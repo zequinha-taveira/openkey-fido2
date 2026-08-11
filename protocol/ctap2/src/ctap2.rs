@@ -15,18 +15,31 @@ extern crate alloc;
 use crate::attestation::{AttestationFormat, PackedAttestation, SelfAttestation};
 use crate::client_pin;
 
+/// Comando CTAP2 serializado para transporte.
+///
+/// `cmd` é o byte de comando (ver [`Ctap2Command`]) e `data` o payload
+/// CBOR opcional.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CtapCommand {
+    /// Byte de comando CTAP2.
     pub cmd: u8,
+    /// Payload CBOR serializado, se houver.
     #[serde(with = "serde_bytes")]
     pub data: Option<Vec<u8>>,
 }
 
+/// Resposta CTAP2 serializada para transporte.
+///
+/// Cada variante contém a response estruturada do comando correspondente.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CtapResponse {
+    /// Resposta do comando MakeCredential.
     MakeCredential(MakeCredentialResponse),
+    /// Resposta do comando GetAssertion.
     GetAssertion(GetAssertionResponse),
+    /// Resposta do comando GetInfo.
     GetInfo(GetInfoResponse),
+    /// Resposta do comando GetVersion.
     GetVersion(GetVersionResponse),
 }
 
@@ -103,50 +116,66 @@ impl Extensions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Input da extensão `hmac-secret` para derivação de segredo compartilhado.
 pub struct HmacSecretInput {
+    /// Salt cifrado com keyAgreement (ChaCha20-Poly1305).
     #[serde(with = "serde_bytes", rename = "saltEnc")]
     pub salt_enc: Vec<u8>,
+    /// Versão do protocolo PIN/UV auth utilizada.
     #[serde(rename = "pinUvAuthProtocol")]
     pub pin_uv_auth_protocol: Option<u8>,
 }
 
+/// Opções do comando MakeCredential (mapa `options` do CTAP2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MakeCredentialOptions {
+    /// Resident key — credencial armazenada no autenticador.
     #[serde(default)]
     pub rk: bool,
+    /// User verification — exigir PIN/biometria.
     #[serde(default)]
     pub uv: bool,
+    /// User presence — exigir toque físico.
     #[serde(default)]
     pub up: bool,
+    /// Estendido — inclui dados adicionais no authData.
     #[serde(rename = "att", default)]
     pub extended: bool,
 }
 
+/// Resposta do comando MakeCredential.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MakeCredentialResponse {
+    /// Formato de attestation (e.g. `"none"`, `"packed"`).
     pub fmt: String,
+    /// Authenticator Data CBOR serializado.
     #[serde(with = "serde_bytes", rename = "authData")]
     pub auth_data: Vec<u8>,
-    /// CBOR map (attStmt). Kept as a map so the encoded response matches
-    /// CTAP2's `{fmt, attStmt, authData}` structure.
+    /// Mapa CBOR de attestation statement (`{alg, sig, x5c}` ou `{alg, sig}`).
     #[serde(rename = "attStmt")]
     pub attestation_info: BTreeMap<i64, Value>,
+    /// Saídas das extensões ativas, se houver.
     #[serde(rename = "extensions", skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionOutputs>,
 }
 
+/// Saídas das extensões WebAuthn incluídas na resposta CTAP2.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtensionOutputs {
+    /// Política de proteção da credencial (extensão `credProtect`).
     #[serde(rename = "credProtect", skip_serializing_if = "Option::is_none")]
     pub cred_protect: Option<u8>,
+    /// Comprimento mínimo de PIN aceito (extensão `minPinLength`).
     #[serde(rename = "minPinLength", skip_serializing_if = "Option::is_none")]
     pub min_pin_length: Option<u32>,
+    /// Blob customizado da credencial (extensão `credBlob`).
     #[serde(
         with = "serde_bytes",
         rename = "credBlob",
         skip_serializing_if = "Option::is_none"
     )]
     pub cred_blob: Option<Vec<u8>>,
+    /// Segredo HMAC compartilhado (extensão `hmac-secret`).
     #[serde(
         with = "serde_bytes",
         rename = "hmac-secret",
@@ -155,126 +184,195 @@ pub struct ExtensionOutputs {
     pub hmac_secret: Option<Vec<u8>>,
 }
 
+/// Dados de credencial retornados em respostas CTAP2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialData {
+    /// AAGUID do autenticador.
     #[serde(with = "serde_bytes")]
     pub aaguid: Vec<u8>,
+    /// Identificador opaco da credencial.
     #[serde(with = "serde_bytes")]
     pub credential_id: Vec<u8>,
+    /// Tipo da credencial (e.g. `"public-key"`).
     pub credential_type: String,
+    /// Chave pública no formato COSE.
     #[serde(with = "serde_bytes")]
     pub public_key: Vec<u8>,
+    /// Contador de assinaturas.
     pub sign_count: u32,
 }
 
+/// Requisição do comando GetAssertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAssertionRequest {
+    /// Identificador do relying party.
     #[serde(rename = "rpId")]
     pub rp_id: String,
+    /// Lista de credenciais do cliente (non-resident).
     pub credentials: Vec<CredentialDescriptor>,
+    /// Lista de credenciais permitidas (resident keys).
     #[serde(rename = "allowList")]
     pub allow_list: Option<Vec<CredentialDescriptor>>,
+    /// Hash dos clientData JSON.
     #[serde(with = "serde_bytes", rename = "clientDataHash")]
     pub client_data_hash: Vec<u8>,
+    /// Extensões WebAuthn ativas.
     pub extensions: Option<Extensions>,
+    /// Opções do comando.
     pub options: GetAssertionOptions,
+    /// Versão do protocolo PIN/UV auth.
     #[serde(rename = "pinUvAuthProtocol")]
     pub pin_protocol: Option<u8>,
+    /// Indica se user verification foi realizada.
     pub uv: Option<bool>,
 }
 
+/// Opções do comando GetAssertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAssertionOptions {
+    /// User presence — exigir toque físico.
     pub up: bool,
+    /// User verification — exigir PIN/biometria.
     pub uv: bool,
 }
 
+/// Resposta do comando GetAssertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAssertionResponse {
+    /// Credencial utilizada na assertion.
     #[serde(rename = "credential")]
     pub credential: Option<CredentialDescriptor>,
+    /// Authenticator Data CBOR serializado.
     #[serde(with = "serde_bytes", rename = "authData")]
     pub auth_data: Vec<u8>,
+    /// Assinatura sobre `authData || clientDataHash`.
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
+    /// Dados do usuário (quando credencial é discoverable).
     pub user: Option<User>,
+    /// Total de credenciais encontradas (multi-assertion).
     #[serde(rename = "numberOfCredentials")]
     pub number_of_credentials: Option<u16>,
+    /// Indica se há mais credenciais (GetNextAssertion).
     pub next: Option<bool>,
+    /// Saídas das extensões ativas, se houver.
     #[serde(rename = "extensions", skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionOutputs>,
 }
 
+/// Resposta do comando GetInfo — capacidades do autenticador.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetInfoResponse {
+    /// Versões CTAP suportadas (e.g. `"FIDO_2_0"`, `"FIDO_2_1"`).
     pub versions: Vec<String>,
+    /// Extensões WebAuthn suportadas.
     pub extensions: Vec<String>,
+    /// AAGUID do dispositivo.
     #[serde(with = "serde_bytes")]
     pub aaguid: Vec<u8>,
+    /// Opções habilitadas (e.g. `"rk"`, `"uv"`, `"up"`).
     pub options: Vec<String>,
+    /// Número de relying parties com credenciais armazenadas.
     pub rp_count: u32,
+    /// Comprimento máximo de credBlob em bytes.
     pub max_cred_blob_length: u32,
+    /// Comprimento máximo de credential ID em bytes.
     pub max_credential_id_length: u16,
+    /// Número máximo de credenciais residentes.
     pub max_credential_count: u16,
+    /// Versão do firmware.
     pub firmware_version: String,
+    /// Algoritmos COSE suportados.
     pub algorithms: Vec<CoseAlgorithmEntry>,
+    /// Recursos de segurança do silício, se houver.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityFeatures>,
 }
 
-/// COSE algorithm entry for GetInfo response (CTAP2 §6.4).
+/// Entrada de algoritmo COSE para resposta GetInfo (CTAP2 §6.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoseAlgorithmEntry {
+    /// Identificador numérico do algoritmo (e.g. `-8` EdDSA, `-7` ES256, `-257` RS256).
     pub alg: i32,
+    /// Tipo de chave (e.g. `"public-key"`).
     #[serde(rename = "type")]
     pub key_type: String,
 }
 
+/// Resposta do comando GetVersion — metadados do firmware.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetVersionResponse {
+    /// Versão do firmware (ex. `"0.1.0"`).
     pub firmware_version: String,
+    /// Hash do commit git.
     pub firmware_commit_id: String,
+    /// Timestamp ou identificador do build.
     pub firmware_build_id: String,
 }
 
+/// Requisição do comando BioEnroll (gerenciamento de biometria).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BioEnrollRequest {
+    /// Sub-comando (0x01 enroll, 0x03 get characteristics).
     #[serde(rename = "subCommand")]
     pub sub_command: u8,
+    /// Parâmetros opcionais do sub-comando.
     #[serde(rename = "subCommandParams")]
     pub sub_command_params: Option<BTreeMap<String, Value>>,
 }
 
+/// Resposta do comando BioEnroll.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BioEnrollResponse {
+    /// Tipo de biometria (0 = fingerprint).
     #[serde(rename = "fingerprintKind")]
     pub fingerprint_kind: u8,
+    /// Número máximo de enrollments permitidos.
     #[serde(rename = "maxEnrollments")]
     pub max_enrollments: u8,
 }
 
+/// Resposta dos comandos EnumerateRPs (initial/next).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnumerateRPsResponse {
+    /// Dados do relying party.
     pub rp: RelyingParty,
+    /// SHA-256 do `rpId`.
     #[serde(with = "serde_bytes", rename = "rpHash")]
     pub rp_hash: Vec<u8>,
+    /// Total de RPs com credenciais armazenadas.
     #[serde(rename = "totalRPs")]
     pub total_rps: u8,
 }
 
+/// Comandos CTAP2 reconhecidos pelo autenticador.
+///
+/// Cada variante corresponde ao byte de comando definido na especificação
+/// CTAP2 (§6). Comandos desconhecidos são capturados por [`Ctap2Command::Unknown`].
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctap2Command {
+    /// MakeCredential (0x01) — cria uma nova credencial.
     MakeCredential = 0x01,
+    /// GetAssertion (0x02) — produz uma assinatura para autenticação.
     GetAssertion = 0x02,
+    /// GetInfo (0x04) — retorna capacidades do autenticador.
     GetInfo = 0x04,
+    /// ClientPIN (0x06) — gerencia PIN e pinUvAuthToken.
     ClientPIN = 0x06,
+    /// Reset (0x07) — limpa todas as credenciais e estado.
     Reset = 0x07,
+    /// GetNextAssertion (0x08) — retorna próxima credencial em multi-assertion.
     GetNextAssertion = 0x08,
+    /// BioEnroll (0x09) — gerenciamento de biometria (stub).
     BioEnroll = 0x09,
+    /// EnumerateRPsInitial (0x3B) — inicia enumeração de relying parties.
     EnumerateRPsInitial = 0x3B,
+    /// EnumerateRPsNext (0x3C) — continua enumeração de relying parties.
     EnumerateRPsNext = 0x3C,
+    /// Selection (0x0B) — seleciona dispositivo via toque.
     Selection = 0x0B,
+    /// Comando não reconhecido — contém o byte original.
     Unknown(u8),
 }
 
@@ -296,32 +394,62 @@ impl Ctap2Command {
     }
 }
 
+/// Códigos de erro CTAP2 (CTAP2 §6.3).
+///
+/// Cada variante mapeia para o byte de status definido na especificação.
+/// Erros de camadas inferiores são convertidos para `Ctap2Error` nas
+/// fronteiras do protocolo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctap2Error {
+    /// Operação concluída com sucesso.
     Success = 0x00,
+    /// Comando desconhecido ou não suportado.
     InvalidCommand = 0x01,
+    /// Parâmetro obrigatório ausente ou inválido.
     InvalidParameter = 0x02,
+    /// Comprimento do payload incorreto.
     InvalidLength = 0x03,
+    /// Dados malformados ou inválidos.
     InvalidData = 0x04,
+    /// Comando inválido no estado atual.
     InvalidState = 0x05,
+    /// Opção não suportada.
     InvalidOption = 0x06,
+    /// Timeout na operação.
     Timeout = 0x08,
+    /// Recurso ocupado — outro comando está em execução.
     ResourceBusy = 0x09,
+    /// Credencial já existe no exclude_list.
     CredentialExists = 0x0A,
+    /// Comando recebido, processamento iniciado.
     Processing = 0x0B,
+    /// Algoritmo criptográfico não suportado.
     UnsupportedAlgorithm = 0x0C,
+    /// Opção do comando não suportada.
     UnsupportedOption = 0x0D,
+    /// Chave inválida fornecida.
     InvalidKey = 0x11,
+    /// Nenhuma credencial correspondente encontrada.
     NoCredentials = 0x0E,
+    /// PIN incorreto.
     PinInvalid = 0x31,
+    /// PIN incorreto com contador de tentativas decrementado.
     PinInvalidRetries = 0x32,
+    /// PIN necessário para continuar.
     PinRequired = 0x33,
+    /// PIN viola política de segurança.
     PinPolicyViolation = 0x34,
+    /// Token de autenticação PIN/UV necessário.
     PinTokenRequired = 0x35,
+    /// Token de autenticação expirado.
     PinTokenExpired = 0x36,
+    /// Token pendente de aprovação do usuário.
     PinTokenPending = 0x37,
+    /// Falha na geração/validação do token.
     PinTokenFailure = 0x38,
+    /// Request excede o tamanho máximo permitido.
     RequestTooLarge = 0x40,
+    /// Erro não categorizado.
     Unknown = 0x7F,
 }
 

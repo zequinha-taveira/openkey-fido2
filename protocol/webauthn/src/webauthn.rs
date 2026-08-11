@@ -6,10 +6,12 @@ use ctap2::{
 use log::debug;
 
 /// Errors produced by the WebAuthn protocol layer before delegating to CTAP2.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WebAuthnError {
     #[error("client_data_hash must not be empty")]
     EmptyClientDataHash,
+    #[allow(dead_code)]
     #[error("client_data_json must not be empty")]
     EmptyClientDataJson,
     #[error("rp_id must not be empty")]
@@ -36,12 +38,17 @@ fn validate_get_assertion(request: &GetAssertionRequest) -> Result<(), WebAuthnE
     Ok(())
 }
 
+/// Autenticador WebAuthn que valida requests e delega ao CTAP2.
+///
+/// Mantém um [`Ctap2Authenticator`] interno e expõe métodos de alto nível
+/// com validação de campos obrigatórios.
 #[derive(Debug)]
 pub struct WebAuthnAuthenticator {
     ctap: Ctap2Authenticator,
 }
 
 impl WebAuthnAuthenticator {
+    /// Cria um autenticador WebAuthn com crypto e storage fornecidos.
     pub fn new(
         aaguid: [u8; 16],
         crypto: CryptoEngine,
@@ -76,34 +83,41 @@ impl WebAuthnAuthenticator {
         Ok(response)
     }
 
+    /// Retorna capacidades do autenticador via GetInfo.
     pub fn get_info(&self) -> Result<ctap2::GetInfoResponse, Box<dyn std::error::Error>> {
         debug!("Processing WebAuthn GetInfo request");
         let response = self.ctap.get_info()?;
         Ok(response)
     }
 
+    /// Retorna metadados do firmware via GetVersion.
     pub fn get_version(&self) -> Result<ctap2::GetVersionResponse, Box<dyn std::error::Error>> {
         debug!("Processing WebAuthn GetVersion request");
         let response = self.ctap.get_version()?;
         Ok(response)
     }
 
+    /// Processa um comando CTAP2 bruto (byte + payload CBOR).
     pub fn process_command(&mut self, cmd: u8, data: Vec<u8>) -> Result<Vec<u8>, Ctap2Error> {
         self.ctap.process_command(cmd, data)
     }
 
+    /// Define capacidades do autovicador reportadas no GetInfo.
     pub fn set_capabilities(&mut self, capabilities: ctap2::Ctap2Capabilities) {
         self.ctap.set_capabilities(capabilities);
     }
 
+    /// Retorna referência imutável às capacidades configuradas.
     pub fn capabilities(&self) -> &ctap2::Ctap2Capabilities {
         self.ctap.capabilities()
     }
 
+    /// Retorna referência imutável ao autenticador CTAP2 interno.
     pub fn get_ctap(&self) -> &Ctap2Authenticator {
         &self.ctap
     }
 
+    /// Retorna referência mutável ao autenticador CTAP2 interno.
     pub fn get_ctap_mut(&mut self) -> &mut Ctap2Authenticator {
         &mut self.ctap
     }

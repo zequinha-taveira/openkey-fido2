@@ -1,8 +1,8 @@
 # openkey-fido2
 
-[![CI](https://github.com/openkey-fido2/openkey-fido2/actions/workflows/ci.yml/badge.svg)](https://github.com/openkey-fido2/openkey-fido2/actions/workflows/ci.yml)
-[![E2E](https://github.com/openkey-fido2/openkey-fido2/actions/workflows/e2e.yml/badge.svg)](https://github.com/openkey-fido2/openkey-fido2/actions/workflows/e2e.yml)
-[![Coverage](https://github.com/openkey-fido2/openkey-fido2/actions/workflows/coverage.yml/badge.svg)](https://github.com/openkey-fido2/openkey-fido2/actions/workflows/coverage.yml)
+[![CI](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/ci.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/ci.yml)
+[![E2E](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/e2e.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/e2e.yml)
+[![Coverage](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/coverage.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/coverage.yml)
 [![Docs](https://img.shields.io/badge/docs-cargo--doc-blue.svg)](https://docs.rs/openkey-fido2)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#licença)

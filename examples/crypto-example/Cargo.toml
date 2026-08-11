@@ -1,0 +1,15 @@
+[package]
+name = "crypto-example"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal example of CryptoEngine operations (Ed25519, ES256, hybrid encryption)"
+license = "MIT"
+
+[dependencies]
+crypto = { path = "../../protocol/crypto" }
+log = "0.4"
+env_logger = "0.10"
+
+[[bin]]
+name = "crypto-example"
+path = "src/main.rs"

@@ -220,6 +220,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-example"
+version = "0.1.0"
+dependencies = [
+ "crypto",
+ "env_logger",
+ "log",
+]
+
+[[package]]
 name = "ctap2"
 version = "0.1.0"
 dependencies = [
@@ -867,8 +876,18 @@ dependencies = [
 name = "transport"
 version = "0.1.0"
 dependencies = [
+ "embedded-hal 1.0.0",
  "log",
  "thiserror",
+]
+
+[[package]]
+name = "transport-example"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "transport",
 ]
 
 [[package]]

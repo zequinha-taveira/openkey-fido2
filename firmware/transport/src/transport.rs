@@ -24,7 +24,7 @@ pub enum TransportError {
 ///
 /// A trait é object-safe, permitindo `Box<dyn Transport>` no
 /// `EmbeddedAuthenticator`.
-pub trait Transport {
+pub trait Transport: Send + Sync {
     /// Inicializa o transporte (enumeração USB, ativação de rádio, etc.).
     fn init(&mut self) -> Result<(), TransportError>;
     /// Envia um frame de resposta para o host.

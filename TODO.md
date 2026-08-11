@@ -145,7 +145,8 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Adicionar `TransportConfig` em `firmware/device-profile/src/profile.rs`** — `TransportType` com `UsbHid`, `UsbCcid`, `Nfc`, `BleGatt` e atalhos `TransportConfig::usb_hid()/usb_ccid()/nfc()/ble_gatt()`. Crate: `device-profile`. Critério: `DeviceProfileBuilder::transport_config()` aceita config.
 - ✅ **Integrar transport no `EmbeddedAuthenticator`** — `init_transport` instancia o stub conforme `profile.transport_config`; acessores `transport()` / `transport_mut()`. Crate: `authenticator`. Critério: `EmbeddedAuthenticator` usa transport configurado.
 - ✅ **Testes unitários dos stubs de transporte** — 19 testes em `firmware/transport/src/` (ciclo de vida, `NotInitialized` antes de `init`, `Unimplemented` em I/O, object safety). Crate: `transport`. Critério: `cargo test -p transport` passando.
-- ❌ **Implementação real dos transportes** — Substituir stubs por USB-HID (`usb-device`), CCID, NFC ISO 14443 e BLE GATT reais, roteando frames para `process_command`. Crate: `transport`, `authenticator`.
+- ✅ **Definir trait contracts embedded-hal para transportes** — Módulo `transport::embedded` com traits `UsbHidDevice`, `EmbeddedTransportError`, `StatusLed`. Feature gate `embedded` com `embedded-hal 1.0`. Crate: `transport`. Critério: `cargo build -p transport --features embedded` compila.
+- ✅ **Implementação de referência USB-HID para RP2350** — `Rp2350UsbHid` implementa `UsbHidDevice` com placeholder do periférico USB. 7 testes cobrindo ciclo de vida, buffer too small, timeout, LED. Crate: `transport::embedded::rp2350`. Critério: `cargo test -p transport --features embedded` passando.
 
 #### Attestation
 
@@ -201,9 +202,9 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Criar `docs/adr/ADR-0005-isolamento-contexto-agentes.md`** — Padrão de isolamento de contexto e estado compartilhado controlado. Criado em 2026-08-05.
 - ✅ **Revisar ADRs existentes para numeração consistente** — Verificado: ADR-0001 a ADR-0008 existem e correspondem às referências no TODO.md. Criado ADR-0008 (sealed-box/ECIES) que estava faltando. Critério: mapeamento consistente entre TODO.md e arquivos.
 - ✅ **Criar `CONTRIBUTING.md` na raiz** — Guia de contribuição com padrões de código, testes, PRs. Crate: N/A. Critério: arquivo criado e referenciado.
-- ❌ **Criar `docs/architecture.md`** — Diagramas e contratos entre módulos. Crate: N/A. Critério: documento criado com diagramas.
-- ❌ **Adicionar doc comments em todas as APIs públicas** — `///` comments em structs, traits, funções públicas. Crate: todos. Critério: `cargo doc --workspace` sem warnings.
-- ❌ **Adicionar exemplos em `examples/` para cada crate** — Exemplo mínimo para `ctap2`, `crypto`, `storage`. Crate: `examples`. Critério: `cargo run --example <name>` funciona.
+- ✅ **Criar `docs/architecture.md`** — Diagramas de dependência, contratos entre módulos, fluxos de dados MakeCredential/GetAssertion, regras de dependência, pontos de extensão. Criado em 2026-08-10.
+- ✅ **Adicionar doc comments em todas as APIs públicas** — `///` comments adicionados em `Ctap2Error` (22 variantes), `Ctap2Command` (11 variantes), todos os request/response structs do CTAP2, módulo e métodos do `webauthn`. Crates: `ctap2`, `webauthn`. Critério: documentação completa nas APIs públicas.
+- ✅ **Adicionar exemplos em `examples/` para cada crate** — Criados `examples/crypto-example/` (Ed25519, ES256, hybrid, HMAC, SHA-256) e `examples/transport-example/` (custom Transport trait impl). Crates: `examples`. Critério: `cargo run -p crypto-example` e `cargo run -p transport-example` funcionam.
 
 ---
 

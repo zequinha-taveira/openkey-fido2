@@ -1,0 +1,15 @@
+[package]
+name = "transport-example"
+version = "0.1.0"
+edition = "2021"
+description = "Example of implementing a custom Transport trait"
+license = "MIT"
+
+[dependencies]
+transport = { path = "../../firmware/transport" }
+log = "0.4"
+env_logger = "0.10"
+
+[[bin]]
+name = "transport-example"
+path = "src/main.rs"
