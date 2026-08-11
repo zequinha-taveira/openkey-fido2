@@ -17,5 +17,5 @@ board-generic = { path = "../../firmware/board-generic" }
 device-profile = { path = "../../firmware/device-profile" }
 transport = { path = "../../firmware/transport" }
 log = "0.4"
-thiserror = "1.0"
+thiserror = "2.0"
 ring = "0.17"
