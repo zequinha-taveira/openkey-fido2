@@ -1,118 +1,168 @@
-# Documentação de Arquitetura do openkey-fido2
+# Arquitetura do openkey-fido2
 
-Diagrama de dependências entre os crates do projeto:
+## Visão Geral
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    openkey-fido2 (workspace)                     │
-│                                                                   │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │                    Cargo.toml                             │  │
-│  │  workspace: [dependencies]                                 │  │
-│  │  ├── ring → crypto/                                      │  │
-│  │  ├── thiserror → ctap2/                                  │  │
-│  │  ├── serde → ctap2/, webauthn/, crypto/                  │  │
-│  │  ├── ciborium → ctap2/, simulator/                       │  │
-│  │  └── rsa → crypto/                                       │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                   │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │               firmware/                                   │  │
-│  │                                                             │  │
-│  │  ├── authenticator/   → Coordena todas as camadas.       │  │
-│  │  │   └── EmbeddedAuthenticator (API final)                │  │
-│  │  ├── board-generic/   → HAL e perfis pré-definidos        │  │
-│  │  │   └── profiles.rs + board_generic.rs                    │  │
-│  │  ├── device-profile/  → Configuração de produto           │  │
-│  │  ├── ctap2/           → CTAP2 protocolo                   │  │
-│  │  │   ├── ctap2.rs (handler, request/response)           │  │
-│  │  │   ├── crypto/ (client_pin, attestation, etc.)        │  │
-│  │  │   └── storage/ (storage-engine)                       │  │
-│  │  ├── crypto/          → Operações criptográficas         │  │
-│  │  │   ├── ed25519.rs (key pair)                           │  │
-│  │  │   ├── hmac_sha256.rs (key derivation)                 │  │
-│  │  │   └── ecies.rs (ECIES encryption)                    │  │
-│  │  ├── storage/         → Armazenamento de credenciais     │  │
-│  │  │   └── storage.rs (StorageEngine)                      │  │
-│  │  ├── transport/        → Abstração de transportes       │  │
-│  │  └── webauthn/         → Validação de requests WebAuthn  │  │
-│  │       └── ctap2/ → delega ao CTAP2                     │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                   │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │              simulator/                                   │  │
-│  │  Exposi o firmware via JSON line protocol para testes    │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                   │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │              tests/                                       │  │
-│  │  Rust + Python (simulador) + E2E examples                  │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                                                                   │
-└─────────────────────────────────────────────────────────────────┘
-```
+Firmware FIDO2/WebAuthn em Rust para authenticators embarcados. A arquitetura
+é em camadas com dependências unidirecionais: camadas superiores dependem de
+inferiores, nunca o contrário.
 
-## Crates e Responsabilidades
-
-### `authenticator` (firmware/authenticator/)
-Coordena todas as camadas. `EmbeddedAuthenticator` é a API final.
-
-### `webauthn` (protocol/webauthn/)
-Validação de requests WebAuthn, delega ao CTAP2.
-
-### `ctap2` (protocol/ctap2/)
-Implementação do estado CTAP2 (MakeCredential, GetAssertion, GetInfo, etc.).
-
-### `crypto` (protocol/crypto/)
-Operações criptográficas (Ed25519, HMAC-SHA256, ChaCha20-Poly1305, SHA-256).
-
-### `storage` (firmware/storage/)
-Armazenamento de credenciais com encryption at rest.
-
-### `board-generic` (firmware/board-generic/)
-HAL e perfis pré-definidos de boards (NRF52840, STM32L4, RP2350, etc.).
-
-### `device-profile` (firmware/device-profile/)
-Configuração de produto e capability discovery.
-
-### `fido2-simulator` (simulator/)
-Binário host que expõe o firmware via JSON line protocol para testes.
-
-### `examples` (examples/)
-Exemplos mínimos de uso do EmbeddedAuthenticator.
-
-### `tests` (tests/)
-Testes de integração Rust e E2E Python.
-
-## Dependências entre Crates
+## Diagrama de Dependências
 
 ```
-authenticator
-    ├── webauthn
-    │   └── ctap2
-    │       ├── crypto
-    │       └── storage
-    │           └── crypto
-    ├── board-generic
-    └── device-profile
-        └── board-generic
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         EmbeddedAuthenticator                           │
+│                         (firmware/authenticator)                        │
+│   Coordena todas as camadas e expõe a API final                         │
+└───────────────┬─────────────────────────────────────────────────────────┘
+                │
+    ┌───────────┼───────────┬───────────────────┐
+    ▼           ▼           ▼                   ▼
+┌────────┐ ┌─────────┐ ┌──────────────┐ ┌────────────────┐
+│webauthn│ │ device  │ │  board       │ │   transport    │
+│        │ │-profile │ │ -generic     │ │                │
+└───┬────┘ └────┬────┘ └──────┬───────┘ └────────────────┘
+    │           │             │
+    ▼           ▼             │
+┌────────┐     │             │
+│ ctap2  │◄────┘             │
+└───┬────┘                   │
+    │                        │
+    ├──► storage ──► crypto  │
+    │         │               │
+    └─────────┴───────────────┘
 ```
 
-**Regra**: setas apontam de quem depende para quem é dependido. Nunca crie dependências circulares.
+## Contratos entre Módulos
 
-## Fluxo de Dados
+### `authenticator` → API Final
 
-1. **Autenticação**: CTAP2 protocolo (ctap2/) → Hardware (CTAP2 authenticator)
-2. **Validação**: WebAuthn (webauthn/) → CTAP2 (ctap2/)
-3. **Criptografia**: Crypto (crypto/) → Storage (storage/)
-4. **Armazenamento**: StorageEngine → Credential descriptografado → Crypto
-5. **Board Profile**: DeviceProfile → BoardDefinition → Hardware
-6. **Capability Discovery**: GetInfo → DeviceProfile → CTAP2 auth
+- **Entrada**: requests WebAuthn ou CBOR brutos
+- **Saída**: responses CTAP2 serializadas
+- **Contrato**: `EmbeddedAuthenticator` é a única API pública consumida por
+  aplicações. Todas as outras crates são detalhes de implementação.
 
-## Documentação
+### `webauthn` → Validação
 
-- `AGENTS.md` — guia do agente (estado deste repositório)
-- `TODO.md` — estado do projeto
-- `README.md` — visão geral e como compilar
-- `docs/adr/` — decisões de arquitetura
-- `CONTRIBUTING.md` — padrões de código e testes
+- **Entrada**: `MakeCredentialRequest`, `GetAssertionRequest`
+- **Saída**: response CTAP2 ou `WebAuthnError`
+- **Contrato**: valida campos obrigatórios (`rp_id`, `client_data_hash`)
+  antes de delegar ao CTAP2. Não contém estado mutável além do `Ctap2Authenticator`.
+
+### `ctap2` → Protocolo
+
+- **Entrada**: comando CTAP2 (byte + payload CBOR)
+- **Saída**: `Ctap2Error` ou response CBOR
+- **Contrato**: implementa a máquina de estado CTAP2. Erros de camadas
+  inferiores são mapeados para `Ctap2Error` nas fronteiras do protocolo.
+
+### `crypto` → Primitivas
+
+- **Entrada**: bytes + chaves
+- **Saída**: signatures, ciphertexts, hashes
+- **Contrato**: toda operação criptográfica passa por `CryptoEngine`.
+  Chaves privadas nunca saem em plaintext. Comparação é constant-time.
+
+### `storage` → Persistência
+
+- **Entrada**: `Credential` (plaintext), chave
+- **Saída**: `StoredCredential` (chave cifrada)
+- **Contrato**: encryption at rest via ChaCha20-Poly1305. `StorageBackend`
+  é injetável (file vs flash). Wear leveling protege flash.
+
+### `transport` → Comunicação
+
+- **Entrada**: frames do host
+- **Saída**: frames de resposta
+- **Contrato**: trait `Transport` é object-safe (`Box<dyn Transport>`).
+  Cada transporte implementa `init/send/recv/close`. Stubs retornam
+  `Unimplemented`; implementações reais usam `embedded-hal`.
+
+### `board-generic` → HAL
+
+- **Entrada**: definições estáticas de board
+- **Saída**: `BoardDefinition`, `BoardHAL`
+- **Contrato**: perfis são `const` (vivem em flash). `BoardTrait` abstrai
+  GPIO/I2C/SPI para implementações por board.
+
+### `device-profile` → Configuração
+
+- **Entrada**: `BoardDefinition`
+- **Saída**: `DeviceProfile`, `Capabilities`
+- **Contrato**: `DeviceProfileBuilder` configura produto. `CapabilityDiscovery`
+  gera snapshot runtime para `GetInfo`.
+
+## Fluxo de Dados: MakeCredential
+
+```
+Host                    Transport              Authenticator           WebAuthn            CTAP2              Storage
+ │                         │                       │                    │                   │                   │
+ │── CBOR request ────────►│                       │                    │                   │                   │
+ │                         │── frame ─────────────►│                    │                   │                   │
+ │                         │                       │── validate ───────►│                   │                   │
+ │                         │                       │                    │── make_credential►│                   │
+ │                         │                       │                    │                   │── store ─────────►│
+ │                         │                       │                    │                   │◄── stored ────────│
+ │                         │                       │                    │◄── response ──────│                   │
+ │                         │◄── frame ─────────────│                    │                   │                   │
+ │◄── CBOR response ───────│                       │                    │                   │                   │
+```
+
+## Fluxo de Dados: GetAssertion
+
+```
+Host                    Transport              Authenticator           CTAP2              Crypto             Storage
+ │                         │                       │                    │                   │                   │
+ │── CBOR request ────────►│                       │                    │                   │                   │
+ │                         │── frame ─────────────►│                    │                   │                   │
+ │                         │                       │── get_assertion ──►│                   │                   │
+ │                         │                       │                    │── get_credential ─────────────────────►│
+ │                         │                       │                    │◄── StoredCredential ──────────────────│
+ │                         │                       │                    │── decrypt ───────►│                   │
+ │                         │                       │                    │◄── private_key ──│                   │
+ │                         │                       │                    │── sign ──────────►│                   │
+ │                         │                       │                    │◄── signature ────│                   │
+ │                         │◄── frame ─────────────│                    │                   │                   │
+ │◄── CBOR response ───────│                       │                    │                   │                   │
+```
+
+## Regras de Dependência
+
+1. **Sem ciclos**: setas apontam de quem depende para quem é dependido
+2. **Crypto é folha**: apenas `ring`, `rsa`, `rand` como dependências externas
+3. **Transport é folha**: apenas `log` + `thiserror`
+4. **Storage depende de crypto**: para encryption at rest
+5. **CTAP2 depende de storage + crypto**: para persistência e assinaturas
+6. **Authenticator depende de tudo**: é o ponto de composição
+
+## Mapeamento de Crates
+
+| Crate | Caminho | Diretório | Responsabilidade |
+|-------|---------|-----------|------------------|
+| `authenticator` | `firmware/authenticator/` | firmware | API final |
+| `webauthn` | `protocol/webauthn/` | protocol | Validação WebAuthn |
+| `ctap2` | `protocol/ctap2/` | protocol | Estado CTAP2 |
+| `crypto` | `protocol/crypto/` | protocol | Primitivas criptográficas |
+| `storage` | `firmware/storage/` | firmware | Persistência cifrada |
+| `transport` | `firmware/transport/` | firmware | Trait + stubs |
+| `board-generic` | `firmware/board-generic/` | firmware | HAL + perfis |
+| `device-profile` | `firmware/device-profile/` | firmware | Configuração |
+| `fido2-simulator` | `simulator/` | raiz | Simulador host |
+| `test-suite` | `tests/` | raiz | Testes Rust + Python |
+
+## Estratégia std/no_std (ADR-0004)
+
+- **Crates de protocolo** (`crypto`, `ctap2`, `webauthn`): `extern crate alloc`
+  para compatibilidade com targets embarcados
+- **Crates de firmware** (`storage`, `transport`, `board-generic`): prontos
+  para `no_std` quando necessário
+- **Simulador e exemplos**: `std` completo para desenvolvimento
+
+## Pontos de Extensão
+
+| Extensão | Onde adicionar | Contrato |
+|----------|---------------|----------|
+| Novo algoritmo | `crypto::CryptoEngine` + `ctap2::Ctap2Capabilities` | Adicionar método + COSE key builder |
+| Novo transporte | `firmware/transport/` | Implementar `Transport` trait |
+| Novo board | `board-generic::profiles` | `BoardDefinition` com `const fn` |
+| Nova extensão WebAuthn | `ctap2::Extensions` + handler | Adicionar campo + validação |
+| Novo backend de storage | `storage::StorageBackend` | Implementar trait + injetar |
