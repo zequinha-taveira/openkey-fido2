@@ -2,6 +2,13 @@
 //!
 //! Define a trait [`Transport`] e stubs para os transportes físicos
 //! previstos: USB-HID (CTAPHID), USB-CCID, NFC (ISO 14443) e BLE GATT.
+//!
+//! When the `embedded` feature is enabled, the [`embedded`] module provides
+//! `no_std` trait contracts and reference implementations for targets that
+//! implement [`embedded-hal`].
+
+#[cfg(feature = "embedded")]
+pub mod embedded;
 
 pub mod ble_gatt;
 pub mod nfc;

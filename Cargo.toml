@@ -11,8 +11,10 @@ members = [
     "protocol/crypto",
     "examples/basic",
     "examples/ccid",
+    "examples/crypto-example",
     "examples/ctap-example",
     "examples/storage-example",
+    "examples/transport-example",
     "simulator",
     "tests",
 ]
