@@ -10,7 +10,7 @@ authenticator = { path = "../../firmware/authenticator" }
 board-generic = { path = "../../firmware/board-generic" }
 ctap2 = { path = "../../protocol/ctap2" }
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 
 [[bin]]
 name = "ctap2-example"
