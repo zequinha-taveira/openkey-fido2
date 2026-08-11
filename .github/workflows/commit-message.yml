@@ -1,0 +1,60 @@
+name: Commit Message Format
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    name: Validate Commit Message
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get latest commit message
+        run: |
+          MSG=$(git log -1 --format=%s)
+          echo "message=$MSG" >> $GITHUB_OUTPUT
+
+      - name: Validate format
+        run: |
+          MSG="${{ steps.get-message.outputs.message }}"
+          # Portuguese: lowercase start, imperative, concise
+          if [[ ! $MSG =~ ^[a-z] ]]; then
+            echo "❌ Commit message must start with lowercase letter (Portuguese convention)"
+            exit 1
+          fi
+          if [ ${#MSG} -gt 72 ]; then
+            echo "❌ Commit message must be max 72 characters"
+            exit 1
+          fi
+          # Check for ADR reference when docs/adr changed
+          if git diff HEAD~1 HEAD --name-only | grep -q '^docs/adr/'; then
+            if [[ ! $MSG =~ adr: ]]; then
+              echo "❌ ADR files changed but no 'adr: ADR-XXXX' reference"
+              exit 1
+            fi
+          fi
+          # Check for issue reference when message contains fix/bug
+          if echo "$MSG" | grep -qiE '(fix|corrig|bug)'; then
+            if ! echo "$MSG" | grep -qiE 'fixes #[0-9]+'; then
+              echo "⚠️ Message mentions fix/bug but missing 'fixes #123'"
+            fi
+          fi
+          echo "✅ Commit message validated"
+
+      - name: Comment on PR if invalid
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          comment-mode: single
+          script: |
+            const msg = '${{ steps.get-message.outputs.message }}';
+            await github.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `**Commit message validation failed**\n\`-${msg}\`\n\nPlease follow the commit message conventions:\n- Start with lowercase letter\n- Max 72 characters\n- Use imperative mood\n- Reference ADR: \`adr: ADR-XXXX\` when changing docs/adr\n- Reference issues: \`fixes #123\` when fixing`
+            });
