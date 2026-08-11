@@ -10,6 +10,6 @@ build = "build.rs"
 authenticator = { path = "../firmware/authenticator" }
 ctap2 = { path = "../protocol/ctap2" }
 device-profile = { path = "../firmware/device-profile" }
-base64 = "0.22"
+base64 = "0.23"
 ciborium = "0.2"
 serde_json = "1.0"
