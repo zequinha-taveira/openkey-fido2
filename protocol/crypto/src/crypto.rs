@@ -191,7 +191,7 @@ impl CryptoEngine {
     /// Generate an RSA-2048 key pair for RS256 (alg -257).
     /// Returns (PKCS#8 private key, modulus `n` big-endian, exponent `e` big-endian).
     pub fn generate_rsa_key_pair(&self) -> Result<RsaKeyMaterial, Box<dyn std::error::Error>> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rngs::OsRng;
         let private_key = RsaPrivateKey::new(&mut rng, RSA_KEY_BITS)
             .map_err(|e| format!("RSA key generation failed: {:?}", e))?;
         let public_key = RsaPublicKey::from(&private_key);
