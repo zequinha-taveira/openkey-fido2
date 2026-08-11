@@ -1,0 +1,44 @@
+# Board profile: Raspberry Pi Pico 2 (RP2350)
+#
+# Mirrors the fields of board_generic::BoardDefinition in
+# firmware/board-generic/src/profiles.rs. AAGUID matches the RP2350 profile.
+
+name: pico2-fido
+chip: RP2350
+vendor: Raspberry Pi Ltd
+description: Raspberry Pi Pico 2 - official development board based on the RP2350
+
+aaguid: "525032333530000000000000000005"
+
+transports:
+  - usb-hid
+  - usb-ccid
+
+has_secure_storage: false
+has_crypto_accelerator: true
+
+pins:
+  i2c_sda: 4
+  i2c_scl: 5
+  spi_mosi: 6
+  spi_miso: 7
+  spi_clk: 8
+  cs: 9
+  reset: 10
+  irq: 11
+  led: 25
+  button: 13
+
+usb:
+  # --- VID/PID notes ---
+  # 0x2E8A is the Raspberry Pi Ltd vendor ID and, together with PID 0x000F,
+  # identifies ONLY the Pico 2 UF2 bootrom (BOOTSEL) interface - it must not
+  # be reused for the FIDO2 authenticator.
+  # A final product must use a VID registered with the USB-IF (or its own
+  # vendor VID) and a product-specific, unique PID.
+  vid: "0x2E8A"
+  pid: "0x000F"
+  note: |
+    The VID/PID above identify the Pico 2 UF2 bootrom, not the authenticator.
+    Use your own registered VID and a unique PID for the FIDO2 product;
+    unregistered VID/PID values can collide with other devices on the host.

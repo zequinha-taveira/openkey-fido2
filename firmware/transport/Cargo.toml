@@ -1,0 +1,10 @@
+[package]
+name = "transport"
+version = "0.1.0"
+edition = "2021"
+description = "Transport layer for FIDO2 authenticator (USB-HID, CCID)"
+license = "MIT"
+
+[dependencies]
+log = "0.4"
+thiserror = "1.0"

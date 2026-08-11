@@ -1,0 +1,44 @@
+# Board profile: Tiny2350 (RP2350)
+#
+# Generic third-party / clone development board built on the Raspberry Pi
+# RP2350 chip, in the Pico-2 form factor.
+
+name: tiny2350-fido
+chip: RP2350
+vendor: Generic (third-party/clone)
+description: Tiny2350 - generic RP2350 development board (third-party or clone)
+
+aaguid: "54494e59323335300000000000000006"
+
+transports:
+  - usb-hid
+  - usb-ccid
+
+has_secure_storage: false
+has_crypto_accelerator: true
+
+pins:
+  i2c_sda: 4
+  i2c_scl: 5
+  spi_mosi: 6
+  spi_miso: 7
+  spi_clk: 8
+  cs: 9
+  reset: 10
+  irq: 11
+  led: 25
+  button: 13
+
+usb:
+  # --- VID/PID notes ---
+  # Clone boards often reuse the Raspberry Pi bootrom VID/PID (0x2E8A /
+  # 0x000F) for BOOTSEL/UF2 compatibility. This is a boot-only identity and
+  # must NOT be reused for the FIDO2 authenticator.
+  # Third-party boards have no guaranteed VID/PID: the product vendor must
+  # register its own VID with the USB-IF and assign a unique PID per product.
+  vid: "0x2E8A"
+  pid: "0x000F"
+  note: |
+    Generic boards provide no product VID/PID; the values above only cover the
+    UF2 bootrom compatibility mode used by many clones. Register your own
+    VID/PID for the FIDO2 authenticator to avoid collisions.

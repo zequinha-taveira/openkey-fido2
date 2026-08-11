@@ -1,0 +1,14 @@
+[package]
+name = "webauthn"
+version = "0.1.0"
+edition = "2021"
+description = "WebAuthn implementation for FIDO2 authenticators"
+license = "MIT"
+
+[dependencies]
+ctap2 = { path = "../../protocol/ctap2" }
+crypto = { path = "../../protocol/crypto" }
+storage = { path = "../../firmware/storage" }
+log = "0.4"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }

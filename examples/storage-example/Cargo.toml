@@ -1,0 +1,18 @@
+[package]
+name = "storage-example"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal example of credential storage and retrieval"
+license = "MIT"
+
+[dependencies]
+authenticator = { path = "../../firmware/authenticator" }
+board-generic = { path = "../../firmware/board-generic" }
+crypto = { path = "../../protocol/crypto" }
+ctap2 = { path = "../../protocol/ctap2" }
+log = "0.4"
+env_logger = "0.10"
+
+[[bin]]
+name = "storage-example"
+path = "src/main.rs"

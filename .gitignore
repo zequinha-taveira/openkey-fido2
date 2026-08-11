@@ -1,0 +1,19 @@
+target/
+**/target/
+*.rs.bk
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.log
+
+# Fuzzing (cargo-fuzz)
+fuzz/artifacts/
+fuzz/corpus/
+fuzz/coverage/
+
+# Code coverage (cargo-tarpaulin)
+coverage/
+tarpaulin-report.html
+cobertura.xml

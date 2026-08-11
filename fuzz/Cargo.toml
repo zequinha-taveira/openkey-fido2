@@ -1,0 +1,31 @@
+[package]
+name = "openkey-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Fuzz targets para o parsing CBOR do CTAP2 (cargo-fuzz)"
+license = "MIT OR Apache-2.0"
+
+# Crate fora do workspace principal: `cargo-fuzz` gerencia seu proprio build
+# (sanitizers, RUSTFLAGS e perfil release com debug-assertions).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ctap2 = { path = "../protocol/ctap2" }
+ciborium = "0.2"
+
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "decode_cbor"
+path = "fuzz_targets/decode_cbor.rs"
+test = false
+doc = false
+bench = false

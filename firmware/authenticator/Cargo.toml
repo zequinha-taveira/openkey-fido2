@@ -1,0 +1,21 @@
+[package]
+name = "authenticator"
+version = "0.1.0"
+edition = "2021"
+description = "Core FIDO2 authenticator logic"
+license = "MIT"
+repository = "https://github.com/yourusername/fido2-embedded"
+authors = ["openkey-fido2 contributors"]
+build = "build.rs"
+
+[dependencies]
+ctap2 = { path = "../../protocol/ctap2" }
+webauthn = { path = "../../protocol/webauthn" }
+crypto = { path = "../../protocol/crypto" }
+storage = { path = "../../firmware/storage" }
+board-generic = { path = "../../firmware/board-generic" }
+device-profile = { path = "../../firmware/device-profile" }
+transport = { path = "../../firmware/transport" }
+log = "0.4"
+thiserror = "1.0"
+ring = "0.17"

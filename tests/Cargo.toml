@@ -1,0 +1,17 @@
+[package]
+name = "test-suite"
+version = "0.1.0"
+edition = "2021"
+description = "Integration tests for openkey-fido2 protocols"
+license = "MIT"
+
+[dependencies]
+crypto = { path = "../protocol/crypto" }
+storage = { path = "../firmware/storage" }
+ctap2 = { path = "../protocol/ctap2" }
+webauthn = { path = "../protocol/webauthn" }
+authenticator = { path = "../firmware/authenticator" }
+board-generic = { path = "../firmware/board-generic" }
+device-profile = { path = "../firmware/device-profile" }
+transport = { path = "../firmware/transport" }
+ciborium = "0.2"

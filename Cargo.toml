@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "firmware/authenticator",
+    "firmware/board-generic",
+    "firmware/device-profile",
+    "firmware/storage",
+    "firmware/transport",
+    "protocol/ctap2",
+    "protocol/webauthn",
+    "protocol/crypto",
+    "examples/basic",
+    "examples/ccid",
+    "examples/ctap-example",
+    "examples/storage-example",
+    "simulator",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["openkey-fido2 contributors"]
+description = "FIDO2 Embedded Authenticator - Open-source FIDO2/WebAuthn authenticator for embedded devices"
+repository = "https://github.com/openkey-fido2/openkey-fido2"
+readme = "README.md"
+keywords = ["fido2", "webauthn", "ctap2", "authenticator", "embedded", "security"]
+categories = ["embedded", "cryptography", "authentication"]
+rust-version = "1.70"
+
+[workspace.metadata.docs.rs]
+all-features = true
+
+[workspace.dependencies]
+ring = "0.17"
+log = "0.4"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"
+zeroize = { version = "1.7", features = ["derive"] }
+
+[profile.dev]
+opt-level = 2
+lto = true
+
+[profile.release]
+codegen-units = 1
+opt-level = "s"
+strip = true
+lto = true
+debug = true
+panic = "abort"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

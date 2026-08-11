@@ -1,0 +1,15 @@
+[package]
+name = "fido2-simulator"
+version = "0.1.0"
+edition = "2021"
+description = "Host simulator exposing the FIDO2 firmware over a JSON line protocol (no hardware required)"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+authenticator = { path = "../firmware/authenticator" }
+ctap2 = { path = "../protocol/ctap2" }
+device-profile = { path = "../firmware/device-profile" }
+base64 = "0.22"
+ciborium = "0.2"
+serde_json = "1.0"
