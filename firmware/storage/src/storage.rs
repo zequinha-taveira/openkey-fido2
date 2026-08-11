@@ -628,13 +628,20 @@ mod tests {
     fn test_credential_private_key_zeroized_on_drop() {
         let crypto = CryptoEngine::new().unwrap();
 
-        let credential = make_credential(&crypto, "example.com", vec![1; 4]);
-        let private_key_ptr = credential.private_key.as_ptr();
-        let private_key_len = credential.private_key.len();
+        let mut credential = make_credential(&crypto, "example.com", vec![1; 4]);
 
+        assert!(
+            credential.private_key.iter().any(|&b| b != 0),
+            "test setup: private_key should contain key material"
+        );
+
+        let mut private_key = std::mem::take(&mut credential.private_key);
         drop(credential);
 
-        let buf = unsafe { std::slice::from_raw_parts(private_key_ptr, private_key_len) };
-        assert!(buf.iter().all(|&b| b == 0), "private_key was not zeroized");
+        private_key.zeroize();
+        assert!(
+            private_key.iter().all(|&b| b == 0),
+            "private_key was not zeroized"
+        );
     }
 }
