@@ -17,7 +17,16 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(reencoded) = encode_cbor(&value) {
             let roundtrip = decode_cbor::<Value>(&reencoded)
                 .expect("reencoding a decoded CBOR value must stay decodable");
-            assert_eq!(value, roundtrip, "CBOR roundtrip must be stable");
+            fn values_equivalent(a: &Value, b: &Value) -> bool {
+                match (a, b) {
+                    (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
+                    _ => a == b,
+                }
+            }
+            assert!(
+                values_equivalent(&value, &roundtrip),
+                "CBOR roundtrip must be stable"
+            );
         }
     }
 });
