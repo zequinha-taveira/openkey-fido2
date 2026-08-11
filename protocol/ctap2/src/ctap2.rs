@@ -236,81 +236,115 @@ pub struct GetAssertionOptions {
     pub uv: bool,
 }
 
+/// Resposta do comando GetAssertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAssertionResponse {
+    /// Credencial utilizada na assertion.
     #[serde(rename = "credential")]
     pub credential: Option<CredentialDescriptor>,
+    /// Authenticator Data CBOR serializado.
     #[serde(with = "serde_bytes", rename = "authData")]
     pub auth_data: Vec<u8>,
+    /// Assinatura sobre `authData || clientDataHash`.
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
+    /// Dados do usuário (quando credencial é discoverable).
     pub user: Option<User>,
+    /// Total de credenciais encontradas (multi-assertion).
     #[serde(rename = "numberOfCredentials")]
     pub number_of_credentials: Option<u16>,
+    /// Indica se há mais credenciais (GetNextAssertion).
     pub next: Option<bool>,
+    /// Saídas das extensões ativas, se houver.
     #[serde(rename = "extensions", skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionOutputs>,
 }
 
+/// Resposta do comando GetInfo — capacidades do autenticador.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetInfoResponse {
+    /// Versões CTAP suportadas (e.g. `"FIDO_2_0"`, `"FIDO_2_1"`).
     pub versions: Vec<String>,
+    /// Extensões WebAuthn suportadas.
     pub extensions: Vec<String>,
+    /// AAGUID do dispositivo.
     #[serde(with = "serde_bytes")]
     pub aaguid: Vec<u8>,
+    /// Opções habilitadas (e.g. `"rk"`, `"uv"`, `"up"`).
     pub options: Vec<String>,
+    /// Número de relying parties com credenciais armazenadas.
     pub rp_count: u32,
+    /// Comprimento máximo de credBlob em bytes.
     pub max_cred_blob_length: u32,
+    /// Comprimento máximo de credential ID em bytes.
     pub max_credential_id_length: u16,
+    /// Número máximo de credenciais residentes.
     pub max_credential_count: u16,
+    /// Versão do firmware.
     pub firmware_version: String,
+    /// Algoritmos COSE suportados.
     pub algorithms: Vec<CoseAlgorithmEntry>,
+    /// Recursos de segurança do silício, se houver.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityFeatures>,
 }
 
-/// COSE algorithm entry for GetInfo response (CTAP2 §6.4).
+/// Entrada de algoritmo COSE para resposta GetInfo (CTAP2 §6.4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoseAlgorithmEntry {
+    /// Identificador numérico do algoritmo (e.g. `-8` EdDSA, `-7` ES256, `-257` RS256).
     pub alg: i32,
+    /// Tipo de chave (e.g. `"public-key"`).
     #[serde(rename = "type")]
     pub key_type: String,
 }
 
+/// Resposta do comando GetVersion — metadados do firmware.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetVersionResponse {
+    /// Versão do firmware (ex. `"0.1.0"`).
     pub firmware_version: String,
+    /// Hash do commit git.
     pub firmware_commit_id: String,
+    /// Timestamp ou identificador do build.
     pub firmware_build_id: String,
 }
 
+/// Requisição do comando BioEnroll (gerenciamento de biometria).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BioEnrollRequest {
+    /// Sub-comando (0x01 enroll, 0x03 get characteristics).
     #[serde(rename = "subCommand")]
     pub sub_command: u8,
+    /// Parâmetros opcionais do sub-comando.
     #[serde(rename = "subCommandParams")]
     pub sub_command_params: Option<BTreeMap<String, Value>>,
 }
 
+/// Resposta do comando BioEnroll.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BioEnrollResponse {
+    /// Tipo de biometria (0 = fingerprint).
     #[serde(rename = "fingerprintKind")]
     pub fingerprint_kind: u8,
+    /// Número máximo de enrollments permitidos.
     #[serde(rename = "maxEnrollments")]
     pub max_enrollments: u8,
 }
 
+/// Resposta dos comandos EnumerateRPs (initial/next).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnumerateRPsResponse {
+    /// Dados do relying party.
     pub rp: RelyingParty,
+    /// SHA-256 do `rpId`.
     #[serde(with = "serde_bytes", rename = "rpHash")]
     pub rp_hash: Vec<u8>,
+    /// Total de RPs com credenciais armazenadas.
     #[serde(rename = "totalRPs")]
     pub total_rps: u8,
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Comandos CTAP2 reconhecidos pelo autenticador.
 ///
 /// Cada variante corresponde ao byte de comando definido na especificação
