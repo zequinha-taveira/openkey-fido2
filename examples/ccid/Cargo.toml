@@ -9,4 +9,4 @@ license = "MIT"
 authenticator = { path = "../../firmware/authenticator" }
 board-generic = { path = "../../firmware/board-generic" }
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
