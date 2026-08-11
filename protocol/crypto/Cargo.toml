@@ -10,5 +10,5 @@ log = "0.4"
 ring = "0.17"
 rsa = { version = "0.9", features = ["sha2"] }
 rand = "0.8"
-num-bigint-dig = "0.8"
+num-bigint-dig = "0.9"
 zeroize = { workspace = true }
