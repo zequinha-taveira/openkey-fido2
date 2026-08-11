@@ -6,12 +6,14 @@ Cobra getPINRetries, setPIN, changePIN, getPINToken e getPINHashEnc.
 import base64
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
-SIM_BIN = WORKSPACE_ROOT / "target" / "debug" / "fido2-simulator.exe"
+_EXE = ".exe" if sys.platform == "win32" else ""
+SIM_BIN = WORKSPACE_ROOT / "target" / "debug" / f"fido2-simulator{_EXE}"
 BUILD_TIMEOUT_S = 600
 RUN_TIMEOUT_S = 30
 

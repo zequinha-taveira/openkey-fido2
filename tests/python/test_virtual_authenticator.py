@@ -243,7 +243,7 @@ def test_reset_limpa_todas_as_credenciais(auth):
 
 def test_comando_desconhecido_devolve_invalid_command(auth):
     with pytest.raises(Ctap2ResponseError) as exc:
-        auth.process_command(0x3B)  # EnumerateRPsInitial não implementado
+        auth.process_command(0xFF)  # comando não existente
     assert exc.value.code == 0x01  # INVALID_COMMAND
 
 
