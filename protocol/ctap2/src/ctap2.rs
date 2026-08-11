@@ -349,6 +349,7 @@ pub struct EnumerateRPsResponse {
 ///
 /// Cada variante corresponde ao byte de comando definido na especificação
 /// CTAP2 (§6). Comandos desconhecidos são capturados por [`Ctap2Command::Unknown`].
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctap2Command {
     /// MakeCredential (0x01) — cria uma nova credencial.
