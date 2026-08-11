@@ -159,18 +159,23 @@ pub struct MakeCredentialResponse {
     pub extensions: Option<ExtensionOutputs>,
 }
 
+/// Saídas das extensões WebAuthn incluídas na resposta CTAP2.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtensionOutputs {
+    /// Política de proteção da credencial (extensão `credProtect`).
     #[serde(rename = "credProtect", skip_serializing_if = "Option::is_none")]
     pub cred_protect: Option<u8>,
+    /// Comprimento mínimo de PIN aceito (extensão `minPinLength`).
     #[serde(rename = "minPinLength", skip_serializing_if = "Option::is_none")]
     pub min_pin_length: Option<u32>,
+    /// Blob customizado da credencial (extensão `credBlob`).
     #[serde(
         with = "serde_bytes",
         rename = "credBlob",
         skip_serializing_if = "Option::is_none"
     )]
     pub cred_blob: Option<Vec<u8>>,
+    /// Segredo HMAC compartilhado (extensão `hmac-secret`).
     #[serde(
         with = "serde_bytes",
         rename = "hmac-secret",
@@ -179,37 +184,55 @@ pub struct ExtensionOutputs {
     pub hmac_secret: Option<Vec<u8>>,
 }
 
+/// Dados de credencial retornados em respostas CTAP2.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialData {
+    /// AAGUID do autenticador.
     #[serde(with = "serde_bytes")]
     pub aaguid: Vec<u8>,
+    /// Identificador opaco da credencial.
     #[serde(with = "serde_bytes")]
     pub credential_id: Vec<u8>,
+    /// Tipo da credencial (e.g. `"public-key"`).
     pub credential_type: String,
+    /// Chave pública no formato COSE.
     #[serde(with = "serde_bytes")]
     pub public_key: Vec<u8>,
+    /// Contador de assinaturas.
     pub sign_count: u32,
 }
 
+/// Requisição do comando GetAssertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAssertionRequest {
+    /// Identificador do relying party.
     #[serde(rename = "rpId")]
     pub rp_id: String,
+    /// Lista de credenciais do cliente (non-resident).
     pub credentials: Vec<CredentialDescriptor>,
+    /// Lista de credenciais permitidas (resident keys).
     #[serde(rename = "allowList")]
     pub allow_list: Option<Vec<CredentialDescriptor>>,
+    /// Hash dos clientData JSON.
     #[serde(with = "serde_bytes", rename = "clientDataHash")]
     pub client_data_hash: Vec<u8>,
+    /// Extensões WebAuthn ativas.
     pub extensions: Option<Extensions>,
+    /// Opções do comando.
     pub options: GetAssertionOptions,
+    /// Versão do protocolo PIN/UV auth.
     #[serde(rename = "pinUvAuthProtocol")]
     pub pin_protocol: Option<u8>,
+    /// Indica se user verification foi realizada.
     pub uv: Option<bool>,
 }
 
+/// Opções do comando GetAssertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAssertionOptions {
+    /// User presence — exigir toque físico.
     pub up: bool,
+    /// User verification — exigir PIN/biometria.
     pub uv: bool,
 }
 
