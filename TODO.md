@@ -67,6 +67,7 @@ completos; itens com 🚧 estão em progresso; itens com ❌ são incrementos fu
 - ✅ AGENTS.md (guia do agente)
 - ✅ TODO.md (este arquivo)
 - ✅ Virtual board em Python (`simulator/python/board/`): cbor, gpio, i2c, spi, ccid, board, profiles
+- ✅ **Release CI criado: `.github/workflows/release.yml`** (build, test, artifacts, criação de release)
 
 ---
 

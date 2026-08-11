@@ -1,6 +1,7 @@
 # openkey-fido2
 
 [![CI](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/ci.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/ci.yml)
+[![Release](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/release.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/release.yml)
 [![E2E](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/e2e.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/e2e.yml)
 [![Coverage](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/coverage.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/coverage.yml)
 [![Docs](https://img.shields.io/badge/docs-cargo--doc-blue.svg)](https://docs.rs/openkey-fido2)

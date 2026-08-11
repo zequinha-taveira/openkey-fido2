@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [created]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Run E2E tests
+        run: |
+          cargo build -p fido2-simulator --locked
+          python -m pytest tests/python -v
+
+      - name: Build examples
+        run: cargo build -p basic-example -p ccid-example --locked
+
+  build-artifacts:
+    name: Build Artifacts
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build fido2-simulator
+        run: cargo build -p fido2-simulator --locked
+
+      - name: Build openkey-core wheel
+        run: |
+          python -m maturin build --manifest-path python/openkey_core/Cargo.toml --interpreter python --out dist
+          python -m pip install --force-reinstall dist/*.whl
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-artifacts
+          path: |
+            simulator/target/release/fido2-simulator
+            dist/*.whl
+            firmware/target/release/
+            protocol/crypto/target/release/
+            protocol/ctap2/target/release/
+            protocol/webauthn/target/release/
+            firmware/storage/target/release/
+            firmware/authenticator/target/release/
+            firmware/board-generic/target/release/
+            firmware/device-profile/target/release/
+            firmware/transport/target/release/
+
+  create-release:
+    name: Create Release
+    needs: build-artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ github.ref_name }}
+          body: |
+            Release ${{ github.ref_name }}
+
+          draft: false
+          prerelease: false
+          files: |
+            simulator/target/release/fido2-simulator
+            dist/*.whl
+            firmware/target/release/
+            protocol/crypto/target/release/
+            protocol/ctap2/target/release/
+            protocol/webauthn/target/release/
+            firmware/storage/target/release/
+            firmware/authenticator/target/release/
+            firmware/board-generic/target/release/
+            firmware/device-profile/target/release/
+            firmware/transport/target/release/
