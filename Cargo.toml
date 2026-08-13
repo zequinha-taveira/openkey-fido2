@@ -25,11 +25,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["openkey-fido2 contributors"]
 description = "FIDO2 Embedded Authenticator - Open-source FIDO2/WebAuthn authenticator for embedded devices"
-repository = "https://github.com/openkey-fido2/openkey-fido2"
+repository = "https://github.com/zequinha-taveira/openkey-fido2"
 readme = "README.md"
 keywords = ["fido2", "webauthn", "ctap2", "authenticator", "embedded", "security"]
 categories = ["embedded", "cryptography", "authentication"]
-rust-version = "1.70"
+rust-version = "1.85"
 
 [workspace.metadata.docs.rs]
 all-features = true

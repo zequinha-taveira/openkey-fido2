@@ -25,6 +25,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip pytest fido2 maturin
+
       - name: Build
         run: cargo build --workspace --locked
 
@@ -34,6 +41,8 @@ jobs:
       - name: Run E2E tests
         run: |
           cargo build -p fido2-simulator --locked
+          python -m maturin build --manifest-path python/openkey_core/Cargo.toml --interpreter python --out dist
+          python -m pip install --force-reinstall dist/*.whl
           python -m pytest tests/python -v
 
       - name: Build examples
@@ -50,30 +59,31 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build fido2-simulator
-        run: cargo build -p fido2-simulator --locked
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Install maturin
+        run: python -m pip install --upgrade pip maturin
+
+      - name: Build fido2-simulator (release)
+        run: cargo build -p fido2-simulator --release --locked
 
       - name: Build openkey-core wheel
         run: |
           python -m maturin build --manifest-path python/openkey_core/Cargo.toml --interpreter python --out dist
-          python -m pip install --force-reinstall dist/*.whl
+
+      - name: Stage release artifacts
+        run: |
+          mkdir -p artifacts
+          cp target/release/fido2-simulator artifacts/
+          cp dist/*.whl artifacts/
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7
         with:
           name: release-artifacts
-          path: |
-            simulator/target/release/fido2-simulator
-            dist/*.whl
-            firmware/target/release/
-            protocol/crypto/target/release/
-            protocol/ctap2/target/release/
-            protocol/webauthn/target/release/
-            firmware/storage/target/release/
-            firmware/authenticator/target/release/
-            firmware/board-generic/target/release/
-            firmware/device-profile/target/release/
-            firmware/transport/target/release/
+          path: artifacts/
 
   create-release:
     name: Create Release
@@ -82,9 +92,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: release-artifacts
+          path: artifacts
 
       - name: Create GitHub Release
         id: create_release
@@ -98,14 +110,5 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            simulator/target/release/fido2-simulator
-            dist/*.whl
-            firmware/target/release/
-            protocol/crypto/target/release/
-            protocol/ctap2/target/release/
-            protocol/webauthn/target/release/
-            firmware/storage/target/release/
-            firmware/authenticator/target/release/
-            firmware/board-generic/target/release/
-            firmware/device-profile/target/release/
-            firmware/transport/target/release/
+            artifacts/fido2-simulator
+            artifacts/*.whl

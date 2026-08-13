@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Core FIDO2 authenticator logic"
 license = "MIT"
-repository = "https://github.com/yourusername/fido2-embedded"
+repository = "https://github.com/zequinha-taveira/openkey-fido2"
 authors = ["openkey-fido2 contributors"]
 build = "build.rs"
 

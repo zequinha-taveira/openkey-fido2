@@ -19,6 +19,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Get latest commit message
+        id: get-message
         run: |
           MSG=$(git log -1 --format=%s)
           echo "message=$MSG" >> $GITHUB_OUTPUT
