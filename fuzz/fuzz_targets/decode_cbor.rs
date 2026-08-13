@@ -20,6 +20,19 @@ fuzz_target!(|data: &[u8]| {
             fn values_equivalent(a: &Value, b: &Value) -> bool {
                 match (a, b) {
                     (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
+                    (Value::Tag(xt, xv), Value::Tag(yt, yv)) => {
+                        xt == yt && values_equivalent(xv, yv)
+                    }
+                    (Value::Array(xs), Value::Array(ys)) => {
+                        xs.len() == ys.len()
+                            && xs.iter().zip(ys).all(|(x, y)| values_equivalent(x, y))
+                    }
+                    (Value::Map(xs), Value::Map(ys)) => {
+                        xs.len() == ys.len()
+                            && xs.iter().zip(ys).all(|((xk, xv), (yk, yv))| {
+                                values_equivalent(xk, yk) && values_equivalent(xv, yv)
+                            })
+                    }
                     _ => a == b,
                 }
             }
