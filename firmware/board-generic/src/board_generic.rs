@@ -78,6 +78,24 @@ impl SecurityFeatures {
     }
 }
 
+/// Fonte automática de user presence configurada no board.
+///
+/// Descreve como o board expõe o toque físico do usuário. O host
+/// (`EmbeddedAuthenticator::new_with_board`) usa isso para injetar o sensor
+/// correto no check de `up` do CTAP2, sem chamada manual a
+/// `set_user_presence_button`. No target embarcado, o mesmo papel é cumprido
+/// pelo método [`BoardTrait::button_pressed`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UserPresenceSource {
+    /// Sem fonte automática — user presence é injetado manualmente (ou ausente).
+    #[default]
+    None,
+    /// Botão BOOTSEL reaproveitado (linha CS da flash QSPI) — ex.: RP2350.
+    ///
+    /// Zero fiação extra: o BOOTSEL já vem soldado no board.
+    Bootsel,
+}
+
 /// Descrição estática de um board: identidade, transportes e pinagem.
 ///
 /// Todos os construtores são `const` para que perfis vivam em flash e sejam
@@ -116,6 +134,8 @@ pub struct BoardDefinition {
     pub led_pin: u8,
     /// GPIO do botão de user presence.
     pub button_pin: u8,
+    /// Fonte automática de user presence (ex.: [`UserPresenceSource::Bootsel`]).
+    pub presence_source: UserPresenceSource,
 }
 
 impl BoardDefinition {
@@ -138,6 +158,7 @@ impl BoardDefinition {
             irq_pin: 0,
             led_pin: 0,
             button_pin: 0,
+            presence_source: UserPresenceSource::None,
         }
     }
 
@@ -189,6 +210,13 @@ impl BoardDefinition {
     /// Define o GPIO do botão de user presence.
     pub const fn button(mut self, pin: u8) -> Self {
         self.button_pin = pin;
+        self
+    }
+    /// Define a fonte automática de user presence do board.
+    ///
+    /// Ex.: [`UserPresenceSource::Bootsel`] no RP2350 (botão BOOTSEL sem GPIO).
+    pub const fn presence_source(mut self, source: UserPresenceSource) -> Self {
+        self.presence_source = source;
         self
     }
     /// Habilita o transporte USB-CCID.
@@ -413,5 +441,13 @@ pub trait BoardTrait {
     /// Aguarda `ms` milissegundos. Implementação padrão é no-op.
     fn delay_ms(&mut self, ms: u32) {
         let _ = ms;
+    }
+
+    /// Lê o botão de user presence. Padrão `false` (não pressionado).
+    ///
+    /// Boards com botão dedicado (ou que reaproveitam o BOOTSEL) devem
+    /// sobrescrever para consultar o pino ou [`crate::bootsel::BootselButton`].
+    fn button_pressed(&mut self) -> bool {
+        false
     }
 }

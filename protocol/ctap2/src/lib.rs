@@ -20,7 +20,8 @@ pub use ctap2::{
     Ctap2Command, Ctap2Error, CtapCommand, CtapResponse, EnumerateRPsResponse, ExtensionOutputs,
     Extensions, GetAssertionOptions, GetAssertionRequest, GetAssertionResponse, GetInfoResponse,
     GetVersionResponse, HmacSecretInput, MakeCredentialOptions, MakeCredentialRequest,
-    MakeCredentialResponse, PublicKeyCredParams, RelyingParty, SecurityFeatures, User, AAGUID,
+    MakeCredentialResponse, PublicKeyCredParams, RelyingParty, SecurityFeatures, User,
+    UserPresence, AAGUID,
 };
 
 pub use client_pin::{ClientPin, ClientPinRequest, ClientPinResponse, ClientPinSubCommand};

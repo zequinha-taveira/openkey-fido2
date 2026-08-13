@@ -28,11 +28,11 @@ test-python:
 
 # Verificar formatacao
 fmt-check:
-    cargo fmt --check --workspace
+    cargo fmt --all -- --check
 
 # Aplicar formatacao
 fmt:
-    cargo fmt --workspace
+    cargo fmt --all
 
 # Verificar linter (trata warnings como erros)
 clippy:

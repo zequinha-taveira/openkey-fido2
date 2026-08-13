@@ -1,10 +1,11 @@
 # openkey-fido2
 
 [![CI](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/ci.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/ci.yml)
+[![Release](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/release.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/release.yml)
 [![E2E](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/e2e.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/e2e.yml)
 [![Coverage](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/coverage.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/coverage.yml)
 [![Docs](https://img.shields.io/badge/docs-cargo--doc-blue.svg)](https://docs.rs/openkey-fido2)
-[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#licença)
 
 Firmware FIDO2/WebAuthn em Rust para authenticators embarcados. Implementa CTAP2, WebAuthn, criptografia via `ring`, e armazenamento seguro de credenciais.
@@ -140,7 +141,6 @@ Detalhes do harness de fuzzing em [`fuzz/README.md`](fuzz/README.md).
 | NRF52840 | único | BLE ready, ARM CryptoCell |
 | STM32L4 | único | low-power, hardware RNG |
 | ESP32C3 | único | Wi-Fi/BLE, RISC-V |
-| RP2040 | único | dual-core, baixo custo |
 | RP2350 | único | RISC-V, secure boot, trust zone |
 | GENERIC | único | perfil padrão para desenvolvimento |
 

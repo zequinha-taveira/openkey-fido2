@@ -8,7 +8,7 @@ pub mod crypto;
 /// Encriptação híbrida (ECIES X25519 + ChaCha20-Poly1305).
 pub mod hybrid;
 
-pub use crypto::CryptoEngine;
+pub use crypto::{constant_time_eq, CryptoEngine};
 pub use hybrid::{
     hybrid_decrypt, hybrid_encrypt, hybrid_generate_keypair, HybridCiphertext, ECIES_OVERHEAD,
     NONCE_LEN, TAG_LEN, X25519_KEY_LEN,

@@ -366,6 +366,8 @@ pub enum Ctap2Command {
     GetNextAssertion = 0x08,
     /// BioEnroll (0x09) — gerenciamento de biometria (stub).
     BioEnroll = 0x09,
+    /// GetVersion (0x0F) — retorna versões de firmware/hardware.
+    GetVersion = 0x0F,
     /// EnumerateRPsInitial (0x3B) — inicia enumeração de relying parties.
     EnumerateRPsInitial = 0x3B,
     /// EnumerateRPsNext (0x3C) — continua enumeração de relying parties.
@@ -386,6 +388,7 @@ impl Ctap2Command {
             0x07 => Ctap2Command::Reset,
             0x08 => Ctap2Command::GetNextAssertion,
             0x09 => Ctap2Command::BioEnroll,
+            0x0F => Ctap2Command::GetVersion,
             0x3B => Ctap2Command::EnumerateRPsInitial,
             0x3C => Ctap2Command::EnumerateRPsNext,
             0x0B => Ctap2Command::Selection,
@@ -427,6 +430,8 @@ pub enum Ctap2Error {
     UnsupportedAlgorithm = 0x0C,
     /// Opção do comando não suportada.
     UnsupportedOption = 0x0D,
+    /// Operação negada pelo usuário (ex.: toque físico não detectado).
+    OperationDenied = 0x13,
     /// Chave inválida fornecida.
     InvalidKey = 0x11,
     /// Nenhuma credencial correspondente encontrada.
@@ -599,6 +604,15 @@ struct AuthDataParams<'a> {
     algorithm: i32,
 }
 
+/// Sinal de user presence fornecido pela camada de hardware.
+///
+/// Implementado pelo board e injetado no [`Ctap2Authenticator`] para aplicar o
+/// check de `up` (toque físico) em MakeCredential/GetAssertion.
+pub trait UserPresence: core::fmt::Debug {
+    /// Retorna `true` se o usuário está presente (ex.: botão pressionado).
+    fn is_present(&mut self) -> bool;
+}
+
 #[derive(Debug)]
 pub struct Ctap2Authenticator {
     crypto: CryptoEngine,
@@ -608,6 +622,7 @@ pub struct Ctap2Authenticator {
     attestation_cert: Option<crate::attestation::AttestationCertificate>,
     enumerate_rps_state: Option<EnumerateRPsState>,
     get_next_assertion_state: Option<GetNextAssertionState>,
+    user_presence: Option<Box<dyn UserPresence>>,
 }
 
 #[derive(Debug)]
@@ -651,6 +666,7 @@ impl Ctap2Authenticator {
             attestation_cert: None,
             enumerate_rps_state: None,
             get_next_assertion_state: None,
+            user_presence: None,
         })
     }
 
@@ -677,6 +693,14 @@ impl Ctap2Authenticator {
         self.attestation_cert = Some(cert);
     }
 
+    /// Define a fonte de user presence usada no check de `up`.
+    ///
+    /// Quando `None` (padrão), o check é considerado satisfeito — comportamento
+    /// usado em simulação e testes sem botão físico.
+    pub fn set_user_presence(&mut self, presence: Option<Box<dyn UserPresence>>) {
+        self.user_presence = presence;
+    }
+
     pub fn get_crypto(&self) -> &CryptoEngine {
         &self.crypto
     }
@@ -694,6 +718,14 @@ impl Ctap2Authenticator {
         request: MakeCredentialRequest,
     ) -> Result<MakeCredentialResponse, Box<dyn std::error::Error>> {
         debug!("Processing MakeCredential request");
+
+        if request.options.up {
+            if let Some(presence) = self.user_presence.as_mut() {
+                if !presence.is_present() {
+                    return Err(Box::new(Ctap2Error::OperationDenied));
+                }
+            }
+        }
 
         let rp_id_hash = hash_rp_id(&request.rp.id, &self.crypto);
 
@@ -857,6 +889,14 @@ impl Ctap2Authenticator {
         request: GetAssertionRequest,
     ) -> Result<GetAssertionResponse, Box<dyn std::error::Error>> {
         debug!("Processing GetAssertion request");
+
+        if request.options.up {
+            if let Some(presence) = self.user_presence.as_mut() {
+                if !presence.is_present() {
+                    return Err(Box::new(Ctap2Error::OperationDenied));
+                }
+            }
+        }
 
         let rp_id_hash = hash_rp_id(&request.rp_id, &self.crypto);
         let mut selected: Option<Credential> = None;
@@ -1072,6 +1112,7 @@ impl Ctap2Authenticator {
                 Ok(encoded)
             }
             Ctap2Command::Selection => self.handle_selection(),
+            Ctap2Command::GetVersion => self.handle_get_version(),
             Ctap2Command::ClientPIN => self.handle_client_pin(&data),
             Ctap2Command::Reset => self.handle_reset(),
             Ctap2Command::GetNextAssertion => self.handle_get_next_assertion(),
@@ -1083,6 +1124,10 @@ impl Ctap2Authenticator {
     }
 
     fn handle_selection(&self) -> Result<Vec<u8>, Ctap2Error> {
+        self.handle_get_version()
+    }
+
+    fn handle_get_version(&self) -> Result<Vec<u8>, Ctap2Error> {
         let response = self.get_version().map_err(|_| Ctap2Error::InvalidData)?;
         let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
         Ok(encoded)
@@ -1408,7 +1453,7 @@ impl client_pin::ClientPin for Ctap2Authenticator {
             .map_err(|_| Ctap2Error::PinRequired)?;
 
         let old_hash = self.crypto.sha256(old_pin);
-        if old_hash != stored_hash {
+        if !crypto::constant_time_eq(&old_hash, &stored_hash) {
             self.decrement_pin_retries();
             return Err(Ctap2Error::PinInvalid);
         }
@@ -1466,7 +1511,7 @@ impl client_pin::ClientPin for Ctap2Authenticator {
             .retrieve(client_pin::PIN_STORAGE_KEY)
             .map_err(|_| Ctap2Error::PinRequired)?;
         let submitted_hash = self.crypto.sha256(pin);
-        if submitted_hash != stored_hash {
+        if !crypto::constant_time_eq(&submitted_hash, &stored_hash) {
             self.decrement_pin_retries();
             return Err(Ctap2Error::PinInvalid);
         }
@@ -1604,6 +1649,99 @@ mod tests {
         assert_eq!(response.firmware_version, "0.1.0");
         assert_eq!(response.firmware_commit_id, "0000000");
         assert_eq!(response.firmware_build_id, "00000000");
+    }
+
+    #[test]
+    fn test_get_version() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let result = authenticator.process_command(0x0F, vec![]);
+        assert!(result.is_ok());
+
+        let encoded = result.unwrap();
+        let response: GetVersionResponse = from_reader(encoded.as_slice()).unwrap();
+        assert_eq!(response.firmware_version, "0.1.0");
+        assert_eq!(response.firmware_commit_id, "0000000");
+        assert_eq!(response.firmware_build_id, "00000000");
+    }
+
+    #[derive(Debug)]
+    struct TestUserPresence {
+        present: bool,
+    }
+
+    impl UserPresence for TestUserPresence {
+        fn is_present(&mut self) -> bool {
+            self.present
+        }
+    }
+
+    fn make_credential_request(up: bool) -> MakeCredentialRequest {
+        MakeCredentialRequest {
+            client_data_hash: b"test".to_vec(),
+            rp: RelyingParty {
+                id: "example.com".to_string(),
+                name: None,
+                icon: None,
+            },
+            user: User {
+                id: b"user123".to_vec(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            },
+            pub_key_cred_params: vec![PublicKeyCredParams {
+                r#type: "public-key".to_string(),
+                algorithms: -7,
+            }],
+            exclude_list: vec![],
+            extensions: None,
+            options: MakeCredentialOptions {
+                rk: false,
+                uv: false,
+                up,
+                extended: false,
+            },
+            pin_protocol: None,
+            enterprise_protections: None,
+        }
+    }
+
+    #[test]
+    fn test_user_presence_denied_when_button_not_pressed() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut auth = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        auth.set_user_presence(Some(Box::new(TestUserPresence { present: false })));
+
+        match auth.make_credential(make_credential_request(true)) {
+            Err(e) => assert_eq!(
+                e.downcast_ref::<Ctap2Error>(),
+                Some(&Ctap2Error::OperationDenied)
+            ),
+            Ok(_) => panic!("expected OperationDenied"),
+        }
+    }
+
+    #[test]
+    fn test_user_presence_allowed_when_button_pressed() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut auth = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        auth.set_user_presence(Some(Box::new(TestUserPresence { present: true })));
+
+        assert!(auth.make_credential(make_credential_request(true)).is_ok());
+    }
+
+    #[test]
+    fn test_user_presence_default_allows_without_check() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut auth = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        assert!(auth.make_credential(make_credential_request(true)).is_ok());
     }
 
     #[test]
