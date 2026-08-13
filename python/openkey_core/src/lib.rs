@@ -1,8 +1,26 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use authenticator::EmbeddedAuthenticator;
 use board_generic::BoardDefinition;
+use ctap2::UserPresence;
+
+/// User presence controlado pelo host (simulação/testes).
+///
+/// Lê um [`AtomicBool`] compartilhado, permitindo simular press/release do
+/// botão (ex.: BOOTSEL do RP2350) a partir do Python via
+/// [`VirtualAuthenticator::set_presence_pressed`].
+#[derive(Debug)]
+struct SimulatedPresence(Arc<AtomicBool>);
+
+impl UserPresence for SimulatedPresence {
+    fn is_present(&mut self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 /// Autenticador virtual FIDO2 em processo, ligado ao mesmo núcleo Rust que
 /// compila para firmware (`EmbeddedAuthenticator`). Fala CTAP2 real sobre
@@ -10,6 +28,7 @@ use board_generic::BoardDefinition;
 #[pyclass(name = "VirtualAuthenticator", module = "openkey_core")]
 pub struct VirtualAuthenticator {
     inner: EmbeddedAuthenticator,
+    presence: Arc<AtomicBool>,
 }
 
 #[pymethods]
@@ -23,9 +42,9 @@ impl VirtualAuthenticator {
     #[pyo3(signature = (aaguid=None, product_name=None))]
     fn new(aaguid: Option<Vec<u8>>, product_name: Option<String>) -> PyResult<Self> {
         let aaguid: [u8; 16] = match aaguid {
-            Some(bytes) => bytes.try_into().map_err(|_| {
-                PyValueError::new_err("aaguid deve ter exatamente 16 bytes")
-            })?,
+            Some(bytes) => bytes
+                .try_into()
+                .map_err(|_| PyValueError::new_err("aaguid deve ter exatamente 16 bytes"))?,
             None => [0u8; 16],
         };
         let board = BoardDefinition::new(
@@ -35,10 +54,25 @@ impl VirtualAuthenticator {
             },
             aaguid,
         );
-        let inner = EmbeddedAuthenticator::new_with_board(&board).map_err(|e| {
+        let mut inner = EmbeddedAuthenticator::new_with_board(&board).map_err(|e| {
             PyValueError::new_err(format!("falha ao inicializar o autenticador: {e}"))
         })?;
-        Ok(Self { inner })
+
+        // User presence default = presente (comportamento anterior preservado).
+        let presence = Arc::new(AtomicBool::new(true));
+        inner.set_user_presence(Some(Box::new(SimulatedPresence(presence.clone()))));
+
+        Ok(Self { inner, presence })
+    }
+
+    /// Simula o botão de user presence (ex.: BOOTSEL do RP2350).
+    ///
+    /// Args:
+    ///     pressed (bool): `True` = botão pressionado (usuário presente).
+    ///     Quando `False`, comandos com `up` (MakeCredential/GetAssertion)
+    ///     retornam `CTAP2_ERR_OPERATION_DENIED`.
+    fn set_presence_pressed(&mut self, pressed: bool) {
+        self.presence.store(pressed, Ordering::SeqCst);
     }
 
     /// Executa um comando CTAP2 (wire format) contra o núcleo Rust.
