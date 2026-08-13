@@ -61,7 +61,7 @@ completos; itens com 🚧 estão em progresso; itens com ❌ são incrementos fu
 - ✅ Testes do virtual board (CBOR, GPIO, I2C, SPI, CCID, perfis)
 
 ### Infraestrutura
-- ✅ Workspace Cargo com 11 crates
+- ✅ Workspace Cargo com 16 crates
 - ✅ Simulador com JSON line protocol
 - ✅ Exemplos básicos funcionando
 - ✅ AGENTS.md (guia do agente)
