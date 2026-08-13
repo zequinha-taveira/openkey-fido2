@@ -71,6 +71,19 @@ def test_up_false_dispensa_check_de_presenca(auth):
     assert not att.auth_data.is_user_present()
 
 
+def test_denial_nao_deixa_estado_parcial(auth):
+    # MakeCredential negado por falta de user presence não deve criar credencial:
+    # ao pressionar o botão e repetir com o mesmo user_id, o request deve
+    # funcionar (sem acusar CREDENTIAL_EXCLUDED).
+    auth.set_presence_pressed(False)
+    with pytest.raises(Ctap2ResponseError):
+        register(auth, user_id=b"user-1")
+
+    auth.set_presence_pressed(True)
+    att = register(auth, user_id=b"user-1")
+    assert att.auth_data.is_user_present()
+
+
 # ---- GetAssertion --------------------------------------------------------
 
 
@@ -100,3 +113,20 @@ def test_assertion_up_false_dispensa_check_de_presenca(auth):
     auth.set_presence_pressed(False)
     assertion = login(auth, credential_id, up=False)
     assert assertion.credential_id == credential_id
+
+
+def test_assertion_negada_nao_incrementa_sign_counter(auth):
+    # GetAssertion negado não deve consumir um incremento do sign counter.
+    att = register(auth)
+    credential_id = att.auth_data.credential_data.credential_id
+
+    first = login(auth, credential_id)  # up default true -> presente
+    assert first.auth_data.counter == 1
+
+    auth.set_presence_pressed(False)
+    with pytest.raises(Ctap2ResponseError):
+        login(auth, credential_id, up=True)
+
+    auth.set_presence_pressed(True)
+    third = login(auth, credential_id)
+    assert third.auth_data.counter == 2  # não 3: a negação não incrementou
