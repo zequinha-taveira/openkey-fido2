@@ -121,8 +121,12 @@ pub fn is_pin_set(storage: &storage::StorageEngine) -> bool {
     storage.retrieve(PIN_STORAGE_KEY).is_ok()
 }
 
+/// Indica se o PIN está bloqueado após [`PIN_BLOCK_THRESHOLD`] falhas
+/// consecutivas. O contador começa em [`PIN_MAX_RETRIES`] e é decrementado a
+/// cada falha; o bloqueio ocorre quando restam
+/// `PIN_MAX_RETRIES - PIN_BLOCK_THRESHOLD` tentativas ou menos.
 pub fn is_pin_blocked(storage: &storage::StorageEngine) -> bool {
-    read_retries(storage) < PIN_BLOCK_THRESHOLD
+    read_retries(storage) <= PIN_MAX_RETRIES - PIN_BLOCK_THRESHOLD
 }
 
 pub(crate) fn handle_client_pin(
@@ -233,7 +237,7 @@ fn handle_get_pin_token(
             .retrieve(PIN_STORAGE_KEY)
             .map_err(|_| Ctap2Error::PinRequired)?;
 
-        if submitted_hash != stored_hash {
+        if !crypto::constant_time_eq(&submitted_hash, &stored_hash) {
             authenticator.decrement_pin_retries();
             return Err(Ctap2Error::PinInvalid);
         }
@@ -406,7 +410,7 @@ mod tests {
         let mut authenticator = create_authenticator();
         authenticator.set_pin(b"1234").unwrap();
 
-        for _ in 0..(PIN_MAX_RETRIES - PIN_BLOCK_THRESHOLD + 1) {
+        for _ in 0..PIN_BLOCK_THRESHOLD {
             authenticator.change_pin(b"wrong", b"5678").ok();
         }
 
