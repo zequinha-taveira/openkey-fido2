@@ -14,9 +14,9 @@ use ctap2::UserPresence;
 /// botão (ex.: BOOTSEL do RP2350) a partir do Python via
 /// [`VirtualAuthenticator::set_presence_pressed`].
 #[derive(Debug)]
-struct SharedPresence(Arc<AtomicBool>);
+struct SimulatedPresence(Arc<AtomicBool>);
 
-impl UserPresence for SharedPresence {
+impl UserPresence for SimulatedPresence {
     fn is_present(&mut self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
@@ -60,7 +60,7 @@ impl VirtualAuthenticator {
 
         // User presence default = presente (comportamento anterior preservado).
         let presence = Arc::new(AtomicBool::new(true));
-        inner.set_user_presence(Some(Box::new(SharedPresence(presence.clone()))));
+        inner.set_user_presence(Some(Box::new(SimulatedPresence(presence.clone()))));
 
         Ok(Self { inner, presence })
     }
