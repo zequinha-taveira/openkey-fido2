@@ -608,7 +608,7 @@ struct AuthDataParams<'a> {
 ///
 /// Implementado pelo board e injetado no [`Ctap2Authenticator`] para aplicar o
 /// check de `up` (toque físico) em MakeCredential/GetAssertion.
-pub trait UserPresence: core::fmt::Debug {
+pub trait UserPresence: core::fmt::Debug + Send + Sync {
     /// Retorna `true` se o usuário está presente (ex.: botão pressionado).
     fn is_present(&mut self) -> bool;
 }
