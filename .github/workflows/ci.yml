@@ -64,7 +64,7 @@ jobs:
   fuzz-smoke:
     name: Fuzz smoke (60s)
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v7
 
