@@ -107,6 +107,11 @@ impl WebAuthnAuthenticator {
         self.ctap.set_capabilities(capabilities);
     }
 
+    /// Define a fonte de user presence (check de `up`) no CTAP2 subjacente.
+    pub fn set_user_presence(&mut self, presence: Option<Box<dyn ctap2::UserPresence>>) {
+        self.ctap.set_user_presence(presence);
+    }
+
     /// Retorna referência imutável às capacidades configuradas.
     pub fn capabilities(&self) -> &ctap2::Ctap2Capabilities {
         self.ctap.capabilities()

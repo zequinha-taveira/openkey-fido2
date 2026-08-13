@@ -1,4 +1,6 @@
-use board_generic::BoardDefinition;
+use board_generic::{
+    BoardDefinition, BootselButton, Rp2350Qspi, UserPresenceButton, UserPresenceSource,
+};
 use core::fmt;
 use crypto::CryptoEngine;
 use device_profile::{
@@ -47,7 +49,9 @@ impl EmbeddedAuthenticator {
     /// AAGUID, transportes e features de segurança vêm do hardware.
     pub fn new_with_board(board: &BoardDefinition) -> Result<Self, Box<dyn std::error::Error>> {
         let profile = DeviceProfileBuilder::from_board(board).build();
-        Self::new_with_profile(profile)
+        let mut auth = Self::new_with_profile(profile)?;
+        auth.set_board_user_presence(board);
+        Ok(auth)
     }
 
     /// Cria um autenticador a partir de um perfil de produto explícito.
@@ -126,6 +130,36 @@ impl EmbeddedAuthenticator {
         self.discovery.profile()
     }
 
+    /// Define a fonte de user presence aplicada ao check de `up` no CTAP2.
+    ///
+    /// `None` (padrão) considera o usuário presente — adequado a simulação e
+    /// testes sem botão físico.
+    pub fn set_user_presence(&mut self, presence: Option<Box<dyn ctap2::UserPresence>>) {
+        self.webauthn.set_user_presence(presence);
+    }
+
+    /// Injeta um botão de user presence do board (ex.: BOOTSEL do RP2350).
+    pub fn set_user_presence_button<B>(&mut self, button: B)
+    where
+        B: UserPresenceButton + core::fmt::Debug + 'static,
+    {
+        self.set_user_presence(Some(Box::new(ButtonPresence(button))));
+    }
+
+    /// Aplica a fonte de user presence declarada no board ao check de `up`.
+    ///
+    /// Boards com [`UserPresenceSource::Bootsel`] (RP2350) ganham o sensor
+    /// BOOTSEL automaticamente, sem chamada manual a
+    /// [`EmbeddedAuthenticator::set_user_presence_button`].
+    fn set_board_user_presence(&mut self, board: &BoardDefinition) {
+        match board.presence_source {
+            UserPresenceSource::Bootsel => {
+                self.set_user_presence_button(BootselButton::new(Rp2350Qspi::new()));
+            }
+            UserPresenceSource::None => {}
+        }
+    }
+
     /// Registra uma nova credencial (CTAP2 `authenticatorMakeCredential`).
     pub fn make_credential(
         &mut self,
@@ -162,6 +196,22 @@ impl EmbeddedAuthenticator {
         data: Vec<u8>,
     ) -> Result<Vec<u8>, ctap2::Ctap2Error> {
         self.webauthn.process_command(cmd, data)
+    }
+}
+
+/// Adapta um [`UserPresenceButton`] do HAL para o [`ctap2::UserPresence`]
+/// consumido pelo autenticador.
+struct ButtonPresence<B>(B);
+
+impl<B> core::fmt::Debug for ButtonPresence<B> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ButtonPresence").finish_non_exhaustive()
+    }
+}
+
+impl<B: UserPresenceButton> ctap2::UserPresence for ButtonPresence<B> {
+    fn is_present(&mut self) -> bool {
+        self.0.is_pressed()
     }
 }
 
@@ -259,5 +309,86 @@ fn ctap2_capabilities(caps: &Capabilities) -> ctap2::Ctap2Capabilities {
             unique_id: caps.security.unique_id,
             tamper_detection: caps.security.tamper_detection,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request_with_up(up: bool) -> ctap2::MakeCredentialRequest {
+        ctap2::MakeCredentialRequest {
+            client_data_hash: b"test".to_vec(),
+            rp: ctap2::RelyingParty {
+                id: "example.com".to_string(),
+                name: None,
+                icon: None,
+            },
+            user: ctap2::User {
+                id: b"user123".to_vec(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            },
+            pub_key_cred_params: vec![ctap2::PublicKeyCredParams {
+                r#type: "public-key".to_string(),
+                algorithms: -7,
+            }],
+            exclude_list: vec![],
+            extensions: None,
+            options: ctap2::MakeCredentialOptions {
+                rk: false,
+                uv: false,
+                up,
+                extended: false,
+            },
+            pin_protocol: None,
+            enterprise_protections: None,
+        }
+    }
+
+    #[test]
+    fn test_bootsel_user_presence_denied_when_not_pressed() {
+        let mut auth = EmbeddedAuthenticator::new().unwrap();
+        // BOOTSEL não pressionado (padrão: CS em nível alto) => up negado.
+        auth.set_user_presence_button(BootselButton::new(Rp2350Qspi::new()));
+
+        match auth.make_credential(request_with_up(true)) {
+            Err(e) => assert_eq!(
+                e.downcast_ref::<ctap2::Ctap2Error>(),
+                Some(&ctap2::Ctap2Error::OperationDenied)
+            ),
+            Ok(_) => panic!("expected OperationDenied for BOOTSEL not pressed"),
+        }
+    }
+
+    #[test]
+    fn test_bootsel_user_presence_allowed_when_pressed() {
+        let mut qspi = Rp2350Qspi::new();
+        qspi.set_cs_level(false); // BOOTSEL pressionado (CS -> GND)
+        let mut auth = EmbeddedAuthenticator::new().unwrap();
+        auth.set_user_presence_button(BootselButton::new(qspi));
+
+        assert!(auth.make_credential(request_with_up(true)).is_ok());
+    }
+
+    #[test]
+    fn test_new_with_board_rp2350_auto_wires_bootsel_and_denies_up() {
+        let mut auth = EmbeddedAuthenticator::new_with_board(&board_generic::RP2350).unwrap();
+        // BOOTSEL idle (não pressionado) => up negado, sem chamada manual.
+        match auth.make_credential(request_with_up(true)) {
+            Err(e) => assert_eq!(
+                e.downcast_ref::<ctap2::Ctap2Error>(),
+                Some(&ctap2::Ctap2Error::OperationDenied)
+            ),
+            Ok(_) => panic!("expected OperationDenied for RP2350 auto-wired BOOTSEL"),
+        }
+    }
+
+    #[test]
+    fn test_new_with_board_generic_allows_up() {
+        let mut auth = EmbeddedAuthenticator::new_with_board(&board_generic::GENERIC).unwrap();
+        // Sem fonte automática => user presence ausente => up satisfeito.
+        assert!(auth.make_credential(request_with_up(true)).is_ok());
     }
 }

@@ -172,6 +172,10 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Testes E2E Python: `tests/python/test_ctap2_commands.py`** — Testar Reset, GetNextAssertion, EnumerateRPs, BioEnroll. Crate: `tests`. ⬅️ depende de todos os comandos. Critério: `pytest tests/python/test_ctap2_commands.py -v` passando.
 - ✅ **Adicionar `rp_id` campo em `Credential`** — Armazenar plaintext do RP ID para suportar EnumerateRPs. Crate: `storage`. Critério: credenciais armazenam `rp_id` válido.
 
+#### Hardware / User Presence
+
+- ✅ **Reaproveitar o botão BOOTSEL do RP2350 para user presence** — zero fiação extra: o BOOTSEL já vem no board (ligado ao CS da flash QSPI, não é GPIO comum). Implementado `firmware/board-generic/src/bootsel.rs` (trait `UserPresenceButton` + `BootselButton` + `Rp2350Qspi` + testes press/release) e integrado ao fluxo `up`: trait `ctap2::UserPresence` + `Ctap2Authenticator::set_user_presence` (check em MakeCredential/GetAssertion → `Ctap2Error::OperationDenied`), `BoardTrait::button_pressed()` e `EmbeddedAuthenticator::set_user_presence_button()` (injeta o `BootselButton`). Auto-wiring: enum `UserPresenceSource::Bootsel` no perfil `RP2350` + `EmbeddedAuthenticator::new_with_board` conecta o BOOTSEL ao fluxo `up` automaticamente. Crate: `board-generic`, `ctap2`, `authenticator`. Critério: `press`/`release` do BOOTSEL detectados; `up` negado quando o botão não está pressionado.
+
 ### Prioridade Baixa
 
 #### Segurança Avançada

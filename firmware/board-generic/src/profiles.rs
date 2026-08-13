@@ -8,7 +8,7 @@
 //!
 //! Available profiles: `NRF52840`, `STM32L4`, `ESP32C3`, `RP2350` and `GENERIC`.
 
-use crate::board_generic::{BoardDefinition, SecurityFeatures};
+use crate::board_generic::{BoardDefinition, SecurityFeatures, UserPresenceSource};
 
 /// nRF52840-based authenticator with USB-HID, NFC and BLE transports.
 pub const NRF52840: BoardDefinition = BoardDefinition::new(
@@ -136,6 +136,8 @@ pub const fn rp2350_with_pins(pins: Rp2350Pins) -> BoardDefinition {
     .secure_storage(true)
     .crypto_accelerator(true)
     .security_features(SecurityFeatures::rp2350())
+    // User presence reaproveita o BOOTSEL (linha CS da flash QSPI), não um GPIO.
+    .presence_source(UserPresenceSource::Bootsel)
     .i2c_sda(pins.i2c_sda)
     .i2c_scl(pins.i2c_scl)
     .spi_mosi(pins.spi_mosi)
@@ -191,3 +193,21 @@ pub const GENERIC: BoardDefinition = BoardDefinition::new(
 .irq(7)
 .led(8)
 .button(9);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rp2350_uses_bootsel_for_presence() {
+        assert_eq!(RP2350.presence_source, UserPresenceSource::Bootsel);
+    }
+
+    #[test]
+    fn test_other_profiles_have_no_auto_presence() {
+        assert_eq!(GENERIC.presence_source, UserPresenceSource::None);
+        assert_eq!(NRF52840.presence_source, UserPresenceSource::None);
+        assert_eq!(STM32L4.presence_source, UserPresenceSource::None);
+        assert_eq!(ESP32C3.presence_source, UserPresenceSource::None);
+    }
+}
