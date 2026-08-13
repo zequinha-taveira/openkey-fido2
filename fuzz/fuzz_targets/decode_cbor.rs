@@ -7,6 +7,30 @@ use ctap2::{
 };
 use libfuzzer_sys::fuzz_target;
 
+/// `ciborium::Value` normaliza o CBOR (indefinite→definite, tags 0..=3 →
+/// tipos naturais, f16→f64), então `decode(encode(v))` pode diferir de `v` no
+/// primeiro passo — ex.: tag 2 (bignum) sobre bstr indefinido vira `Integer`.
+/// O invariante correto é que a re-encodação *estabiliza*: a segunda e a
+/// terceira re-encodações são idênticas.
+fn reencode_stable(value: &Value) -> bool {
+    let Ok(e1) = encode_cbor(value) else {
+        return true;
+    };
+    let Ok(v2) = decode_cbor::<Value>(&e1) else {
+        return false;
+    };
+    let Ok(e2) = encode_cbor(&v2) else {
+        return true;
+    };
+    let Ok(v3) = decode_cbor::<Value>(&e2) else {
+        return false;
+    };
+    let Ok(e3) = encode_cbor(&v3) else {
+        return true;
+    };
+    e2 == e3
+}
+
 fuzz_target!(|data: &[u8]| {
     let _ = decode_cbor::<MakeCredentialRequest>(data);
     let _ = decode_cbor::<GetAssertionRequest>(data);
@@ -14,32 +38,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = decode_cbor::<BioEnrollRequest>(data);
 
     if let Ok(value) = decode_cbor::<Value>(data) {
-        if let Ok(reencoded) = encode_cbor(&value) {
-            let roundtrip = decode_cbor::<Value>(&reencoded)
-                .expect("reencoding a decoded CBOR value must stay decodable");
-            fn values_equivalent(a: &Value, b: &Value) -> bool {
-                match (a, b) {
-                    (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
-                    (Value::Tag(xt, xv), Value::Tag(yt, yv)) => {
-                        xt == yt && values_equivalent(xv, yv)
-                    }
-                    (Value::Array(xs), Value::Array(ys)) => {
-                        xs.len() == ys.len()
-                            && xs.iter().zip(ys).all(|(x, y)| values_equivalent(x, y))
-                    }
-                    (Value::Map(xs), Value::Map(ys)) => {
-                        xs.len() == ys.len()
-                            && xs.iter().zip(ys).all(|((xk, xv), (yk, yv))| {
-                                values_equivalent(xk, yk) && values_equivalent(xv, yv)
-                            })
-                    }
-                    _ => a == b,
-                }
-            }
-            assert!(
-                values_equivalent(&value, &roundtrip),
-                "CBOR roundtrip must be stable"
-            );
-        }
+        assert!(reencode_stable(&value), "CBOR re-encoding must stabilize");
     }
 });
