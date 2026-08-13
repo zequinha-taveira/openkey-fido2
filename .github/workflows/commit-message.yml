@@ -9,7 +9,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
 
 jobs:
   validate:
@@ -17,11 +16,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Get latest commit message
         id: get-message
         run: |
-          MSG=$(git log -1 --format=%s)
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            SHA="HEAD"
+          fi
+          # --no-merges: merge commits ("Merge pull request #N", "Merge ... into ...")
+          # are auto-generated and don't follow the lowercase convention.
+          MSG=$(git log -1 --format=%s --no-merges "$SHA")
           echo "message=$MSG" >> $GITHUB_OUTPUT
 
       - name: Validate format
@@ -53,7 +61,7 @@ jobs:
 
       - name: Comment on PR if invalid
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const msg = '${{ steps.get-message.outputs.message }}';

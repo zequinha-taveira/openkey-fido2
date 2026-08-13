@@ -13,7 +13,7 @@
 //! `Rp2350UsbPeriph` em `transport::embedded::rp2350`.
 
 /// Contrato de um sensor de user presence (toque físico).
-pub trait UserPresenceButton {
+pub trait UserPresenceButton: Send + Sync {
     /// Retorna `true` se o botão está pressionado neste instante.
     fn is_pressed(&mut self) -> bool;
 }
