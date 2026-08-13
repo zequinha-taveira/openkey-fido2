@@ -49,6 +49,7 @@ CTAP2_ERROR_NAMES = {
     0x0A: "CREDENTIAL_EXCLUDED",
     0x0C: "UNSUPPORTED_ALGORITHM",
     0x0E: "NO_CREDENTIALS",
+    0x13: "OPERATION_DENIED",
     0x31: "PIN_INVALID",
     0x32: "PIN_INVALID_RETRIES",
     0x33: "PIN_REQUIRED",
@@ -219,6 +220,14 @@ class VirtualAuthenticator:
     def reset(self) -> None:
         """Executa `reset`, apagando todas as credenciais."""
         self.process_command(CMD.RESET)
+
+    def set_presence_pressed(self, pressed: bool) -> None:
+        """Simula o botão de user presence (ex.: BOOTSEL do RP2350).
+
+        Quando `False`, comandos com `up` (MakeCredential/GetAssertion)
+        retornam `OPERATION_DENIED` (0x13), como um botão físico solto.
+        """
+        self._native.set_presence_pressed(pressed)
 
     @staticmethod
     def rp_id_hash(rp_id: str) -> bytes:

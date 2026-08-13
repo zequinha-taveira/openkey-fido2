@@ -17,3 +17,8 @@ fuzz/coverage/
 coverage/
 tarpaulin-report.html
 cobertura.xml
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
