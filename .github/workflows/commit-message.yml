@@ -23,10 +23,13 @@ jobs:
         id: get-message
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            MSG=$(git log -1 --format=%s "${{ github.event.pull_request.head.sha }}")
+            SHA="${{ github.event.pull_request.head.sha }}"
           else
-            MSG=$(git log -1 --format=%s)
+            SHA="HEAD"
           fi
+          # --no-merges: merge commits ("Merge pull request #N", "Merge ... into ...")
+          # are auto-generated and don't follow the lowercase convention.
+          MSG=$(git log -1 --format=%s --no-merges "$SHA")
           echo "message=$MSG" >> $GITHUB_OUTPUT
 
       - name: Validate format
