@@ -1,0 +1,13 @@
+# Configuração local do crate standalone `nrf52840-firmware`.
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "target-cpu=cortex-m4",
+]
+
+runner = "probe-rs run --chip nRF52840_xxAA"

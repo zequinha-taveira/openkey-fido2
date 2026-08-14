@@ -90,6 +90,23 @@ clean:
 build-rp2350:
     cargo build -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features
 
+# Compilar o firmware bare-metal completo para RP2350 (gera .elf)
+# Crate standalone com workspace proprio; usa o target definido no seu .cargo/config.toml
+build-rp2350-firmware:
+    cd examples/rp2350-firmware && cargo build
+
+# Checar o firmware bare-metal do RP2350 sem gerar binario
+check-rp2350-firmware:
+    cd examples/rp2350-firmware && cargo check
+
+# Compilar o firmware bare-metal completo para nRF52840 (gera .elf)
+build-nrf52840-firmware:
+    cd examples/nrf52840-firmware && cargo build
+
+# Checar o firmware bare-metal do nRF52840 sem gerar binario
+check-nrf52840-firmware:
+    cd examples/nrf52840-firmware && cargo check
+
 # Compilacao cruzada para nRF52840 (ARM Cortex-M4F)
 build-nrf52840:
     cargo build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features

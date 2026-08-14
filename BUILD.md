@@ -94,6 +94,61 @@ cargo build -p transport --target thumbv7em-none-eabihf --features embedded --no
 just check-targets
 ```
 
+#### Firmware bare-metal executável (RP2350)
+
+Além da crate `transport`, há um **binário `no_std` completo de boot** para o
+RP2350 em [`examples/rp2350-firmware/`](examples/rp2350-firmware/):
+
+```bash
+# Gerar o binário ELF para o RP2350 (Cortex-M33)
+cd examples/rp2350-firmware && cargo build
+
+# Via just
+just build-rp2350-firmware
+```
+
+O crate é **standalone** (workspace próprio, como `fuzz/`), portanto não é
+compilado por `cargo build --workspace`. Ele configura os clocks reais via
+`rp235x-hal` (XOSC + PLLs), instala um heap `embedded-alloc` e executa um loop
+de despacho CTAPHID sobre o crate `transport`, usando o backend USB real
+(`usb-device` + `hal::usb::UsbBus` do RP2350, via `transport::UsbHidBackend`).
+O artefato final é um binário ELF em
+`examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/debug/`.
+
+O backend USB real vive no crate `transport` atrás da feature `usb-device`
+(módulo `embedded::usb_hid_backend`). Testes em host com um `MockUsbBus`:
+
+```bash
+cargo test -p transport --features usb-device
+```
+
+#### Firmware bare-metal executável (nRF52840)
+
+Há um binário equivalente para o **nRF52840** (Nordic, Cortex-M4F) em
+[`examples/nrf52840-firmware/`](examples/nrf52840-firmware/):
+
+```bash
+# Gerar o binário ELF para o nRF52840 (Cortex-M4F)
+cd examples/nrf52840-firmware && cargo build
+
+# Via just
+just build-nrf52840-firmware
+```
+
+Configura clocks reais via `nrf52840-hal` (HFCLK externo), heap
+`embedded-alloc` e o loop CTAPHID (referência `Nrf52840UsbHid`/`Nrf52840Nfc`).
+
+#### Virtual CTAPHID Bridge (Linux/UHID)
+
+[`tools/ctaphid_bridge.py`](tools/ctaphid_bridge.py) cria um dispositivo
+USB-HID virtual (`/dev/uhid`, **Linux only**) e conecta o
+`fido2-simulator --raw-cbor` a navegadores / FIDO Conformance Tool. A framing
+CTAPHID e o wrapping CBOR são testáveis em host:
+
+```bash
+python -m pytest tests/python/test_ctaphid_bridge.py -v
+```
+
 ---
 
 ## Testes

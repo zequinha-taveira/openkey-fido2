@@ -1,0 +1,16 @@
+# Configuração local do crate standalone `rp2350-firmware`.
+#
+# `cargo build` (sem argumentos) usa o target Cortex-M33 do RP2350 por padrão.
+# O `runner` usa probe-rs para `cargo run` em hardware real.
+
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = [
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=-Tlink.x",
+    "-C", "target-cpu=cortex-m33",
+]
+
+runner = "probe-rs run --chip RP2350"

@@ -86,8 +86,10 @@ Firmware FIDO2/WebAuthn em Rust para authenticators embarcados. Implementa CTAP2
 - **Credential pruning** — LRU quando `max_credential_count` atingido
 
 ### Transportes
-- **USB-HID** stub — placeholder para implementação futura
+- **USB-HID** — stub (host) + backend real via `usb-device` para RP2350 (`transport::UsbHidBackend`, feature `usb-device`)
 - **CCID** stub — interface para smartcard
+- **Firmware bare-metal** — `examples/rp2350-firmware` e `examples/nrf52840-firmware` (boot + loop CTAPHID)
+- **Virtual CTAPHID Bridge** — `tools/ctaphid_bridge.py` (UHID, Linux)
 
 ## Comandos
 

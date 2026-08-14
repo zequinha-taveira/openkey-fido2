@@ -1,0 +1,34 @@
+[package]
+name = "rp2350-firmware"
+version = "0.1.0"
+edition = "2021"
+description = "Bare-metal boot application for the RP2350 (FIDO2 authenticator firmware skeleton)"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/zequinha-taveira/openkey-fido2"
+repository = "https://github.com/zequinha-taveira/openkey-fido2"
+publish = false
+
+# Crate standalone (fora do workspace principal, como `fuzz/`): é um binário
+# `no_std` para Cortex-M33 que não compila para o host. O `[workspace]` vazio
+# isola este crate do workspace raiz, mantendo `cargo build --workspace`
+# funcionando normalmente.
+[workspace]
+
+[dependencies]
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+embedded-alloc = "0.7"
+embedded-hal = "1.0"
+rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "rt"] }
+transport = { path = "../../firmware/transport", default-features = false, features = ["embedded", "usb-device"] }
+usb-device = "0.3"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
