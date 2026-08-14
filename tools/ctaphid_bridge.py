@@ -450,6 +450,65 @@ class CtaphidBridge:
 
 
 # --------------------------------------------------------------------------
+# self-test
+# --------------------------------------------------------------------------
+
+
+def self_test(simulator_path: str | None) -> int:
+    """Valida o pipeline completo da ponte sem UHID: fragmentação/remontagem
+    CTAPHID, handshake CTAPHID_INIT e round-trip CBOR GetInfo contra o
+    simulador real. Roda em qualquer plataforma."""
+    # 1. Roundtrip de fragmentação/remontagem multi-pacote.
+    payload = bytes(range(256))
+    pkts = fragment(0x11223344, CMD_CBOR, payload)
+    assert len(pkts) > 1, "payload de 256 bytes deve gerar múltiplos pacotes"
+    asm = Assembler()
+    result = None
+    for pkt in pkts:
+        r = asm.process(pkt)
+        if r is not None:
+            result = r
+    assert result is not None and result[2] == payload, "roundtrip de fragmentação falhou"
+    print("[ok] fragmentação/remontagem CTAPHID (multi-pacote)")
+
+    # 2. Handshake INIT + CBOR GetInfo via simulador.
+    sim = Simulator(simulator_path)
+    try:
+        channels = ChannelManager()
+        asm = Assembler()
+
+        # INIT (broadcast CID, nonce de 8 bytes).
+        init_pkt = pack_init(CTAPHID_BROADCAST_CID, CMD_INIT, bytes(8), total_len=8)
+        msg = asm.process(init_pkt)
+        assert msg is not None, "sem mensagem do INIT"
+        _, cmd, nonce = msg
+        assert cmd == CMD_INIT
+
+        init_resp = channels.build_init_response(nonce)
+        assert len(init_resp) == 17
+        assigned = int.from_bytes(init_resp[8:12], "big")
+        assert assigned not in (0x00000000, CTAPHID_BROADCAST_CID), "CID inválido"
+        assert init_resp[12] == 2, "versão do protocolo CTAPHID deve ser 2"
+        assert init_resp[16] & 0x04, "CAPABILITY_CBOR ausente"
+        print(f"[ok] CTAPHID_INIT → CID 0x{assigned:08x}, caps 0x{init_resp[16]:02x}")
+
+        # CBOR GetInfo (opcode 0x04, sem parâmetros).
+        getinfo = cbor.encode({1: 0x04})
+        ctap_cmd, params = ctap2_request_decode(getinfo)
+        assert ctap_cmd == 0x04
+        status, resp_data = sim.send_raw(ctap_cmd, params)
+        assert status == 0x00, f"GetInfo retornou status 0x{status:02x}"
+        decoded = cbor.decode(ctap2_response_encode(status, resp_data))
+        assert isinstance(decoded.get(1), dict), "GetInfo não retornou um mapa CBOR"
+        print(f"[ok] CTAPHID_CBOR GetInfo → status 0x00, {len(resp_data)} bytes de CBOR")
+    finally:
+        sim.close()
+
+    print("self-test concluído com sucesso.")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -459,9 +518,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--simulator", type=str, default=None, help="caminho para o fido2-simulator"
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="valida o pipeline da ponte (framing + INIT + CBOR) sem UHID",
+    )
     parser.add_argument("--vid", type=lambda v: int(v, 0), default=0x1209)
     parser.add_argument("--pid", type=lambda v: int(v, 0), default=0x0001)
     args = parser.parse_args(argv)
+
+    if args.self_test:
+        return self_test(args.simulator)
 
     if not os.path.exists("/dev/uhid"):
         print(
