@@ -1,8 +1,11 @@
-"""Testes da framing CTAPHID e do wrapping CBOR do `tools/ctaphid_bridge.py`.
+"""Testes da ponte CTAPHID (`tools/ctaphid_bridge.py`).
 
-Estes testes cobrem a parte pura (e testável em qualquer plataforma) da ponte:
-parse/pack de pacotes, fragmentação, remontagem, alocação de CID e o wrapping
-CBOR CTAP2. A parte UHID (/dev/uhid) é Linux-only e não é exercitada aqui.
+Cobre a parte pura (testável em qualquer plataforma) — parse/pack de pacotes,
+fragmentação, remontagem, alocação de CID e o wrapping CBOR CTAP2 — e o
+dispatch da ponte (`CtaphidBridge.handle_packet`) de ponta a ponta contra o
+`fido2-simulator --raw-cbor` real, usando um UHID falso (`RecordingUhid`).
+
+A parte UHID de verdade (/dev/uhid) é Linux-only e não é exercitada aqui.
 """
 
 from __future__ import annotations
@@ -23,14 +26,21 @@ from ctaphid_bridge import (  # noqa: E402
     CMD_INIT,
     CMD_PING,
     CMD_WINK,
+    CTAPHID_BROADCAST_CID,
+    ERR_INVALID_CMD,
+    ERR_OTHER,
     Assembler,
     ChannelManager,
+    CtaphidBridge,
+    RecordingUhid,
+    Simulator,
     ctap2_request_decode,
     ctap2_response_encode,
     fragment,
     pack_cont,
     pack_init,
     parse_packet,
+    reassemble,
 )
 
 
@@ -156,3 +166,77 @@ def test_dispatch_helper_cbor_to_simulator_format() -> None:
     cmd, params = ctap2_request_decode(payload)
     assert cmd == 0x04
     assert params == b""
+
+
+# ---------------------------------------------------------------------------
+# Dispatch da ponte (CtaphidBridge.handle_packet) de ponta a ponta
+# ---------------------------------------------------------------------------
+
+
+def test_bridge_dispatch_init_handshake() -> None:
+    uhid = RecordingUhid()
+    bridge_obj = CtaphidBridge(uhid, None)  # sim não é usado no INIT
+    bridge_obj.handle_packet(
+        pack_init(CTAPHID_BROADCAST_CID, CMD_INIT, bytes(8), total_len=8)
+    )
+    msg = reassemble(uhid.sent)
+    assert msg is not None
+    cid, cmd, payload = msg
+    assert cid == CTAPHID_BROADCAST_CID
+    assert cmd == CMD_INIT
+    assert len(payload) == 17
+    assert payload[12] == 2  # versão do protocolo CTAPHID
+    assert payload[16] & 0x04  # CAPABILITY_CBOR
+
+
+def test_bridge_dispatch_ping_echo() -> None:
+    uhid = RecordingUhid()
+    bridge_obj = CtaphidBridge(uhid, None)  # sim não é usado no PING
+    bridge_obj.handle_packet(pack_init(0x11223344, CMD_PING, b"hello"))
+    assert reassemble(uhid.sent) == (0x11223344, CMD_PING, b"hello")
+
+
+def test_bridge_dispatch_unknown_command() -> None:
+    uhid = RecordingUhid()
+    bridge_obj = CtaphidBridge(uhid, None)  # sim não é usado em comando desconhecido
+    bridge_obj.handle_packet(pack_init(0x11223344, 0x77, b""))
+    assert reassemble(uhid.sent) == (0x11223344, CMD_ERROR, bytes([ERR_INVALID_CMD]))
+
+
+def test_bridge_dispatch_cbor_non_map_payload() -> None:
+    from fido2 import cbor
+
+    uhid = RecordingUhid()
+    bridge_obj = CtaphidBridge(uhid, None)  # sim não é usado: o decode falha antes
+    # Payload CBOR válido mas não-mapa: o dispatch falha e responde ERR_OTHER.
+    bridge_obj.handle_packet(
+        pack_init(0x11223344, CMD_CBOR, cbor.encode([1, 2, 3]))
+    )
+    msg = reassemble(uhid.sent)
+    assert msg is not None
+    cid, cmd, payload = msg
+    assert (cid, cmd) == (0x11223344, CMD_CBOR)
+    assert cbor.decode(payload) == {1: ERR_OTHER}
+
+
+def test_bridge_dispatch_cbor_getinfo_roundtrip() -> None:
+    from fido2 import cbor
+
+    try:
+        sim = Simulator(None)
+    except FileNotFoundError as exc:
+        pytest.skip(f"fido2-simulator não encontrado: {exc}")
+    try:
+        uhid = RecordingUhid()
+        bridge_obj = CtaphidBridge(uhid, sim)
+        getinfo = cbor.encode({1: 0x04})
+        for pkt in fragment(0x11223344, CMD_CBOR, getinfo):
+            bridge_obj.handle_packet(pkt)
+        msg = reassemble(uhid.sent)
+        assert msg is not None
+        cid, cmd, payload = msg
+        assert (cid, cmd) == (0x11223344, CMD_CBOR)
+        decoded = cbor.decode(payload)
+        assert isinstance(decoded.get(1), dict), "GetInfo via dispatch não retornou mapa CBOR"
+    finally:
+        sim.close()

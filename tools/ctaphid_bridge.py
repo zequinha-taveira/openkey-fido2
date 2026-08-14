@@ -454,10 +454,42 @@ class CtaphidBridge:
 # --------------------------------------------------------------------------
 
 
+class RecordingUhid:
+    """UHID falso que grava os input reports (64 bytes) enviados pela ponte.
+
+    Permite exercitar o dispatch de `CtaphidBridge.handle_packet` sem
+    `/dev/uhid` — usado pelo self-test e pelos testes em
+    `tests/python/test_ctaphid_bridge.py`.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def send_input(self, data: bytes) -> None:
+        self.sent.append(data)
+
+
+def reassemble(packets: list[bytes]) -> tuple[int, int, bytes] | None:
+    """Remonta pacotes CTAPHID e retorna a última mensagem completa como
+    `(cid, cmd, payload)`.
+
+    Retorna `None` se nenhuma mensagem foi concluída. Mensagens anteriores são
+    descartadas — suficiente para as respostas single-response dos testes.
+    """
+    asm = Assembler()
+    result: tuple[int, int, bytes] | None = None
+    for pkt in packets:
+        msg = asm.process(pkt)
+        if msg is not None:
+            result = msg
+    return result
+
+
 def self_test(simulator_path: str | None) -> int:
     """Valida o pipeline completo da ponte sem UHID: fragmentação/remontagem
-    CTAPHID, handshake CTAPHID_INIT e round-trip CBOR GetInfo contra o
-    simulador real. Roda em qualquer plataforma."""
+    CTAPHID, handshake CTAPHID_INIT, round-trip CBOR GetInfo contra o
+    simulador real e o dispatch de `handle_packet` de ponta a ponta via UHID
+    falso. Roda em qualquer plataforma."""
     # 1. Roundtrip de fragmentação/remontagem multi-pacote.
     payload = bytes(range(256))
     pkts = fragment(0x11223344, CMD_CBOR, payload)
@@ -501,6 +533,31 @@ def self_test(simulator_path: str | None) -> int:
         decoded = cbor.decode(ctap2_response_encode(status, resp_data))
         assert isinstance(decoded.get(1), dict), "GetInfo não retornou um mapa CBOR"
         print(f"[ok] CTAPHID_CBOR GetInfo → status 0x00, {len(resp_data)} bytes de CBOR")
+
+        # 3. Dispatch de ponta a ponta via UHID falso (handle_packet).
+        uhid = RecordingUhid()
+        bridge = CtaphidBridge(uhid, sim)
+
+        bridge.handle_packet(
+            pack_init(CTAPHID_BROADCAST_CID, CMD_INIT, bytes(8), total_len=8)
+        )
+        msg = reassemble(uhid.sent)
+        assert msg is not None, "dispatch INIT não produziu resposta"
+        cid, cmd, init_resp = msg
+        assert cid == CTAPHID_BROADCAST_CID and cmd == CMD_INIT, "dispatch INIT falhou"
+        assert len(init_resp) == 17 and init_resp[12] == 2, "resposta INIT inválida"
+        assert init_resp[16] & 0x04, "CAPABILITY_CBOR ausente na resposta INIT"
+        print("[ok] dispatch CTAPHID_INIT via handle_packet")
+
+        uhid.sent.clear()
+        bridge.handle_packet(pack_init(0x11223344, CMD_CBOR, cbor.encode({1: 0x04})))
+        msg = reassemble(uhid.sent)
+        assert msg is not None, "dispatch CBOR não produziu resposta"
+        cid, cmd, getinfo_resp = msg
+        assert (cid, cmd) == (0x11223344, CMD_CBOR), "dispatch CBOR falhou"
+        decoded = cbor.decode(getinfo_resp)
+        assert isinstance(decoded.get(1), dict), "GetInfo via dispatch não retornou mapa CBOR"
+        print("[ok] dispatch CTAPHID_CBOR GetInfo via handle_packet → simulador")
     finally:
         sim.close()
 
