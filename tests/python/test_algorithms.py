@@ -20,7 +20,7 @@ SIM_BIN = WORKSPACE_ROOT / "target" / "debug" / f"fido2-simulator{_EXE}"
 BUILD_TIMEOUT_S = 600
 RUN_TIMEOUT_S = 30
 
-ERR_UNSUPPORTED_ALGORITHM = 0x0C
+ERR_UNSUPPORTED_ALGORITHM = 0x26
 
 
 def _b64(data: bytes) -> str:

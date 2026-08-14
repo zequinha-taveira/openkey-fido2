@@ -1,5 +1,5 @@
 use alloc::collections::BTreeMap;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use ciborium::de::from_reader;
 use ciborium::ser::into_writer;
@@ -220,10 +220,11 @@ pub struct GetAssertionRequest {
     /// Identificador do relying party.
     #[serde(rename = "rpId")]
     pub rp_id: String,
-    /// Lista de credenciais do cliente (non-resident).
-    pub credentials: Vec<CredentialDescriptor>,
-    /// Lista de credenciais permitidas (resident keys).
+    /// Lista de credenciais permitidas (resident keys), no campo CTAP `allowList`.
     #[serde(rename = "allowList")]
+    pub credentials: Vec<CredentialDescriptor>,
+    /// Alias interno legado; não é serializado no wire format.
+    #[serde(skip)]
     pub allow_list: Option<Vec<CredentialDescriptor>>,
     /// Hash dos clientData JSON.
     #[serde(with = "serde_bytes", rename = "clientDataHash")]
@@ -438,48 +439,49 @@ pub enum Ctap2Error {
     InvalidLength = 0x03,
     /// Dados malformados ou inválidos.
     InvalidData = 0x04,
+    /// Payload CBOR malformado.
+    InvalidCbor = 0x12,
     /// Comando inválido no estado atual.
     InvalidState = 0x05,
     /// Opção não suportada.
-    InvalidOption = 0x06,
+    InvalidOption = 0x2C,
     /// Timeout na operação.
-    Timeout = 0x08,
+    Timeout = 0x3A,
     /// Recurso ocupado — outro comando está em execução.
-    ResourceBusy = 0x09,
+    ResourceBusy = 0x24,
     /// Credencial já existe no exclude_list.
-    CredentialExists = 0x0A,
+    CredentialExists = 0x19,
     /// Comando recebido, processamento iniciado.
-    Processing = 0x0B,
+    Processing = 0x21,
     /// Algoritmo criptográfico não suportado.
-    UnsupportedAlgorithm = 0x0C,
+    UnsupportedAlgorithm = 0x26,
     /// Opção do comando não suportada.
-    UnsupportedOption = 0x0D,
+    UnsupportedOption = 0x2B,
     /// Operação negada pelo usuário (ex.: toque físico não detectado).
-    OperationDenied = 0x13,
+    OperationDenied = 0x27,
     /// Chave inválida fornecida.
-    InvalidKey = 0x11,
+    InvalidKey = 0x22,
     /// Nenhuma credencial correspondente encontrada.
-    NoCredentials = 0x0E,
+    NoCredentials = 0x2E,
     /// PIN incorreto.
     PinInvalid = 0x31,
     /// PIN incorreto com contador de tentativas decrementado.
     PinInvalidRetries = 0x32,
     /// PIN necessário para continuar.
-    PinRequired = 0x33,
+    PinRequired = 0x35,
     /// PIN viola política de segurança.
-    PinPolicyViolation = 0x34,
+    PinPolicyViolation = 0x37,
     /// Token de autenticação PIN/UV necessário.
-    PinTokenRequired = 0x35,
+    PinTokenRequired = 0x36,
     /// Token de autenticação expirado.
-    PinTokenExpired = 0x36,
+    PinTokenExpired = 0x38,
     /// Token pendente de aprovação do usuário.
-    PinTokenPending = 0x37,
-    /// Falha na geração/validação do token.
-    PinTokenFailure = 0x38,
+    PinTokenPending = 0x23,
+
     /// Request excede o tamanho máximo permitido.
-    RequestTooLarge = 0x40,
+    RequestTooLarge = 0x39,
     /// Array de large blobs está cheio ou excede o limite máximo.
-    LargeBlobStorageFull = 0x41,
+    LargeBlobStorageFull = 0x18,
     /// Erro não categorizado.
     Unknown = 0x7F,
 }
@@ -541,14 +543,322 @@ fn hash_rp_id(rp_id: &str, crypto: &CryptoEngine) -> [u8; 32] {
     rp_hash
 }
 
+/// Converts the top-level CTAP map from serde's text field names to the
+/// integer labels required by the CTAP 2.1 wire format. Nested maps are left
+/// untouched because RP/user/options/extension maps use text labels.
+fn ctap_key_to_int(key: &str) -> Option<i64> {
+    Some(match key {
+        "clientDataHash" => 0x01,
+        "rp" => 0x02,
+        "user" => 0x03,
+        "pubKeyCredParams" => 0x04,
+        "excludeList" => 0x05,
+        "extensions" => 0x06,
+        "options" => 0x07,
+        "pinUvAuthParam" => 0x08,
+        "pinUvAuthProtocol" => 0x09,
+        "enterpriseAttestation" => 0x0A,
+        "rpId" => 0x01,
+        "allowList" => 0x03,
+        "credential" => 0x01,
+        "authData" => 0x02,
+        "signature" => 0x03,
+
+        "numberOfCredentials" => 0x05,
+        "versions" => 0x01,
+        "aaguid" => 0x03,
+        "maxMsgSize" => 0x05,
+        "pinUvAuthProtocols" => 0x06,
+        "algorithms" => 0x0A,
+        "fmt" => 0x01,
+        "attStmt" => 0x03,
+        "subCommand" => 0x01,
+        "pinProtocol" => 0x02,
+        "keyAgreement" => 0x03,
+        "pinAuth" => 0x04,
+        "newPinEnc" => 0x05,
+        "pinHashEnc" => 0x06,
+        "subCommandParams" => 0x03,
+        "r#type" => 0x01,
+        "id" => 0x02,
+        "type" => 0x01,
+        "alg" => 0x03,
+        _ => return None,
+    })
+}
+
+fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
+    let Value::Map(entries) = value else {
+        return value;
+    };
+    let converted = entries
+        .into_iter()
+        .map(|(key, val)| {
+            if encode {
+                if let Value::Text(name) = key {
+                    // The same field name can have different labels in different
+                    // command maps; use the command's top-level schema first.
+                    let label = match type_name {
+                        t if t.contains("GetAssertionRequest") && name == "rpId" => Some(0x01),
+                        t if t.contains("GetAssertionRequest") && name == "clientDataHash" => {
+                            Some(0x02)
+                        }
+                        t if t.contains("GetAssertionRequest") && name == "allowList" => Some(0x03),
+                        t if t.contains("GetAssertionRequest") && name == "extensions" => {
+                            Some(0x04)
+                        }
+                        t if t.contains("GetAssertionRequest") && name == "options" => Some(0x05),
+                        t if t.contains("GetAssertionRequest") && name == "pinUvAuthParam" => {
+                            Some(0x06)
+                        }
+                        t if t.contains("GetAssertionRequest") && name == "pinUvAuthProtocol" => {
+                            Some(0x07)
+                        }
+                        t if t.contains("GetAssertionResponse") && name == "credential" => {
+                            Some(0x01)
+                        }
+                        t if t.contains("GetAssertionResponse") && name == "auth_data" => {
+                            Some(0x02)
+                        }
+                        t if t.contains("GetAssertionResponse") && name == "signature" => {
+                            Some(0x03)
+                        }
+                        t if t.contains("GetAssertionResponse") && name == "user" => Some(0x04),
+                        t if t.contains("MakeCredentialResponse") && name == "fmt" => Some(0x01),
+                        t if t.contains("MakeCredentialResponse") && name == "auth_data" => {
+                            Some(0x02)
+                        }
+                        t if t.contains("MakeCredentialResponse") && name == "attestation_info" => {
+                            Some(0x03)
+                        }
+                        t if t.contains("GetInfoResponse") && name == "versions" => Some(0x01),
+                        t if t.contains("GetInfoResponse") && name == "extensions" => Some(0x02),
+                        t if t.contains("GetInfoResponse") && name == "aaguid" => Some(0x03),
+                        t if t.contains("GetInfoResponse") && name == "options" => Some(0x04),
+                        t if t.contains("GetInfoResponse")
+                            && name == "max_large_blob_data_size" =>
+                        {
+                            Some(0x0D)
+                        }
+                        t if t.contains("EnumerateRPsResponse") && name == "rp" => Some(0x01),
+                        t if t.contains("EnumerateRPsResponse") && name == "rpHash" => Some(0x02),
+                        t if t.contains("EnumerateRPsResponse") && name == "totalRPs" => Some(0x03),
+                        t if t.contains("BioEnrollRequest") && name == "subCommand" => Some(0x02),
+                        t if t.contains("BioEnrollRequest") && name == "subCommandParams" => {
+                            Some(0x03)
+                        }
+                        t if t.contains("BioEnrollResponse") && name == "fingerprintKind" => {
+                            Some(0x02)
+                        }
+                        t if t.contains("BioEnrollResponse") && name == "maxEnrollments" => {
+                            Some(0x03)
+                        }
+                        t if t.contains("CredentialManagementRequest") && name == "subCommand" => {
+                            Some(0x01)
+                        }
+                        t if t.contains("CredentialManagementRequest")
+                            && name == "subCommandParams" =>
+                        {
+                            Some(0x02)
+                        }
+                        t if t.contains("CredentialManagementRequest")
+                            && name == "pinUvAuthProtocol" =>
+                        {
+                            Some(0x03)
+                        }
+                        t if t.contains("CredentialManagementRequest")
+                            && name == "pinUvAuthParam" =>
+                        {
+                            Some(0x04)
+                        }
+                        t if t.contains("CredsMetadataResponse")
+                            && name == "existingResidentCredentialsCount" =>
+                        {
+                            Some(0x01)
+                        }
+                        t if t.contains("CredsMetadataResponse")
+                            && name == "maxPossibleRemainingResidentCredentialsCount" =>
+                        {
+                            Some(0x02)
+                        }
+                        t if t.contains("EnumerateRpsEntryResponse") && name == "rp" => Some(0x01),
+                        t if t.contains("EnumerateRpsEntryResponse") && name == "rpIDHash" => {
+                            Some(0x02)
+                        }
+                        t if t.contains("EnumerateRpsEntryResponse") && name == "totalRPs" => {
+                            Some(0x03)
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse") && name == "user" => {
+                            Some(0x01)
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse")
+                            && name == "credentialId" =>
+                        {
+                            Some(0x02)
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse")
+                            && name == "publicKey" =>
+                        {
+                            Some(0x03)
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse")
+                            && name == "credProtect" =>
+                        {
+                            Some(0x04)
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse")
+                            && name == "largeBlobKey" =>
+                        {
+                            Some(0x05)
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse")
+                            && name == "totalCredentials" =>
+                        {
+                            Some(0x06)
+                        }
+                        _ => ctap_key_to_int(&name),
+                    };
+                    label
+                        .map(|n| (Value::Integer(n.into()), val.clone()))
+                        .unwrap_or((Value::Text(name), val))
+                } else {
+                    (key, val)
+                }
+            } else if let Value::Integer(n) = key {
+                let label = i64::try_from(n)
+                    .ok()
+                    .and_then(|n| match type_name {
+                        t if t.contains("MakeCredentialRequest") => [
+                            "",
+                            "clientDataHash",
+                            "rp",
+                            "user",
+                            "pubKeyCredParams",
+                            "excludeList",
+                            "extensions",
+                            "options",
+                            "pinUvAuthParam",
+                            "pinUvAuthProtocol",
+                            "enterpriseAttestation",
+                        ]
+                        .get(n as usize)
+                        .copied(),
+                        t if t.contains("GetAssertionRequest") => [
+                            "",
+                            "rpId",
+                            "clientDataHash",
+                            "allowList",
+                            "extensions",
+                            "options",
+                            "pinUvAuthParam",
+                            "pinUvAuthProtocol",
+                        ]
+                        .get(n as usize)
+                        .copied(),
+                        t if t.contains("MakeCredentialResponse") => {
+                            ["", "fmt", "authData", "attStmt", "extensions"]
+                                .get(n as usize)
+                                .copied()
+                        }
+                        t if t.contains("GetAssertionResponse") => [
+                            "",
+                            "credential",
+                            "authData",
+                            "signature",
+                            "user",
+                            "numberOfCredentials",
+                            "extensions",
+                        ]
+                        .get(n as usize)
+                        .copied(),
+                        t if t.contains("GetInfoResponse") => [
+                            "",
+                            "versions",
+                            "extensions",
+                            "aaguid",
+                            "options",
+                            "maxMsgSize",
+                            "pinUvAuthProtocols",
+                            "",
+                            "",
+                            "",
+                            "algorithms",
+                        ]
+                        .get(n as usize)
+                        .copied(),
+                        t if t.contains("EnumerateRPsResponse") => {
+                            ["", "rp", "rpHash", "totalRPs"].get(n as usize).copied()
+                        }
+                        t if t.contains("BioEnrollRequest") => {
+                            ["", "", "subCommand", "subCommandParams"]
+                                .get(n as usize)
+                                .copied()
+                        }
+                        t if t.contains("BioEnrollResponse") => {
+                            ["", "", "fingerprintKind", "maxEnrollments"]
+                                .get(n as usize)
+                                .copied()
+                        }
+                        t if t.contains("CredentialManagementRequest") => [
+                            "",
+                            "subCommand",
+                            "subCommandParams",
+                            "pinUvAuthProtocol",
+                            "pinUvAuthParam",
+                        ]
+                        .get(n as usize)
+                        .copied(),
+                        t if t.contains("CredsMetadataResponse") => [
+                            "",
+                            "existingResidentCredentialsCount",
+                            "maxPossibleRemainingResidentCredentialsCount",
+                        ]
+                        .get(n as usize)
+                        .copied(),
+                        t if t.contains("EnumerateRpsEntryResponse") => {
+                            ["", "rp", "rpIDHash", "totalRPs"].get(n as usize).copied()
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse") => [
+                            "",
+                            "user",
+                            "credentialId",
+                            "publicKey",
+                            "credProtect",
+                            "largeBlobKey",
+                            "totalCredentials",
+                        ]
+                        .get(n as usize)
+                        .copied(),
+                        _ => None,
+                    })
+                    .filter(|s| !s.is_empty());
+                label
+                    .map(|s| (Value::Text(s.into()), val.clone()))
+                    .unwrap_or((Value::Integer(n), val))
+            } else {
+                (key, val)
+            }
+        })
+        .collect();
+    Value::Map(converted)
+}
+
 pub fn encode_cbor<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Ctap2Error> {
+    let mut raw = Vec::new();
+    ciborium::ser::into_writer(value, &mut raw).map_err(|_| Ctap2Error::InvalidData)?;
+    let parsed: Value = from_reader(raw.as_slice()).map_err(|_| Ctap2Error::InvalidData)?;
+    let normalized = root_ctap_keys(parsed, true, core::any::type_name::<T>());
     let mut buf = alloc::vec![];
-    into_writer(value, &mut buf).map_err(|_| Ctap2Error::InvalidData)?;
+    into_writer(&normalized, &mut buf).map_err(|_| Ctap2Error::InvalidData)?;
     Ok(buf)
 }
 
 pub fn decode_cbor<T: DeserializeOwned>(data: &[u8]) -> Result<T, Ctap2Error> {
-    from_reader(data).map_err(|_| Ctap2Error::InvalidData)
+    let parsed: Value = from_reader(data).map_err(|_| Ctap2Error::InvalidCbor)?;
+    let normalized = root_ctap_keys(parsed, false, core::any::type_name::<T>());
+    let mut buf = alloc::vec![];
+    into_writer(&normalized, &mut buf).map_err(|_| Ctap2Error::InvalidCbor)?;
+    from_reader(buf.as_slice()).map_err(|_| Ctap2Error::InvalidCbor)
 }
 
 pub trait DeserializeOwned: for<'de> Deserialize<'de> {}
@@ -3060,8 +3370,7 @@ mod tests {
         let result = authenticator.process_command(0x3B, vec![]);
         assert!(result.is_ok());
 
-        let response: EnumerateRPsResponse =
-            ciborium::de::from_reader(result.unwrap().as_slice()).unwrap();
+        let response: EnumerateRPsResponse = decode_cbor(&result.unwrap()).unwrap();
         assert_eq!(response.total_rps, 2);
         assert!(!response.rp.id.is_empty());
         assert_eq!(response.rp_hash.len(), 32);
@@ -3110,8 +3419,7 @@ mod tests {
 
         let result = authenticator.process_command(0x3C, vec![]);
         assert!(result.is_ok());
-        let response: EnumerateRPsResponse =
-            ciborium::de::from_reader(result.unwrap().as_slice()).unwrap();
+        let response: EnumerateRPsResponse = decode_cbor(&result.unwrap()).unwrap();
         assert_eq!(response.total_rps, 3);
 
         let result = authenticator.process_command(0x3C, vec![]);
@@ -3160,8 +3468,7 @@ mod tests {
         let result = authenticator.process_command(0x09, encoded);
         assert!(result.is_ok());
 
-        let response: BioEnrollResponse =
-            ciborium::de::from_reader(result.unwrap().as_slice()).unwrap();
+        let response: BioEnrollResponse = decode_cbor(&result.unwrap()).unwrap();
         assert_eq!(response.fingerprint_kind, 1);
         assert_eq!(response.max_enrollments, 5);
     }

@@ -43,18 +43,51 @@ CTAP2_ERROR_NAMES = {
     0x02: "INVALID_PARAMETER",
     0x03: "INVALID_LENGTH",
     0x04: "INVALID_SEQUENCE",
-    0x05: "INVALID_STATE",
-    0x06: "ACT",
-    0x07: "CHANNEL_BUSY",
-    0x0A: "CREDENTIAL_EXCLUDED",
-    0x0C: "UNSUPPORTED_ALGORITHM",
-    0x0E: "NO_CREDENTIALS",
-    0x13: "OPERATION_DENIED",
+    0x05: "TIMEOUT",
+    0x06: "CHANNEL_BUSY",
+    0x19: "CREDENTIAL_EXCLUDED",
+    0x26: "UNSUPPORTED_ALGORITHM",
+    0x2E: "NO_CREDENTIALS",
+    0x27: "OPERATION_DENIED",
     0x31: "PIN_INVALID",
-    0x32: "PIN_INVALID_RETRIES",
-    0x33: "PIN_REQUIRED",
-    0x34: "PIN_POLICY_VIOLATION",
+    0x32: "PIN_BLOCKED",
+    0x33: "PIN_AUTH_INVALID",
+    0x34: "PIN_AUTH_BLOCKED",
+    0x35: "PIN_NOT_SET",
+    0x36: "PUAT_REQUIRED",
+    0x37: "PIN_POLICY_VIOLATION",
+    0x38: "PIN_TOKEN_EXPIRED",
+    0x39: "REQUEST_TOO_LARGE",
 }
+
+
+# Chaves inteiras CTAP2 (wire format) → nomes de campo da API de alto nível.
+_RESPONSE_KEYS: dict[int, dict[int, str]] = {
+    CMD.MAKE_CREDENTIAL: {0x01: "fmt", 0x02: "authData", 0x03: "attStmt", 0x06: "extensions"},
+    CMD.GET_ASSERTION: {
+        0x01: "credential",
+        0x02: "authData",
+        0x03: "signature",
+        0x04: "user",
+        0x05: "numberOfCredentials",
+        0x06: "extensions",
+    },
+    CMD.GET_INFO: {
+        0x01: "versions",
+        0x02: "extensions",
+        0x03: "aaguid",
+        0x04: "options",
+        0x0A: "algorithms",
+    },
+}
+
+
+def _convert_response_keys(cmd: int, response):
+    """Converte chaves inteiras do wire format CTAP2 para nomes de campo."""
+    key_map = _RESPONSE_KEYS.get(cmd, {})
+    if isinstance(response, dict):
+        return {key_map.get(k, k): v for k, v in response.items()}
+    return response
 
 
 def _compact(data):
@@ -141,7 +174,9 @@ class VirtualAuthenticator:
         status, response = self._native.process_command(cmd, data)
         if status != 0:
             raise Ctap2ResponseError(status, name=CTAP2_ERROR_NAMES.get(status))
-        return cbor.decode(response)
+        if not response:
+            return None
+        return _convert_response_keys(cmd, cbor.decode(response))
 
     # ---- comandos de alto nível ----------------------------------------
 
@@ -168,21 +203,21 @@ class VirtualAuthenticator:
         `options = {"rk": False, "uv": False, "up": True}`.
         """
         request = {
-            "clientDataHash": bytes(client_data_hash),
-            "rp": {"id": rp_id},
-            "user": {
+            0x01: bytes(client_data_hash),
+            0x02: {"id": rp_id},
+            0x03: {
                 "id": bytes(user_id),
                 "name": user_name,
                 "displayName": user_display_name,
             },
-            "pubKeyCredParams": algorithms
+            0x04: algorithms
             or [{"type": "public-key", "alg": -8}],
-            "excludeList": [
+            0x05: [
                 {"type": "public-key", "id": bytes(d["id"])}
                 for d in (exclude_list or [])
             ],
-            "options": options or {"rk": False, "uv": False, "up": True},
-            "extensions": extensions,
+            0x07: options or {"rk": False, "uv": False, "up": True},
+            0x06: extensions,
         }
         response = self.process_command(CMD.MAKE_CREDENTIAL, request)
         return AttestationObject(cbor.encode(response))
@@ -198,15 +233,14 @@ class VirtualAuthenticator:
     ) -> Assertion:
         """Executa `getAssertion` e devolve a resposta decodificada."""
         request = {
-            "rpId": rp_id,
-            "clientDataHash": bytes(client_data_hash),
-            "credentials": [],
-            "allowList": [
+            0x01: rp_id,
+            0x02: bytes(client_data_hash),
+            0x03: [
                 {"type": "public-key", "id": bytes(d["id"])}
                 for d in (allow_list or [])
             ],
-            "options": options or {"up": True, "uv": False},
-            "extensions": extensions,
+            0x05: options or {"up": True, "uv": False},
+            0x04: extensions,
         }
         response = self.process_command(CMD.GET_ASSERTION, request)
         return Assertion(

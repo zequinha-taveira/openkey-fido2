@@ -119,14 +119,14 @@ def test_exclude_list_rejeita_credencial_existente(auth):
                 {"type": "public-key", "id": att.auth_data.credential_data.credential_id}
             ],
         )
-    assert exc.value.code == 0x0A  # CREDENTIAL_EXCLUDED
+    assert exc.value.code == 0x19  # CREDENTIAL_EXCLUDED
     assert exc.value.name == "CREDENTIAL_EXCLUDED"
 
 
 def test_algoritmo_nao_suportado(auth):
     with pytest.raises(Ctap2ResponseError) as exc:
         register(auth, alg=-65535)  # RS1 não é suportado
-    assert exc.value.code == 0x0C  # UNSUPPORTED_ALGORITHM
+    assert exc.value.code == 0x26  # UNSUPPORTED_ALGORITHM
 
 
 def test_cred_blob_roundtrip(auth):
@@ -226,7 +226,7 @@ def test_allow_list_seleciona_credencial_especifica(auth):
 def test_assertion_sem_credenciais_devolve_no_credentials(auth):
     with pytest.raises(Ctap2ResponseError) as exc:
         auth.get_assertion(rp_id=TEST_RP_ID, client_data_hash=sha256(b"login"))
-    assert exc.value.code == 0x0E  # NO_CREDENTIALS
+    assert exc.value.code == 0x2E  # NO_CREDENTIALS
     assert exc.value.name == "NO_CREDENTIALS"
 
 
@@ -238,7 +238,7 @@ def test_reset_limpa_todas_as_credenciais(auth):
     auth.reset()
     with pytest.raises(Ctap2ResponseError) as exc:
         assert_login(auth, att.auth_data.credential_data.credential_id)
-    assert exc.value.code == 0x0E
+    assert exc.value.code == 0x2E
 
 
 def test_comando_desconhecido_devolve_invalid_command(auth):
@@ -248,5 +248,5 @@ def test_comando_desconhecido_devolve_invalid_command(auth):
 
 
 def test_tabela_de_erros_cobre_codigos_usados(auth):
-    for code in (0x01, 0x0A, 0x0C, 0x0E, 0x33):
+    for code in (0x01, 0x19, 0x26, 0x2E, 0x35):
         assert code in CTAP2_ERROR_NAMES
