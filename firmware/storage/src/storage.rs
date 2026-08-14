@@ -238,6 +238,15 @@ pub struct Credential {
     /// `rp_id` em texto, necessário para EnumerateRPs.
     #[serde(default)]
     pub rp_id: String,
+    /// Chave simétrica para a extensão `largeBlobKey` (32 bytes).
+    #[serde(default)]
+    pub large_blob_key: Option<Vec<u8>>,
+    /// Nome de exibição do usuário (`user.name`).
+    #[serde(default)]
+    pub user_name: Option<String>,
+    /// Nome amigável do usuário (`user.displayName`).
+    #[serde(default)]
+    pub user_display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
@@ -259,6 +268,7 @@ pub struct StoredCredential {
 pub struct StorageEngine {
     credentials: BTreeMap<Vec<u8>, StoredCredential>,
     kv_store: BTreeMap<String, Vec<u8>>,
+    large_blobs: Vec<u8>,
     backend: Option<Box<dyn StorageBackend>>,
     wear_counters: HashMap<String, WearLevelCounter>,
     max_credential_count: Option<usize>,
@@ -269,6 +279,7 @@ impl core::fmt::Debug for StorageEngine {
         f.debug_struct("StorageEngine")
             .field("credentials", &self.credentials)
             .field("kv_store", &self.kv_store)
+            .field("large_blobs_len", &self.large_blobs.len())
             .field("backend", &self.backend.is_some())
             .field("wear_counters", &self.wear_counters)
             .field("max_credential_count", &self.max_credential_count)
@@ -283,6 +294,7 @@ impl StorageEngine {
         Ok(Self {
             credentials: BTreeMap::new(),
             kv_store: BTreeMap::new(),
+            large_blobs: Vec::new(),
             backend: None,
             wear_counters: HashMap::new(),
             max_credential_count: None,
@@ -298,6 +310,7 @@ impl StorageEngine {
         let mut engine = Self {
             credentials: BTreeMap::new(),
             kv_store: BTreeMap::new(),
+            large_blobs: Vec::new(),
             backend: Some(backend),
             wear_counters: HashMap::new(),
             max_credential_count: None,
@@ -520,6 +533,107 @@ impl StorageEngine {
         result
     }
 
+    /// Retorna as credenciais associadas a um `rp_id_hash` específico, já decifradas.
+    pub fn find_credentials_by_rp_hash(
+        &self,
+        rp_hash: &[u8],
+        crypto: &CryptoEngine,
+    ) -> Vec<Credential> {
+        self.credentials
+            .values()
+            .filter(|s| s.credential.rp_id_hash == rp_hash)
+            .filter_map(|s| {
+                let private_key = crypto.decrypt(&s.encrypted_private_key, &s.nonce).ok()?;
+                let mut credential = s.credential.clone();
+                credential.private_key = private_key;
+                Some(credential)
+            })
+            .collect()
+    }
+
+    /// Retorna o número total de credenciais armazenadas.
+    pub fn get_credentials_count(&self) -> usize {
+        self.credentials.len()
+    }
+
+    /// Retorna o número máximo estimado de credenciais restantes que ainda cabem no storage.
+    pub fn get_max_possible_remaining(&self) -> usize {
+        let max = self.max_credential_count.unwrap_or(50);
+        max.saturating_sub(self.credentials.len())
+    }
+
+    /// Atualiza as informações do usuário associadas a uma credencial (Credential Management).
+    pub fn update_user_info(
+        &mut self,
+        credential_id: &[u8],
+        user_name: Option<String>,
+        user_display_name: Option<String>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if let Some(stored) = self.credentials.get_mut(credential_id) {
+            stored.credential.user_name = user_name;
+            stored.credential.user_display_name = user_display_name;
+
+            let cred_key = format!("cred:{}", hex::encode(credential_id));
+            if let Some(backend) = &mut self.backend {
+                let data = serde_json::to_vec(&stored)?;
+                backend.write(&cred_key, &data)?;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Lê um fragmento do array global de large blobs.
+    pub fn read_large_blobs(&self, offset: usize, count: usize) -> Vec<u8> {
+        let len = self.large_blobs.len();
+        if offset >= len {
+            return Vec::new();
+        }
+        let end = core::cmp::min(offset + count, len);
+        self.large_blobs[offset..end].to_vec()
+    }
+
+    /// Escreve um fragmento no array global de large blobs com redimensionamento se necessário.
+    pub fn write_large_blobs(
+        &mut self,
+        offset: usize,
+        data: &[u8],
+        expected_len: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if expected_len > 4096 {
+            return Err("Large blob exceeds maximum supported size (4096 bytes)".into());
+        }
+        if self.large_blobs.len() < expected_len {
+            self.large_blobs.resize(expected_len, 0);
+        }
+        let end = offset + data.len();
+        if end > self.large_blobs.len() {
+            self.large_blobs.resize(end, 0);
+        }
+        self.large_blobs[offset..end].copy_from_slice(data);
+
+        // Se houver backend persistente, salva sob chave reservada "sys:large_blobs"
+        if let Some(backend) = &mut self.backend {
+            backend.write("sys:large_blobs", &self.large_blobs)?;
+        }
+
+        Ok(())
+    }
+
+    /// Limpa o array global de large blobs.
+    pub fn clear_large_blobs(&mut self) {
+        self.large_blobs.clear();
+        if let Some(backend) = &mut self.backend {
+            let _ = backend.delete("sys:large_blobs");
+        }
+    }
+
+    /// Retorna o tamanho atual do array de large blobs.
+    pub fn get_large_blobs_len(&self) -> usize {
+        self.large_blobs.len()
+    }
+
     fn generate_nonce(&self, crypto: &CryptoEngine) -> Vec<u8> {
         crypto.random_bytes(12)
     }
@@ -574,6 +688,9 @@ mod tests {
             created_at: 0,
             algorithm: -8,
             rp_id: rp_id.to_string(),
+            large_blob_key: None,
+            user_name: None,
+            user_display_name: None,
         }
     }
 

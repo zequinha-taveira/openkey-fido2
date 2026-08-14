@@ -1,6 +1,6 @@
-# ADR-0008: Sealed Box Efêmero (ECIES) para Criptografia Híbrida
+# ADR-0008: Sealed Box ECIES para Criptografia Híbrida (Efêmero e Estático)
 
-Status: accepted
+Status: accepted (atualizado em 2026-08-14)
 Data: 2026-08-10
 
 ## Contexto
@@ -8,52 +8,43 @@ Data: 2026-08-10
 O autenticador FIDO2 precisa suportar criptografia híbrida para cenários como:
 - Proteção de `credBlob` em trânsito entre plataforma e autenticador
 - Comunicação segura entre módulos internos (ex.: ClientPIN token exchange)
+- Cifragem persistente em Flash que sobrevive a reinicializações (*reboots*) do dispositivo
 - Extensões futuras que exigem encryption end-to-end
 
-O requisito é um esquema **ECIES** (Elliptic Curve Integrated Encryption Scheme)
-que combine criptografia assimétrica (ECDH) com simétrica (AEAD).
+O requisito é um esquema **ECIES** (Elliptic Curve Integrated Encryption Scheme) que combine criptografia assimétrica (ECDH X25519) com simétrica (ChaCha20-Poly1305 + HKDF-SHA256).
 
 ## Decisão
 
-Implementar um **sealed box efêmero** sobre X25519 + ChaCha20-Poly1305:
+Implementar suporte duplo para **sealed box ECIES**:
 
-1. **Geração de chave**: X25519 via `ring::agreement::EphemeralPrivateKey`
-2. **Derivação**: HKDF-SHA256 com salt `ephemeral_pk || recipient_pk` (identico nos dois lados)
-3. **Cifragem**: ChaCha20-Poly1305 com nonce aleatorio de 12 bytes
-4. **AAD**: chave publica efêmera (proteção contra adulteração)
+1. **Chaves Efêmeras (`ring`)**:
+   - `hybrid_generate_keypair` / `hybrid_decrypt` usam `ring::agreement::EphemeralPrivateKey`.
+   - Adequado para sessões em memória e handshakes efêmeros one-shot.
 
-O ciphertext serializado tem formato:
+2. **Chaves Estáticas Persistíveis (`x25519-dalek`)**:
+   - `hybrid_generate_static_keypair`, `hybrid_diffie_hellman` e `hybrid_decrypt_static` usam `x25519_dalek::StaticSecret` e `x25519_dalek::PublicKey`.
+   - Permite que chaves privadas de 32 bytes sejam persistidas no `StorageEngine` e decifrem mensagens após reboots.
+
+3. **Derivação de Chave Simétrica (Idêntica em ambos os modos)**:
+   - HKDF-SHA256 com salt `ephemeral_pk || recipient_pk`.
+   - Rótulo de domínio `openkey-ecies-v1`.
+
+4. **Cifragem e Autenticação de Mensagem**:
+   - ChaCha20-Poly1305 com nonce aleatório de 12 bytes.
+   - AAD vinculado à chave pública efêmera (proteção estrita contra adulteração).
+
+Formato do ciphertext serializado:
 ```
 | ephemeral_pk (32B) | nonce (12B) | ciphertext+tag (n+16B) |
 ```
 
-### Limitação conhecida
+## Consequências
 
-`ring` 0.17 nao permite importar chaves privadas X25519 estaticas —
-`EphemeralPrivateKey` so pode ser criada via `generate()`. Por isso:
+### Positivas
+- Eliminação da limitação do `ring 0.17` quanto a chaves X25519 estáticas.
+- Total interoperabilidade: payloads cifrados com a chave pública do destinatário podem ser decifrados tanto pelo handler estático quanto efêmero.
+- Suporte a `no_std` e zeroização segura de memória via `zeroize`.
+- Segurança preservada com AAD e KDF determinístico vinculado a ambos os lados.
 
-- `hybrid_decrypt` recebe `EphemeralPrivateKey` **por valor** (consome)
-- O par de chaves do destinatario precisa ser criado no processo e mantido vivo
-- Restrito a cenarios dentro de um mesmo processo (sessoes em memoria)
-
-## Consequencias
-
-Positivas:
-- Criptografia híbrida sem dependencias adicionais (usa `ring` existente)
-- AAD vincula o ciphertext a chave efêmera (tampering detection)
-- KDF deterministico garante mesma chave derivada nos dois lados
-- Zeroizacao best-effort de material sensivel via wrapper `Zeroifying`
-
-Negativas:
-- Limitacao do `ring` impede persistencia de chaves X25519 em flash
-- Wrapper `Zeroizing` manual (sem crate `zeroize`) e menos robusto
-- Nao suporta cenarios de longo prazo onde chaves precisam sobreviver a reboots
-
-Referencias:
-- `protocol/crypto/src/hybrid.rs` — implementacao completa
-- `protocol/crypto/src/hybrid.rs:46` — `Zeroizing<T>` wrapper
-- `protocol/crypto/src/hybrid.rs:124` — `derive_symmetric_key()`
-- `protocol/crypto/src/hybrid.rs:159` — `hybrid_encrypt()`
-- `protocol/crypto/src/hybrid.rs:223` — `hybrid_decrypt()`
-- ADR-0001: uso de `ring` para operacoes criptograficas
-- ADR-0006: side-channel mitigation (zeroize, constant-time)
+### Neutras / Considerações
+- Adiciona a dependência `x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }` ao workspace.

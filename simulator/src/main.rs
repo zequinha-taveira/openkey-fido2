@@ -105,6 +105,7 @@ fn build_extensions(ext_val: Option<&Value>) -> Option<Extensions> {
         cred_blob,
         min_pin_length,
         hmac_secret,
+        large_blob_key: false,
     })
 }
 
@@ -626,8 +627,53 @@ impl Simulator {
     }
 }
 
+fn run_raw_cbor(mut simulator: Simulator) {
+    use std::io::Read;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut in_reader = stdin.lock();
+    let mut out = stdout.lock();
+
+    loop {
+        let mut len_buf = [0u8; 2];
+        if in_reader.read_exact(&mut len_buf).is_err() {
+            break;
+        }
+        let total_len = u16::from_be_bytes(len_buf) as usize;
+        if total_len == 0 {
+            continue;
+        }
+
+        let mut payload = vec![0u8; total_len];
+        if in_reader.read_exact(&mut payload).is_err() {
+            break;
+        }
+
+        let cmd = payload[0];
+        let data = payload[1..].to_vec();
+
+        let (status, resp_data) = match simulator.auth.process_command(cmd, data) {
+            Ok(resp) => (0x00u8, resp),
+            Err(err) => (err.as_u8(), Vec::new()),
+        };
+
+        let resp_len = (1 + resp_data.len()) as u16;
+        if out.write_all(&resp_len.to_be_bytes()).is_err() {
+            break;
+        }
+        if out.write_all(&[status]).is_err() {
+            break;
+        }
+        if !resp_data.is_empty() && out.write_all(&resp_data).is_err() {
+            break;
+        }
+        let _ = out.flush();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let raw_cbor = args.iter().any(|arg| arg == "--raw-cbor");
     let storage_path = args
         .iter()
         .position(|arg| arg == "--storage-path")
@@ -645,6 +691,11 @@ fn main() {
             process::exit(1);
         }
     };
+
+    if raw_cbor {
+        run_raw_cbor(simulator);
+        return;
+    }
 
     let stdin = io::stdin();
     let stdout = io::stdout();

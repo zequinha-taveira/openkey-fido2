@@ -7,7 +7,9 @@ use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{
     EcdsaKeyPair, Ed25519KeyPair, KeyPair, RsaKeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_ASN1,
-    ECDSA_P256_SHA256_ASN1_SIGNING, ED25519, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256,
+    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1, ECDSA_P384_SHA384_ASN1_SIGNING,
+    ED25519, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256, RSA_PSS_2048_8192_SHA256,
+    RSA_PSS_SHA256,
 };
 use rsa::pkcs1::{DecodeRsaPublicKey, EncodeRsaPublicKey};
 use rsa::pkcs8::EncodePrivateKey;
@@ -188,6 +190,76 @@ impl CryptoEngine {
             .map_err(|e| format!("P-256 verification failed: {:?}", e).into())
     }
 
+    /// Generate a P-384 key pair (ES384 / alg -35), returning (PKCS#8 private key, raw public key).
+    /// The public key is 97 bytes: 0x04 + x (48 bytes) + y (48 bytes).
+    pub fn generate_p384_key_pair(&self) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, &rng)
+            .map_err(|e| format!("Failed to generate P-384 PKCS#8: {:?}", e))?;
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                .map_err(|e| format!("Failed to parse P-384 PKCS#8: {:?}", e))?;
+        let public_key = key_pair.public_key().as_ref().to_vec();
+        Ok((pkcs8.as_ref().to_vec(), public_key))
+    }
+
+    /// Sign with P-384 over SHA-384 (ES384 / alg -35), returning a DER-encoded signature.
+    pub fn sign_p384(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_ASN1_SIGNING, private_key, &rng)
+            .map_err(|e| format!("Failed to parse P-384 private key: {:?}", e))?;
+        let signature = key_pair
+            .sign(&rng, message)
+            .map_err(|e| format!("P-384 signing failed: {:?}", e))?;
+        Ok(signature.as_ref().to_vec())
+    }
+
+    /// Verify a P-384 DER-encoded signature (ES384 / alg -35).
+    pub fn verify_p384(
+        &self,
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let verifying_key = UnparsedPublicKey::new(&ECDSA_P384_SHA384_ASN1, public_key);
+        verifying_key
+            .verify(message, signature)
+            .map_err(|e| format!("P-384 verification failed: {:?}", e).into())
+    }
+
+    /// Sign with RSA-PSS over SHA-256 (PS256 / alg -37).
+    pub fn sign_rsa_pss(
+        &self,
+        private_key: &[u8],
+        message: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let key_pair = RsaKeyPair::from_pkcs8(private_key)
+            .map_err(|e| format!("Failed to parse RSA private key: {:?}", e))?;
+        let rng = SystemRandom::new();
+        let mut signature = vec![0u8; key_pair.public().modulus_len()];
+        key_pair
+            .sign(&RSA_PSS_SHA256, &rng, message, &mut signature)
+            .map_err(|e| format!("RSA-PSS signing failed: {:?}", e))?;
+        Ok(signature)
+    }
+
+    /// Verify a PS256 signature against a DER SubjectPublicKeyInfo public key.
+    pub fn verify_rsa_pss(
+        &self,
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let verifying_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, public_key);
+        verifying_key
+            .verify(message, signature)
+            .map_err(|e| format!("RSA-PSS verification failed: {:?}", e).into())
+    }
+
     /// Generate an RSA-2048 key pair for RS256 (alg -257).
     /// Returns (PKCS#8 private key, modulus `n` big-endian, exponent `e` big-endian).
     pub fn generate_rsa_key_pair(&self) -> Result<RsaKeyMaterial, Box<dyn std::error::Error>> {
@@ -327,6 +399,48 @@ impl CryptoEngine {
             .map_err(|e| format!("Decryption failed: {:?}", e))?;
         Ok(plaintext.to_vec())
     }
+
+    /// Gera um par de chaves X25519 estático persistível `(private_key_32B, public_key_32B)`.
+    pub fn generate_x25519_key_pair(
+        &self,
+    ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        let (priv_k, pub_k) = crate::hybrid::hybrid_generate_static_keypair()?;
+        Ok((priv_k.to_vec(), pub_k.to_vec()))
+    }
+
+    /// Executa Diffie-Hellman X25519 entre a chave privada local e a pública do par.
+    pub fn x25519_diffie_hellman(
+        &self,
+        private_key: &[u8],
+        public_key: &[u8],
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let shared = crate::hybrid::hybrid_diffie_hellman(private_key, public_key)?;
+        Ok(shared.to_vec())
+    }
+
+    /// Cifra dados usando ECIES híbrido (X25519 efêmero + HKDF + ChaCha20-Poly1305)
+    /// direcionado à chave pública do destinatário.
+    pub fn hybrid_encrypt(
+        &self,
+        recipient_public_key: &[u8],
+        plaintext: &[u8],
+    ) -> Result<crate::hybrid::HybridCiphertext, Box<dyn std::error::Error>> {
+        crate::hybrid::hybrid_encrypt(recipient_public_key, plaintext)
+    }
+
+    /// Decifra dados ECIES híbridos usando uma chave privada X25519 estática.
+    pub fn hybrid_decrypt_static(
+        &self,
+        recipient_private_key: &[u8],
+        recipient_public_key: &[u8],
+        ciphertext: &crate::hybrid::HybridCiphertext,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        crate::hybrid::hybrid_decrypt_static(
+            recipient_private_key,
+            recipient_public_key,
+            ciphertext,
+        )
+    }
 }
 
 impl Debug for CryptoEngine {
@@ -425,5 +539,60 @@ mod tests {
         b[0] = 0x01;
         b[31] = 0xFF;
         assert!(!constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_es384_sign_verify() {
+        let engine = CryptoEngine::new().unwrap();
+        let (pkcs8, public_key) = engine.generate_p384_key_pair().unwrap();
+        assert_eq!(public_key.len(), 97); // 0x04 + 48 + 48
+
+        let message = b"test message for es384 ecdsa p384";
+        let signature = engine.sign_p384(&pkcs8, message).unwrap();
+        assert!(!signature.is_empty());
+
+        assert!(engine.verify_p384(&public_key, message, &signature).is_ok());
+
+        let mut bad_sig = signature.clone();
+        bad_sig[0] ^= 0xFF;
+        assert!(engine.verify_p384(&public_key, message, &bad_sig).is_err());
+    }
+
+    #[test]
+    fn test_ps256_sign_verify() {
+        let engine = CryptoEngine::new().unwrap();
+        let (pkcs8, n, e) = engine.generate_rsa_key_pair().unwrap();
+        let pub_der = CryptoEngine::rsa_public_key_der(&n, &e).unwrap();
+
+        let message = b"test message for ps256 rsa-pss";
+        let signature = engine.sign_rsa_pss(&pkcs8, message).unwrap();
+        assert_eq!(signature.len(), RSA_KEY_BITS / 8);
+
+        assert!(engine.verify_rsa_pss(&pub_der, message, &signature).is_ok());
+
+        let mut bad_sig = signature.clone();
+        bad_sig[0] ^= 0xFF;
+        assert!(engine.verify_rsa_pss(&pub_der, message, &bad_sig).is_err());
+    }
+
+    #[test]
+    fn test_x25519_static_hybrid_crypto_engine() {
+        let engine = CryptoEngine::new().unwrap();
+        let (priv_a, pub_a) = engine.generate_x25519_key_pair().unwrap();
+        let (priv_b, pub_b) = engine.generate_x25519_key_pair().unwrap();
+
+        assert_eq!(priv_a.len(), 32);
+        assert_eq!(pub_a.len(), 32);
+
+        // DH
+        let shared_ab = engine.x25519_diffie_hellman(&priv_a, &pub_b).unwrap();
+        let shared_ba = engine.x25519_diffie_hellman(&priv_b, &pub_a).unwrap();
+        assert_eq!(shared_ab, shared_ba);
+
+        // ECIES Static
+        let plaintext = b"persisted sealed secret for device reboots";
+        let ct = engine.hybrid_encrypt(&pub_a, plaintext).unwrap();
+        let decrypted = engine.hybrid_decrypt_static(&priv_a, &pub_a, &ct).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 }

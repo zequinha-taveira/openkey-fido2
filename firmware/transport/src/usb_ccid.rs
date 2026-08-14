@@ -1,4 +1,6 @@
 use crate::transport::{Transport, TransportError};
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use log::warn;
 
 /// Stub de transporte USB-CCID (smartcard).

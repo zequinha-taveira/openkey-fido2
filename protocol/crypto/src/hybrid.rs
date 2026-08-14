@@ -1,16 +1,12 @@
 //! Criptografia híbrida (ECIES) sobre X25519 + ChaCha20-Poly1305.
 //!
-//! O esquema é um **sealed box efêmero**: o remetente gera um par de chaves
+//! O esquema é um **sealed box** híbrido: o remetente gera um par de chaves
 //! efêmero, faz ECDH com a chave pública do destinatário, deriva uma chave
 //! simétrica via HKDF-SHA256 e cifra o payload com ChaCha20-Poly1305.
 //!
-//! NOTA: `ring` 0.17 não permite importar chaves privadas X25519 estáticas —
-//! `EphemeralPrivateKey` só pode ser criada via `generate()`. Por isso
-//! `hybrid_decrypt` recebe a `EphemeralPrivateKey` **por valor** em vez de
-//! bytes, e o par de chaves do destinatário precisa ser criado no processo
-//! (via `hybrid_generate_keypair`) e mantido vivo até a decifragem. Isso
-//! restringe o módulo a cenários dentro de um mesmo processo (ex.: sessões em
-//! memória), não a chaves persistidas em flash.
+//! Suporta tanto chaves efêmeras (`EphemeralPrivateKey` via `ring`) quanto
+//! chaves estáticas persistíveis (`[u8; 32]` via `x25519_dalek`), permitindo
+//! decifrar dados armazenados em flash mesmo após reinicializações.
 
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
@@ -19,6 +15,8 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, X25519};
 use ring::hkdf::{self, HKDF_SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
+use x25519_dalek::{PublicKey as DalekPublicKey, StaticSecret};
+use zeroize::Zeroize;
 
 extern crate alloc;
 
@@ -39,10 +37,6 @@ const HKDF_INFO: &[u8] = b"openkey-ecies-v1";
 type Error = Box<dyn std::error::Error>;
 
 /// Wrapper que zera o material sensível ao ser dropado.
-///
-/// NOTA: sem a crate `zeroize` (dependência proibida) e sem `unsafe`, a
-/// melhor garantia disponível é escrever zeros e emitir um `compiler_fence`
-/// para desencorajar a eliminação da escrita morta pelo otimizador.
 struct Zeroizing<T: AsMut<[u8]>>(T);
 
 impl<T: AsMut<[u8]>> Drop for Zeroizing<T> {
@@ -156,6 +150,55 @@ pub fn hybrid_generate_keypair() -> Result<(EphemeralPrivateKey, Vec<u8>), Error
     Ok((private_key, public_key.as_ref().to_vec()))
 }
 
+/// Gera um par de chaves X25519 estático que pode ser persistido em storage/flash.
+///
+/// Retorna `(private_key_32_bytes, public_key_32_bytes)`.
+pub fn hybrid_generate_static_keypair(
+) -> Result<([u8; X25519_KEY_LEN], [u8; X25519_KEY_LEN]), Error> {
+    let rng = SystemRandom::new();
+    let mut priv_bytes = [0u8; X25519_KEY_LEN];
+    rng.fill(&mut priv_bytes)
+        .map_err(|e| format!("Failed to generate random private key bytes: {:?}", e))?;
+
+    let secret = StaticSecret::from(priv_bytes);
+    let public = DalekPublicKey::from(&secret);
+    let pub_bytes = *public.as_bytes();
+
+    Ok((priv_bytes, pub_bytes))
+}
+
+/// Executa Diffie-Hellman com chaves estáticas X25519.
+pub fn hybrid_diffie_hellman(my_private: &[u8], peer_public: &[u8]) -> Result<[u8; 32], Error> {
+    if my_private.len() != X25519_KEY_LEN {
+        return Err(format!(
+            "Private key must be {} bytes, got {}",
+            X25519_KEY_LEN,
+            my_private.len()
+        )
+        .into());
+    }
+    if peer_public.len() != X25519_KEY_LEN {
+        return Err(format!(
+            "Public key must be {} bytes, got {}",
+            X25519_KEY_LEN,
+            peer_public.len()
+        )
+        .into());
+    }
+
+    let priv_array: [u8; 32] = my_private
+        .try_into()
+        .map_err(|_| "invalid private key length")?;
+    let pub_array: [u8; 32] = peer_public
+        .try_into()
+        .map_err(|_| "invalid public key length")?;
+
+    let secret = StaticSecret::from(priv_array);
+    let public = DalekPublicKey::from(pub_array);
+    let shared = secret.diffie_hellman(&public);
+    Ok(*shared.as_bytes())
+}
+
 pub fn hybrid_encrypt(
     recipient_public_key: &[u8],
     plaintext: &[u8],
@@ -215,11 +258,7 @@ pub fn hybrid_encrypt(
     })
 }
 
-/// Decifra um `HybridCiphertext`.
-///
-/// `recipient_private` é consumida (limitação do `ring`, ver nota do módulo).
-/// `recipient_public` é validada contra a chave pública derivada da privada;
-/// a derivada é a usada no KDF, garantindo simetria com `hybrid_encrypt`.
+/// Decifra um `HybridCiphertext` usando chave efêmera `EphemeralPrivateKey`.
 pub fn hybrid_decrypt(
     recipient_private: EphemeralPrivateKey,
     recipient_public: &[u8],
@@ -273,6 +312,88 @@ pub fn hybrid_decrypt(
 
     let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, &*symmetric_key)
         .map_err(|e| format!("Failed to create cipher key: {:?}", e))?;
+    let key = LessSafeKey::new(unbound_key);
+    let nonce = Nonce::assume_unique_for_key(ciphertext.nonce);
+
+    let mut in_out = ciphertext.ciphertext.clone();
+    let plaintext = key
+        .open_in_place(
+            nonce,
+            Aad::from(&ciphertext.ephemeral_public_key),
+            &mut in_out,
+        )
+        .map_err(|e| format!("Decryption failed: {:?}", e))?;
+
+    Ok(plaintext.to_vec())
+}
+
+/// Decifra um `HybridCiphertext` usando uma chave privada X25519 estática (`[u8; 32]`).
+///
+/// Permite que a chave seja persistida em flash/storage e reutilizada após reboots.
+pub fn hybrid_decrypt_static(
+    recipient_private: &[u8],
+    recipient_public: &[u8],
+    ciphertext: &HybridCiphertext,
+) -> Result<Vec<u8>, Error> {
+    if recipient_private.len() != X25519_KEY_LEN {
+        return Err(format!(
+            "Recipient private key must be {} bytes, got {}",
+            X25519_KEY_LEN,
+            recipient_private.len()
+        )
+        .into());
+    }
+    if recipient_public.len() != X25519_KEY_LEN {
+        return Err(format!(
+            "Recipient public key must be {} bytes, got {}",
+            X25519_KEY_LEN,
+            recipient_public.len()
+        )
+        .into());
+    }
+    if ciphertext.ephemeral_public_key.len() != X25519_KEY_LEN {
+        return Err(format!(
+            "Ephemeral public key must be {} bytes, got {}",
+            X25519_KEY_LEN,
+            ciphertext.ephemeral_public_key.len()
+        )
+        .into());
+    }
+    if ciphertext.ciphertext.len() < TAG_LEN {
+        return Err("Ciphertext too short to contain an authentication tag".into());
+    }
+
+    let priv_array: [u8; 32] = recipient_private
+        .try_into()
+        .map_err(|_| "invalid private key")?;
+    let secret = StaticSecret::from(priv_array);
+    let derived_public = DalekPublicKey::from(&secret);
+
+    if derived_public.as_bytes() != recipient_public {
+        return Err("Recipient public key does not match the provided private key".into());
+    }
+
+    let ephem_array: [u8; 32] = ciphertext
+        .ephemeral_public_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "invalid ephemeral key")?;
+    let ephemeral_pub = DalekPublicKey::from(ephem_array);
+
+    let mut shared_secret = secret.diffie_hellman(&ephemeral_pub);
+    let shared_secret_bytes = *shared_secret.as_bytes();
+    shared_secret.zeroize();
+
+    let mut symmetric_key_bytes = derive_symmetric_key(
+        &shared_secret_bytes,
+        &ciphertext.ephemeral_public_key,
+        recipient_public,
+    )?;
+
+    let unbound_key = UnboundKey::new(&CHACHA20_POLY1305, &symmetric_key_bytes)
+        .map_err(|e| format!("Failed to create cipher key: {:?}", e))?;
+    symmetric_key_bytes.zeroize();
+
     let key = LessSafeKey::new(unbound_key);
     let nonce = Nonce::assume_unique_for_key(ciphertext.nonce);
 
@@ -484,5 +605,53 @@ mod tests {
 
         let key3 = derive_symmetric_key(secret1, &recipient_pk, &ephemeral_pk).unwrap();
         assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn test_hybrid_static_keypair_roundtrip() {
+        let (private_bytes, public_bytes) = hybrid_generate_static_keypair().unwrap();
+        assert_eq!(private_bytes.len(), 32);
+        assert_eq!(public_bytes.len(), 32);
+
+        let plaintext = b"dados persistidos que sobrevivem a reboots do microcontrolador";
+
+        // Encrypt with public key
+        let ciphertext = hybrid_encrypt(&public_bytes, plaintext).unwrap();
+
+        // Decrypt with static private key bytes
+        let decrypted = hybrid_decrypt_static(&private_bytes, &public_bytes, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_hybrid_diffie_hellman() {
+        let (priv_a, pub_a) = hybrid_generate_static_keypair().unwrap();
+        let (priv_b, pub_b) = hybrid_generate_static_keypair().unwrap();
+
+        let shared_ab = hybrid_diffie_hellman(&priv_a, &pub_b).unwrap();
+        let shared_ba = hybrid_diffie_hellman(&priv_b, &pub_a).unwrap();
+
+        assert_eq!(shared_ab, shared_ba);
+        assert_ne!(shared_ab, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_hybrid_static_decrypt_wrong_key() {
+        let (priv_a, pub_a) = hybrid_generate_static_keypair().unwrap();
+        let (priv_b, _pub_b) = hybrid_generate_static_keypair().unwrap();
+
+        let ciphertext = hybrid_encrypt(&pub_a, b"confidencial").unwrap();
+        let result = hybrid_decrypt_static(&priv_b, &pub_a, &ciphertext);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hybrid_static_decrypt_tampered() {
+        let (priv_a, pub_a) = hybrid_generate_static_keypair().unwrap();
+        let mut ciphertext = hybrid_encrypt(&pub_a, b"mensagem autenticada").unwrap();
+        ciphertext.ciphertext[0] ^= 0xFF;
+
+        let result = hybrid_decrypt_static(&priv_a, &pub_a, &ciphertext);
+        assert!(result.is_err());
     }
 }

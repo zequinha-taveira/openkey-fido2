@@ -14,6 +14,8 @@ extern crate alloc;
 
 use crate::attestation::{AttestationFormat, PackedAttestation, SelfAttestation};
 use crate::client_pin;
+use crate::cred_mgmt;
+use crate::large_blobs;
 
 /// Comando CTAP2 serializado para transporte.
 ///
@@ -104,6 +106,8 @@ pub struct Extensions {
     pub min_pin_length: bool,
     #[serde(rename = "hmac-secret")]
     pub hmac_secret: Option<HmacSecretInput>,
+    #[serde(rename = "largeBlobKey", default)]
+    pub large_blob_key: bool,
 }
 
 impl Extensions {
@@ -112,6 +116,7 @@ impl Extensions {
             || self.cred_blob.is_some()
             || self.min_pin_length
             || self.hmac_secret.is_some()
+            || self.large_blob_key
     }
 }
 
@@ -182,6 +187,13 @@ pub struct ExtensionOutputs {
         skip_serializing_if = "Option::is_none"
     )]
     pub hmac_secret: Option<Vec<u8>>,
+    /// Chave simétrica associada à credencial (extensão `largeBlobKey`).
+    #[serde(
+        with = "serde_bytes",
+        rename = "largeBlobKey",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub large_blob_key: Option<Vec<u8>>,
 }
 
 /// Dados de credencial retornados em respostas CTAP2.
@@ -287,6 +299,12 @@ pub struct GetInfoResponse {
     /// Recursos de segurança do silício, se houver.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityFeatures>,
+    /// Tamanho máximo suportado para large blobs em bytes (CTAP 2.1 §6.4).
+    #[serde(
+        rename = "maxLargeBlobDataSize",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_large_blob_data_size: Option<u32>,
 }
 
 /// Entrada de algoritmo COSE para resposta GetInfo (CTAP2 §6.4).
@@ -366,14 +384,18 @@ pub enum Ctap2Command {
     GetNextAssertion = 0x08,
     /// BioEnroll (0x09) — gerenciamento de biometria (stub).
     BioEnroll = 0x09,
+    /// CredentialManagement (0x0A) — gerenciamento de credenciais residentes.
+    CredentialManagement = 0x0A,
+    /// Selection (0x0B) — seleciona dispositivo via toque.
+    Selection = 0x0B,
+    /// LargeBlobs (0x0C) — leitura e escrita de large blobs no autenticador.
+    LargeBlobs = 0x0C,
     /// GetVersion (0x0F) — retorna versões de firmware/hardware.
     GetVersion = 0x0F,
     /// EnumerateRPsInitial (0x3B) — inicia enumeração de relying parties.
     EnumerateRPsInitial = 0x3B,
     /// EnumerateRPsNext (0x3C) — continua enumeração de relying parties.
     EnumerateRPsNext = 0x3C,
-    /// Selection (0x0B) — seleciona dispositivo via toque.
-    Selection = 0x0B,
     /// Comando não reconhecido — contém o byte original.
     Unknown(u8),
 }
@@ -388,10 +410,12 @@ impl Ctap2Command {
             0x07 => Ctap2Command::Reset,
             0x08 => Ctap2Command::GetNextAssertion,
             0x09 => Ctap2Command::BioEnroll,
+            0x0A => Ctap2Command::CredentialManagement,
+            0x0B => Ctap2Command::Selection,
+            0x0C => Ctap2Command::LargeBlobs,
             0x0F => Ctap2Command::GetVersion,
             0x3B => Ctap2Command::EnumerateRPsInitial,
             0x3C => Ctap2Command::EnumerateRPsNext,
-            0x0B => Ctap2Command::Selection,
             _ => Ctap2Command::Unknown(value),
         }
     }
@@ -454,6 +478,8 @@ pub enum Ctap2Error {
     PinTokenFailure = 0x38,
     /// Request excede o tamanho máximo permitido.
     RequestTooLarge = 0x40,
+    /// Array de large blobs está cheio ou excede o limite máximo.
+    LargeBlobStorageFull = 0x41,
     /// Erro não categorizado.
     Unknown = 0x7F,
 }
@@ -568,6 +594,7 @@ pub struct Ctap2Capabilities {
     pub firmware_version: String,
     pub min_pin_length: Option<u32>,
     pub security: SecurityFeatures,
+    pub max_large_blob_data_size: Option<u32>,
 }
 
 impl Default for Ctap2Capabilities {
@@ -580,8 +607,15 @@ impl Default for Ctap2Capabilities {
                 "credBlob".to_string(),
                 "minPinLength".to_string(),
                 "hmac-secret".to_string(),
+                "largeBlobKey".to_string(),
             ],
-            options: vec!["rk".to_string(), "up".to_string()],
+            options: vec![
+                "rk".to_string(),
+                "up".to_string(),
+                "largeBlobs".to_string(),
+                "credMgmt".to_string(),
+                "ep".to_string(),
+            ],
             rp_count: 0,
             max_cred_blob_length: 32,
             max_credential_id_length: 64,
@@ -589,6 +623,7 @@ impl Default for Ctap2Capabilities {
             firmware_version: "0.1.0".to_string(),
             min_pin_length: Some(4),
             security: SecurityFeatures::default(),
+            max_large_blob_data_size: Some(4096),
         }
     }
 }
@@ -620,7 +655,10 @@ pub struct Ctap2Authenticator {
     capabilities: Ctap2Capabilities,
     attestation_format: AttestationFormat,
     attestation_cert: Option<crate::attestation::AttestationCertificate>,
+    enterprise_rp_list: Vec<String>,
     enumerate_rps_state: Option<EnumerateRPsState>,
+    cred_mgmt_rps_state: Option<EnumerateRpsCredMgmtState>,
+    cred_mgmt_creds_state: Option<EnumerateCredentialsState>,
     get_next_assertion_state: Option<GetNextAssertionState>,
     user_presence: Option<Box<dyn UserPresence>>,
 }
@@ -628,6 +666,20 @@ pub struct Ctap2Authenticator {
 #[derive(Debug)]
 struct EnumerateRPsState {
     rps: Vec<(String, Vec<u8>)>,
+    total: usize,
+    current_index: usize,
+}
+
+#[derive(Debug)]
+struct EnumerateRpsCredMgmtState {
+    rps: Vec<(String, Vec<u8>)>,
+    total: usize,
+    current_index: usize,
+}
+
+#[derive(Debug)]
+struct EnumerateCredentialsState {
+    creds: Vec<Credential>,
     total: usize,
     current_index: usize,
 }
@@ -664,7 +716,10 @@ impl Ctap2Authenticator {
             capabilities,
             attestation_format: AttestationFormat::None,
             attestation_cert: None,
+            enterprise_rp_list: Vec::new(),
             enumerate_rps_state: None,
+            cred_mgmt_rps_state: None,
+            cred_mgmt_creds_state: None,
             get_next_assertion_state: None,
             user_presence: None,
         })
@@ -699,6 +754,11 @@ impl Ctap2Authenticator {
     /// usado em simulação e testes sem botão físico.
     pub fn set_user_presence(&mut self, presence: Option<Box<dyn UserPresence>>) {
         self.user_presence = presence;
+    }
+
+    /// Define a lista de RP IDs autorizados para Enterprise Attestation.
+    pub fn set_enterprise_rp_list(&mut self, rps: Vec<String>) {
+        self.enterprise_rp_list = rps;
     }
 
     pub fn get_crypto(&self) -> &CryptoEngine {
@@ -738,6 +798,8 @@ impl Ctap2Authenticator {
                 .find_map(|param| match param.algorithms {
                     -7 => Some(-7),
                     -8 => Some(-8),
+                    -35 => Some(-35),
+                    -37 => Some(-37),
                     -257 => Some(-257),
                     _ => None,
                 })
@@ -774,7 +836,8 @@ impl Ctap2Authenticator {
         let credential_id = self.generate_credential_id();
         let (private_key, public_key) = match selected_alg {
             -7 => self.crypto.generate_p256_key_pair()?,
-            -257 => {
+            -35 => self.crypto.generate_p384_key_pair()?,
+            -37 | -257 => {
                 // RSA: keep the PKCS#1 DER public key so both the COSE key and
                 // signature verification can be derived from it.
                 let (pkcs8, n, e) = self.crypto.generate_rsa_key_pair()?;
@@ -782,6 +845,18 @@ impl Ctap2Authenticator {
                 (pkcs8, public_key)
             }
             _ => self.crypto.generate_key_pair()?,
+        };
+
+        // Generate largeBlobKey if the extension was requested.
+        let large_blob_key = if request
+            .extensions
+            .as_ref()
+            .map(|e| e.large_blob_key)
+            .unwrap_or(false)
+        {
+            Some(self.crypto.random_bytes(32))
+        } else {
+            None
         };
 
         let credential = Credential {
@@ -795,6 +870,9 @@ impl Ctap2Authenticator {
             created_at: 0,
             algorithm: selected_alg,
             rp_id: request.rp.id.clone(),
+            large_blob_key: large_blob_key.clone(),
+            user_name: request.user.name.clone(),
+            user_display_name: request.user.display_name.clone(),
         };
 
         self.storage.store_credential(credential, &self.crypto)?;
@@ -842,6 +920,9 @@ impl Ctap2Authenticator {
                 let hmac_key = self.crypto.compute_hmac(&salt, &private_key)?;
                 let encrypted = self.crypto.encrypt(&hmac_key, &[0u8; 12])?;
                 ext_outputs.hmac_secret = Some(encrypted);
+            }
+            if request.extensions.as_ref().unwrap().large_blob_key {
+                ext_outputs.large_blob_key = large_blob_key.clone();
             }
         }
 
@@ -969,6 +1050,12 @@ impl Ctap2Authenticator {
             -7 => self
                 .crypto
                 .sign_p256(&credential.private_key, &data_to_sign)?,
+            -35 => self
+                .crypto
+                .sign_p384(&credential.private_key, &data_to_sign)?,
+            -37 => self
+                .crypto
+                .sign_rsa_pss(&credential.private_key, &data_to_sign)?,
             -257 => self
                 .crypto
                 .sign_rsa(&credential.private_key, &data_to_sign)?,
@@ -994,6 +1081,11 @@ impl Ctap2Authenticator {
                 let hmac_key = self.crypto.compute_hmac(&salt, &credential.private_key)?;
                 let encrypted = self.crypto.encrypt(&hmac_key, &[0u8; 12])?;
                 ext_outputs.hmac_secret = Some(encrypted);
+            }
+            if request.extensions.as_ref().unwrap().large_blob_key {
+                if let Some(ref key) = credential.large_blob_key {
+                    ext_outputs.large_blob_key = Some(key.clone());
+                }
             }
         }
 
@@ -1072,11 +1164,20 @@ impl Ctap2Authenticator {
                     key_type: "public-key".to_string(),
                 },
                 CoseAlgorithmEntry {
+                    alg: -35,
+                    key_type: "public-key".to_string(),
+                },
+                CoseAlgorithmEntry {
+                    alg: -37,
+                    key_type: "public-key".to_string(),
+                },
+                CoseAlgorithmEntry {
                     alg: -257,
                     key_type: "public-key".to_string(),
                 },
             ],
             security,
+            max_large_blob_data_size: self.capabilities.max_large_blob_data_size,
         })
     }
 
@@ -1117,6 +1218,8 @@ impl Ctap2Authenticator {
             Ctap2Command::Reset => self.handle_reset(),
             Ctap2Command::GetNextAssertion => self.handle_get_next_assertion(),
             Ctap2Command::BioEnroll => self.handle_bio_enroll(&data),
+            Ctap2Command::CredentialManagement => self.handle_credential_management(&data),
+            Ctap2Command::LargeBlobs => self.handle_large_blobs(&data),
             Ctap2Command::EnumerateRPsInitial => self.handle_enumerate_rps_initial(),
             Ctap2Command::EnumerateRPsNext => self.handle_enumerate_rps_next(),
             Ctap2Command::Unknown(_) => Err(Ctap2Error::InvalidCommand),
@@ -1142,10 +1245,13 @@ impl Ctap2Authenticator {
 
     fn handle_reset(&mut self) -> Result<Vec<u8>, Ctap2Error> {
         self.storage.clear();
+        self.storage.clear_large_blobs();
         self.enumerate_rps_state = None;
+        self.cred_mgmt_rps_state = None;
+        self.cred_mgmt_creds_state = None;
         self.get_next_assertion_state = None;
         info!("Reset: all credentials and state cleared");
-        Ok(vec![Ctap2Error::Success.as_u8()])
+        Ok(Vec::new())
     }
 
     fn handle_get_next_assertion(&mut self) -> Result<Vec<u8>, Ctap2Error> {
@@ -1259,6 +1365,247 @@ impl Ctap2Authenticator {
         Ok(encoded)
     }
 
+    // ── LargeBlobs (0x0C) ────────────────────────────────────────────────
+
+    fn handle_large_blobs(&mut self, data: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
+        let request: large_blobs::LargeBlobsRequest =
+            decode_cbor(data).map_err(|_| Ctap2Error::InvalidParameter)?;
+
+        // Read operation: `set` is None, `get` is Some
+        if request.set.is_none() {
+            let count = request.get.unwrap_or(0) as usize;
+            let offset = request.offset as usize;
+            let fragment = self.storage.read_large_blobs(offset, count);
+            let response = large_blobs::LargeBlobsResponse {
+                config: Some(fragment),
+            };
+            let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+            return Ok(encoded);
+        }
+
+        // Write operation: `set` is Some
+        let blob_data = request.set.unwrap();
+        let expected_len = request.length.unwrap_or(0) as usize;
+        let offset = request.offset as usize;
+
+        // Validate against max supported size
+        if let Some(max_size) = self.capabilities.max_large_blob_data_size {
+            if expected_len > max_size as usize {
+                return Err(Ctap2Error::LargeBlobStorageFull);
+            }
+        }
+
+        self.storage
+            .write_large_blobs(offset, &blob_data, expected_len)
+            .map_err(|_| Ctap2Error::InvalidData)?;
+
+        let response = large_blobs::LargeBlobsResponse { config: None };
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        Ok(encoded)
+    }
+
+    // ── Credential Management (0x0A) ─────────────────────────────────────
+
+    fn handle_credential_management(&mut self, data: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
+        let request: cred_mgmt::CredentialManagementRequest =
+            decode_cbor(data).map_err(|_| Ctap2Error::InvalidParameter)?;
+
+        match request.sub_command {
+            cred_mgmt::sub_commands::GET_CREDS_METADATA => self.handle_cred_mgmt_get_metadata(),
+            cred_mgmt::sub_commands::ENUMERATE_RPS_BEGIN => {
+                self.handle_cred_mgmt_enumerate_rps_begin()
+            }
+            cred_mgmt::sub_commands::ENUMERATE_RPS_GET_NEXT => {
+                self.handle_cred_mgmt_enumerate_rps_next()
+            }
+            cred_mgmt::sub_commands::ENUMERATE_CREDENTIALS_BEGIN => {
+                let params = request
+                    .sub_command_params
+                    .ok_or(Ctap2Error::InvalidParameter)?;
+                let rp_hash = params.rp_id_hash.ok_or(Ctap2Error::InvalidParameter)?;
+                self.handle_cred_mgmt_enumerate_creds_begin(&rp_hash)
+            }
+            cred_mgmt::sub_commands::ENUMERATE_CREDENTIALS_GET_NEXT => {
+                self.handle_cred_mgmt_enumerate_creds_next()
+            }
+            cred_mgmt::sub_commands::DELETE_CREDENTIAL => {
+                let params = request
+                    .sub_command_params
+                    .ok_or(Ctap2Error::InvalidParameter)?;
+                let cred_desc = params.credential_id.ok_or(Ctap2Error::InvalidParameter)?;
+                self.handle_cred_mgmt_delete_credential(&cred_desc.id)
+            }
+            cred_mgmt::sub_commands::UPDATE_USER_INFORMATION => {
+                let params = request
+                    .sub_command_params
+                    .ok_or(Ctap2Error::InvalidParameter)?;
+                let cred_desc = params.credential_id.ok_or(Ctap2Error::InvalidParameter)?;
+                let user = params.user.ok_or(Ctap2Error::InvalidParameter)?;
+                self.handle_cred_mgmt_update_user(&cred_desc.id, &user)
+            }
+            _ => Err(Ctap2Error::InvalidParameter),
+        }
+    }
+
+    fn handle_cred_mgmt_get_metadata(&self) -> Result<Vec<u8>, Ctap2Error> {
+        let count = self.storage.get_credentials_count() as u32;
+        let remaining = self.storage.get_max_possible_remaining() as u32;
+        let response = cred_mgmt::CredsMetadataResponse {
+            existing_resident_credentials_count: count,
+            max_possible_remaining_resident_credentials_count: remaining,
+        };
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        Ok(encoded)
+    }
+
+    fn handle_cred_mgmt_enumerate_rps_begin(&mut self) -> Result<Vec<u8>, Ctap2Error> {
+        let rps = self.storage.enumerate_rps();
+        let total = rps.len();
+        if total == 0 {
+            return Err(Ctap2Error::NoCredentials);
+        }
+
+        let first_rp_id = rps[0].0.clone();
+        let first_rp_hash = rps[0].1.clone();
+
+        self.cred_mgmt_rps_state = Some(EnumerateRpsCredMgmtState {
+            rps,
+            total,
+            current_index: 0,
+        });
+
+        let response = cred_mgmt::EnumerateRpsEntryResponse {
+            rp: RelyingParty {
+                id: first_rp_id,
+                name: None,
+                icon: None,
+            },
+            rp_id_hash: first_rp_hash,
+            total_rps: total as u32,
+        };
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        Ok(encoded)
+    }
+
+    fn handle_cred_mgmt_enumerate_rps_next(&mut self) -> Result<Vec<u8>, Ctap2Error> {
+        let state = self
+            .cred_mgmt_rps_state
+            .as_mut()
+            .ok_or(Ctap2Error::InvalidState)?;
+
+        state.current_index += 1;
+        if state.current_index >= state.total {
+            self.cred_mgmt_rps_state = None;
+            return Err(Ctap2Error::NoCredentials);
+        }
+
+        let (rp_id, rp_hash) = &state.rps[state.current_index];
+        let response = cred_mgmt::EnumerateRpsEntryResponse {
+            rp: RelyingParty {
+                id: rp_id.clone(),
+                name: None,
+                icon: None,
+            },
+            rp_id_hash: rp_hash.clone(),
+            total_rps: state.total as u32,
+        };
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        Ok(encoded)
+    }
+
+    fn handle_cred_mgmt_enumerate_creds_begin(
+        &mut self,
+        rp_hash: &[u8],
+    ) -> Result<Vec<u8>, Ctap2Error> {
+        let creds = self
+            .storage
+            .find_credentials_by_rp_hash(rp_hash, &self.crypto);
+        let total = creds.len();
+        if total == 0 {
+            return Err(Ctap2Error::NoCredentials);
+        }
+
+        let first = &creds[0];
+        let response = self.build_enumerate_cred_entry(first, total as u32);
+
+        self.cred_mgmt_creds_state = Some(EnumerateCredentialsState {
+            creds,
+            total,
+            current_index: 0,
+        });
+
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        Ok(encoded)
+    }
+
+    fn handle_cred_mgmt_enumerate_creds_next(&mut self) -> Result<Vec<u8>, Ctap2Error> {
+        let state = self
+            .cred_mgmt_creds_state
+            .as_mut()
+            .ok_or(Ctap2Error::InvalidState)?;
+
+        state.current_index += 1;
+        if state.current_index >= state.total {
+            self.cred_mgmt_creds_state = None;
+            return Err(Ctap2Error::NoCredentials);
+        }
+
+        let cred = &state.creds[state.current_index].clone();
+        let total = state.total as u32;
+        let response = self.build_enumerate_cred_entry(cred, total);
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        Ok(encoded)
+    }
+
+    fn handle_cred_mgmt_delete_credential(
+        &mut self,
+        credential_id: &[u8],
+    ) -> Result<Vec<u8>, Ctap2Error> {
+        self.storage
+            .delete_credential(credential_id)
+            .map_err(|_| Ctap2Error::NoCredentials)?;
+        Ok(Vec::new())
+    }
+
+    fn handle_cred_mgmt_update_user(
+        &mut self,
+        credential_id: &[u8],
+        user: &User,
+    ) -> Result<Vec<u8>, Ctap2Error> {
+        let updated = self
+            .storage
+            .update_user_info(credential_id, user.name.clone(), user.display_name.clone())
+            .map_err(|_| Ctap2Error::InvalidData)?;
+        if !updated {
+            return Err(Ctap2Error::NoCredentials);
+        }
+        Ok(Vec::new())
+    }
+
+    fn build_enumerate_cred_entry(
+        &self,
+        credential: &Credential,
+        total: u32,
+    ) -> cred_mgmt::EnumerateCredentialsEntryResponse {
+        cred_mgmt::EnumerateCredentialsEntryResponse {
+            user: User {
+                id: credential.user_handle.clone().unwrap_or_default(),
+                name: credential.user_name.clone(),
+                display_name: credential.user_display_name.clone(),
+                icon_url: None,
+            },
+            credential_id: CredentialDescriptor {
+                r#type: "public-key".to_string(),
+                id: credential.credential_id.clone(),
+                transports: None,
+            },
+            public_key: credential.public_key.clone(),
+            total_credentials: total,
+            cred_protect: None,
+            large_blob_key: credential.large_blob_key.clone(),
+        }
+    }
+
     fn find_matching_credentials(
         &self,
         rp_id: &str,
@@ -1317,6 +1664,12 @@ impl Ctap2Authenticator {
             -7 => self
                 .crypto
                 .sign_p256(&credential.private_key, &data_to_sign)?,
+            -35 => self
+                .crypto
+                .sign_p384(&credential.private_key, &data_to_sign)?,
+            -37 => self
+                .crypto
+                .sign_rsa_pss(&credential.private_key, &data_to_sign)?,
             -257 => self
                 .crypto
                 .sign_rsa(&credential.private_key, &data_to_sign)?,
@@ -1370,6 +1723,20 @@ impl Ctap2Authenticator {
                     } else {
                         return Err("invalid P-256 public key length".into());
                     }
+                }
+                -35 => {
+                    // P-384: public_key is 97 bytes (0x04 || x(48) || y(48))
+                    if params.public_key.len() == 97 {
+                        build_cose_key_p384(&params.public_key[1..49], &params.public_key[49..97])
+                            .map_err(|_| "failed to build P-384 COSE key".to_string())?
+                    } else {
+                        return Err("invalid P-384 public key length".into());
+                    }
+                }
+                -37 => {
+                    let (n, e) = CryptoEngine::rsa_public_key_parts(params.public_key)?;
+                    build_cose_key_rsa_pss(&n, &e)
+                        .map_err(|_| "failed to build RSA-PSS COSE key".to_string())?
                 }
                 -257 => {
                     let (n, e) = CryptoEngine::rsa_public_key_parts(params.public_key)?;
@@ -1554,6 +1921,29 @@ fn build_cose_key_rsa(n: &[u8], e: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
     encode_cbor(&key_map)
 }
 
+/// Builds a COSE_Key CBOR map for an ES384 (EC2, alg -35) P-384 public key.
+/// Labels: kty(1)=EC2(2), alg(3)=ES384(-35), crv(-1)=P-384(2), x(-2)=48 bytes, y(-3)=48 bytes.
+fn build_cose_key_p384(x: &[u8], y: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
+    let mut key_map: BTreeMap<i64, Value> = BTreeMap::new();
+    key_map.insert(1, Value::Integer(Integer::from(2)));
+    key_map.insert(3, Value::Integer(Integer::from(-35)));
+    key_map.insert(-1, Value::Integer(Integer::from(2)));
+    key_map.insert(-2, Value::Bytes(x.to_vec()));
+    key_map.insert(-3, Value::Bytes(y.to_vec()));
+    encode_cbor(&key_map)
+}
+
+/// Builds a COSE_Key CBOR map for a PS256 (RSA-PSS, alg -37) public key.
+/// Labels: kty(1)=RSA(3), alg(3)=PS256(-37), n(-1)=modulus, e(-2)=exponent.
+fn build_cose_key_rsa_pss(n: &[u8], e: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
+    let mut key_map: BTreeMap<i64, Value> = BTreeMap::new();
+    key_map.insert(1, Value::Integer(Integer::from(3)));
+    key_map.insert(3, Value::Integer(Integer::from(-37)));
+    key_map.insert(-1, Value::Bytes(n.to_vec()));
+    key_map.insert(-2, Value::Bytes(e.to_vec()));
+    encode_cbor(&key_map)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1631,7 +2021,7 @@ mod tests {
         assert_eq!(authenticator.get_storage().list_credentials().len(), 1);
 
         let result = authenticator.process_command(0x07, vec![]).unwrap();
-        assert_eq!(result, vec![0x00]);
+        assert!(result.is_empty());
         assert!(authenticator.get_storage().list_credentials().is_empty());
     }
 
@@ -2261,13 +2651,17 @@ mod tests {
         let authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
 
         let info = authenticator.get_info().unwrap();
-        assert_eq!(info.algorithms.len(), 3);
+        assert_eq!(info.algorithms.len(), 5);
         assert_eq!(info.algorithms[0].alg, -7);
         assert_eq!(info.algorithms[0].key_type, "public-key");
         assert_eq!(info.algorithms[1].alg, -8);
         assert_eq!(info.algorithms[1].key_type, "public-key");
-        assert_eq!(info.algorithms[2].alg, -257);
+        assert_eq!(info.algorithms[2].alg, -35);
         assert_eq!(info.algorithms[2].key_type, "public-key");
+        assert_eq!(info.algorithms[3].alg, -37);
+        assert_eq!(info.algorithms[3].key_type, "public-key");
+        assert_eq!(info.algorithms[4].alg, -257);
+        assert_eq!(info.algorithms[4].key_type, "public-key");
     }
 
     #[test]
@@ -2541,7 +2935,7 @@ mod tests {
 
         let result = authenticator.process_command(0x07, vec![]);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), vec![0x00]);
+        assert!(result.unwrap().is_empty());
         assert!(authenticator.get_storage().list_credentials().is_empty());
     }
 
@@ -2780,5 +3174,309 @@ mod tests {
 
         let result = authenticator.process_command(0x3C, vec![]);
         assert!(matches!(result, Err(Ctap2Error::InvalidState)));
+    }
+
+    #[test]
+    fn test_cose_key_p384() {
+        let x = vec![0x11u8; 48];
+        let y = vec![0x22u8; 48];
+        let encoded = build_cose_key_p384(&x, &y).unwrap();
+
+        let map: BTreeMap<i64, Value> = decode_cbor(&encoded).unwrap();
+        assert_eq!(map[&1], Value::Integer(Integer::from(2))); // kty = EC2
+        assert_eq!(map[&3], Value::Integer(Integer::from(-35))); // alg = ES384
+        assert_eq!(map[&-1], Value::Integer(Integer::from(2))); // crv = P-384
+        match &map[&-2] {
+            Value::Bytes(bx) => assert_eq!(bx.len(), 48),
+            other => panic!("expected byte string for x, got {:?}", other),
+        }
+        match &map[&-3] {
+            Value::Bytes(by) => assert_eq!(by.len(), 48),
+            other => panic!("expected byte string for y, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_cose_key_rsa_pss() {
+        let n = vec![0xCCu8; 256];
+        let e = vec![0x01u8, 0x00, 0x01];
+        let encoded = build_cose_key_rsa_pss(&n, &e).unwrap();
+
+        let map: BTreeMap<i64, Value> = decode_cbor(&encoded).unwrap();
+        assert_eq!(map[&1], Value::Integer(Integer::from(3))); // kty = RSA
+        assert_eq!(map[&3], Value::Integer(Integer::from(-37))); // alg = PS256
+    }
+
+    #[test]
+    fn test_es384_make_and_get_assertion_roundtrip() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let make_req = MakeCredentialRequest {
+            client_data_hash: vec![0xAA; 32],
+            rp: RelyingParty {
+                id: "example.com".to_string(),
+                name: Some("Example".to_string()),
+                icon: None,
+            },
+            user: User {
+                id: b"user-es384".to_vec(),
+                name: Some("user@example.com".to_string()),
+                display_name: Some("ES384 User".to_string()),
+                icon_url: None,
+            },
+            pub_key_cred_params: vec![PublicKeyCredParams {
+                r#type: "public-key".to_string(),
+                algorithms: -35, // ES384
+            }],
+            exclude_list: vec![],
+            extensions: None,
+            options: MakeCredentialOptions {
+                rk: true,
+                uv: false,
+                up: false,
+                extended: false,
+            },
+            pin_protocol: None,
+            enterprise_protections: None,
+        };
+
+        let resp = authenticator.make_credential(make_req).unwrap();
+        assert!(!resp.auth_data.is_empty());
+
+        let get_req = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            client_data_hash: vec![0xBB; 32],
+            credentials: vec![],
+            allow_list: None,
+            extensions: None,
+            options: GetAssertionOptions {
+                uv: false,
+                up: false,
+            },
+            pin_protocol: None,
+            uv: None,
+        };
+
+        let assert_resp = authenticator.get_assertion(get_req).unwrap();
+        assert!(!assert_resp.signature.is_empty());
+    }
+
+    #[test]
+    fn test_ps256_make_and_get_assertion_roundtrip() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let make_req = MakeCredentialRequest {
+            client_data_hash: vec![0xAA; 32],
+            rp: RelyingParty {
+                id: "example.com".to_string(),
+                name: Some("Example".to_string()),
+                icon: None,
+            },
+            user: User {
+                id: b"user-ps256".to_vec(),
+                name: Some("user@example.com".to_string()),
+                display_name: Some("PS256 User".to_string()),
+                icon_url: None,
+            },
+            pub_key_cred_params: vec![PublicKeyCredParams {
+                r#type: "public-key".to_string(),
+                algorithms: -37, // PS256
+            }],
+            exclude_list: vec![],
+            extensions: None,
+            options: MakeCredentialOptions {
+                rk: true,
+                uv: false,
+                up: false,
+                extended: false,
+            },
+            pin_protocol: None,
+            enterprise_protections: None,
+        };
+
+        let resp = authenticator.make_credential(make_req).unwrap();
+        assert!(!resp.auth_data.is_empty());
+
+        let get_req = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            client_data_hash: vec![0xBB; 32],
+            credentials: vec![],
+            allow_list: None,
+            extensions: None,
+            options: GetAssertionOptions {
+                uv: false,
+                up: false,
+            },
+            pin_protocol: None,
+            uv: None,
+        };
+
+        let assert_resp = authenticator.get_assertion(get_req).unwrap();
+        assert!(!assert_resp.signature.is_empty());
+    }
+
+    #[test]
+    fn test_large_blobs_command_read_write() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        // 1. Write 64 bytes at offset 0 with expected_length 64
+        let test_blob = vec![0x42u8; 64];
+        let write_req = large_blobs::LargeBlobsRequest {
+            offset: 0,
+            get: None,
+            set: Some(test_blob.clone()),
+            length: Some(64),
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        let write_bytes = encode_cbor(&write_req).unwrap();
+        let write_res = authenticator.process_command(0x0C, write_bytes).unwrap();
+        let write_resp: large_blobs::LargeBlobsResponse = decode_cbor(&write_res).unwrap();
+        assert!(write_resp.config.is_none());
+
+        // 2. Read 32 bytes at offset 16
+        let read_req = large_blobs::LargeBlobsRequest {
+            offset: 16,
+            get: Some(32),
+            set: None,
+            length: None,
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        let read_bytes = encode_cbor(&read_req).unwrap();
+        let read_res = authenticator.process_command(0x0C, read_bytes).unwrap();
+        let read_resp: large_blobs::LargeBlobsResponse = decode_cbor(&read_res).unwrap();
+        assert_eq!(read_resp.config, Some(vec![0x42u8; 32]));
+    }
+
+    #[test]
+    fn test_credential_management_full_flow() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        // Create 2 credentials
+        let make_req1 = MakeCredentialRequest {
+            client_data_hash: vec![0x11; 32],
+            rp: RelyingParty {
+                id: "rp1.com".to_string(),
+                name: Some("RP 1".to_string()),
+                icon: None,
+            },
+            user: User {
+                id: b"user1".to_vec(),
+                name: Some("user1@rp1.com".to_string()),
+                display_name: Some("User One".to_string()),
+                icon_url: None,
+            },
+            pub_key_cred_params: vec![PublicKeyCredParams {
+                r#type: "public-key".to_string(),
+                algorithms: -8,
+            }],
+            exclude_list: vec![],
+            extensions: Some(Extensions {
+                large_blob_key: true,
+                ..Default::default()
+            }),
+            options: MakeCredentialOptions {
+                rk: true,
+                uv: false,
+                up: false,
+                extended: false,
+            },
+            pin_protocol: None,
+            enterprise_protections: None,
+        };
+        let cred1_resp = authenticator.make_credential(make_req1).unwrap();
+        let ext1 = cred1_resp.extensions.unwrap();
+        assert!(ext1.large_blob_key.is_some());
+
+        // 1. Get metadata
+        let meta_req = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::GET_CREDS_METADATA,
+            sub_command_params: None,
+            pin_uv_auth_protocol: None,
+            pin_uv_auth_param: None,
+        };
+        let meta_bytes = encode_cbor(&meta_req).unwrap();
+        let meta_res = authenticator.process_command(0x0A, meta_bytes).unwrap();
+        let meta_resp: cred_mgmt::CredsMetadataResponse = decode_cbor(&meta_res).unwrap();
+        assert_eq!(meta_resp.existing_resident_credentials_count, 1);
+
+        // 2. Enumerate RPs
+        let enum_rp_req = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::ENUMERATE_RPS_BEGIN,
+            sub_command_params: None,
+            pin_uv_auth_protocol: None,
+            pin_uv_auth_param: None,
+        };
+        let enum_rp_bytes = encode_cbor(&enum_rp_req).unwrap();
+        let enum_rp_res = authenticator.process_command(0x0A, enum_rp_bytes).unwrap();
+        let enum_rp_resp: cred_mgmt::EnumerateRpsEntryResponse = decode_cbor(&enum_rp_res).unwrap();
+        assert_eq!(enum_rp_resp.total_rps, 1);
+        assert_eq!(enum_rp_resp.rp.id, "rp1.com");
+
+        // 3. Enumerate credentials for rp1.com
+        let enum_cred_req = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::ENUMERATE_CREDENTIALS_BEGIN,
+            sub_command_params: Some(cred_mgmt::CredMgmtParams {
+                rp_id_hash: Some(enum_rp_resp.rp_id_hash.clone()),
+                credential_id: None,
+                user: None,
+            }),
+            pin_uv_auth_protocol: None,
+            pin_uv_auth_param: None,
+        };
+        let enum_cred_bytes = encode_cbor(&enum_cred_req).unwrap();
+        let enum_cred_res = authenticator
+            .process_command(0x0A, enum_cred_bytes)
+            .unwrap();
+        let enum_cred_resp: cred_mgmt::EnumerateCredentialsEntryResponse =
+            decode_cbor(&enum_cred_res).unwrap();
+        assert_eq!(enum_cred_resp.total_credentials, 1);
+        assert_eq!(enum_cred_resp.user.name, Some("user1@rp1.com".to_string()));
+        assert!(enum_cred_resp.large_blob_key.is_some());
+
+        // 4. Update user info
+        let update_req = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::UPDATE_USER_INFORMATION,
+            sub_command_params: Some(cred_mgmt::CredMgmtParams {
+                rp_id_hash: None,
+                credential_id: Some(enum_cred_resp.credential_id.clone()),
+                user: Some(User {
+                    id: b"user1".to_vec(),
+                    name: Some("updated@rp1.com".to_string()),
+                    display_name: Some("Updated Name".to_string()),
+                    icon_url: None,
+                }),
+            }),
+            pin_uv_auth_protocol: None,
+            pin_uv_auth_param: None,
+        };
+        let update_bytes = encode_cbor(&update_req).unwrap();
+        let update_res = authenticator.process_command(0x0A, update_bytes).unwrap();
+        assert!(update_res.is_empty());
+
+        // 5. Delete credential
+        let del_req = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::DELETE_CREDENTIAL,
+            sub_command_params: Some(cred_mgmt::CredMgmtParams {
+                rp_id_hash: None,
+                credential_id: Some(enum_cred_resp.credential_id),
+                user: None,
+            }),
+            pin_uv_auth_protocol: None,
+            pin_uv_auth_param: None,
+        };
+        let del_bytes = encode_cbor(&del_req).unwrap();
+        let del_res = authenticator.process_command(0x0A, del_bytes).unwrap();
+        assert!(del_res.is_empty());
+        assert_eq!(authenticator.get_storage().get_credentials_count(), 0);
     }
 }

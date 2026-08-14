@@ -1,3 +1,5 @@
+use alloc::string::String;
+use alloc::vec::Vec;
 use log::debug;
 
 /// Erros produzidos pela camada de transporte.

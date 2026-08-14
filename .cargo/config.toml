@@ -1,0 +1,22 @@
+[target.thumbv8m.main-none-eabihf]
+# Target para RP2350 (ARM Cortex-M33)
+runner = "probe-rs run --chip RP2350"
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+]
+
+[target.thumbv7em-none-eabihf]
+# Target para nRF52840 (Cortex-M4F) e STM32L4 (Cortex-M4F)
+runner = "probe-rs run --chip nRF52840_xxAA"
+rustflags = [
+    "-C", "link-arg=-Tlink.x",
+]
+
+[alias]
+# Atalhos de compilação cruzada para targets de hardware real
+check-rp2350 = "check -p transport --target thumbv8m.main-none-eabihf --features embedded"
+check-nrf52840 = "check -p transport --target thumbv7em-none-eabihf --features embedded"
+check-stm32l4 = "check -p transport --target thumbv7em-none-eabihf --features embedded"
+build-rp2350 = "build -p transport --target thumbv8m.main-none-eabihf --features embedded"
+build-nrf52840 = "build -p transport --target thumbv7em-none-eabihf --features embedded"
+build-stm32l4 = "build -p transport --target thumbv7em-none-eabihf --features embedded"
