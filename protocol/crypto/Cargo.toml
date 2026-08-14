@@ -12,3 +12,4 @@ rsa = { version = "0.9", features = ["sha2"] }
 rand = { workspace = true }
 num-bigint-dig = "0.8"
 zeroize = { workspace = true }
+x25519-dalek = { workspace = true }

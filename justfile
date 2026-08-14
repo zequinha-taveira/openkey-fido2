@@ -22,6 +22,10 @@ test:
 test-e2e: build-simulator
     python -m pytest tests/python -v
 
+# Rodar testes de conformidade FIDO2 / CTAP2
+test-conformance: build-simulator
+    python -m pytest tests/python/conformance/ -v
+
 # Apenas rodar pytest (assumindo que o simulador ja esta compilado)
 test-python:
     python -m pytest tests/python -v
@@ -82,5 +86,23 @@ doc-open:
 clean:
     cargo clean --workspace
 
-# Verificar se tudo esta OK (build + testes + lint)
-ci: build test clippy fmt-check
+# Compilacao cruzada para RP2350 (ARM Cortex-M33)
+build-rp2350:
+    cargo build -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features
+
+# Compilacao cruzada para nRF52840 (ARM Cortex-M4F)
+build-nrf52840:
+    cargo build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features
+
+# Compilacao cruzada para STM32L4 (ARM Cortex-M4F)
+build-stm32l4:
+    cargo build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features
+
+# Checar todos os targets de hardware real
+check-targets:
+    cargo check -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features
+    cargo check -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features
+
+# Verificar se tudo esta OK (build + testes + lint + targets embedded)
+ci: build test clippy fmt-check check-targets
+

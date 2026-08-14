@@ -399,6 +399,9 @@ fn test_storage_credential_persistence() {
         created_at: 1000,
         algorithm: -8,
         rp_id: "example.com".to_string(),
+        large_blob_key: None,
+        user_name: None,
+        user_display_name: None,
     };
 
     storage
@@ -802,6 +805,9 @@ fn test_storage_private_key_not_stored_in_plaintext() {
         created_at: 0,
         algorithm: -8,
         rp_id: "example.com".to_string(),
+        large_blob_key: None,
+        user_name: None,
+        user_display_name: None,
     };
 
     storage
@@ -1027,6 +1033,9 @@ fn test_credential_pruning() {
             created_at: i * 1000,
             algorithm: -8,
             rp_id: "example.com".to_string(),
+            large_blob_key: None,
+            user_name: None,
+            user_display_name: None,
         };
         storage.store_credential(credential, &crypto).unwrap();
     }
@@ -1302,4 +1311,104 @@ fn test_get_info_default_has_no_security_features() {
     let info = authenticator.get_info().unwrap();
 
     assert!(info.security.is_none());
+}
+
+#[test]
+fn test_ctaphid_framing_roundtrip_multi_packet() {
+    use transport::ctaphid::{CtaphidAssembler, CtaphidCommand, CtaphidFragmenter};
+
+    let payload = (0..500).map(|i| (i % 255) as u8).collect::<Vec<_>>();
+    let cid = 0x12345678;
+    let packets = CtaphidFragmenter::fragment(cid, CtaphidCommand::Cbor, &payload).unwrap();
+    assert_eq!(packets.len(), 9); // 57 + 8 * 59 = 529 max capacity
+
+    let mut assembler = CtaphidAssembler::new();
+    let mut message = None;
+    for (i, pkt) in packets.iter().enumerate() {
+        let res = assembler.process_packet(pkt).unwrap();
+        if i + 1 == packets.len() {
+            message = res;
+        } else {
+            assert!(res.is_none());
+        }
+    }
+
+    let msg = message.expect("complete message should be assembled");
+    assert_eq!(msg.cid, cid);
+    assert_eq!(msg.cmd, CtaphidCommand::Cbor);
+    assert_eq!(msg.payload, payload);
+}
+
+#[test]
+fn test_ctaphid_channel_allocation_and_management() {
+    use transport::ctaphid::{ctaphid_capabilities, ChannelManager, CTAPHID_BROADCAST_CID};
+
+    let mut mgr = ChannelManager::new();
+    let nonce = [10, 20, 30, 40, 50, 60, 70, 80];
+    let resp = mgr.build_init_response(
+        &nonce,
+        2,
+        1,
+        0,
+        ctaphid_capabilities::CAPABILITY_CBOR | ctaphid_capabilities::CAPABILITY_WINK,
+    );
+
+    assert_eq!(resp.len(), 17);
+    assert_eq!(&resp[0..8], &nonce);
+    let cid = u32::from_be_bytes([resp[8], resp[9], resp[10], resp[11]]);
+    assert!(mgr.is_valid_cid(cid));
+    assert!(mgr.is_valid_cid(CTAPHID_BROADCAST_CID));
+
+    mgr.release_cid(cid);
+    assert!(!mgr.is_valid_cid(cid));
+}
+
+#[test]
+fn test_ctaphid_invalid_sequence_rejection() {
+    use transport::ctaphid::{
+        CtaphidAssembler, CtaphidCommand, CtaphidErrorCode, CtaphidFragmenter,
+    };
+
+    let payload = vec![0xEE; 150];
+    let packets = CtaphidFragmenter::fragment(0x99887766, CtaphidCommand::Msg, &payload).unwrap();
+
+    let mut assembler = CtaphidAssembler::new();
+    assert!(assembler.process_packet(&packets[0]).unwrap().is_none());
+
+    // Skip packet 1 and send packet 2 directly
+    let err = assembler.process_packet(&packets[2]).unwrap_err();
+    assert_eq!(err.0, 0x99887766);
+    assert_eq!(err.1, CtaphidErrorCode::InvalidSeq);
+}
+
+#[test]
+fn test_nrf52840_and_stm32l4_hardware_transports() {
+    use transport::embedded::nrf52840::{Nrf52840Nfc, Nrf52840UsbHid};
+    use transport::embedded::stm32l4::Stm32l4UsbHid;
+    use transport::embedded::{NfcDevice, UsbHidDevice};
+
+    struct TestPin;
+    impl embedded_hal::digital::ErrorType for TestPin {
+        type Error = core::convert::Infallible;
+    }
+    impl embedded_hal::digital::OutputPin for TestPin {
+        fn set_low(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn set_high(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    let mut nrf_usb = Nrf52840UsbHid::new(TestPin);
+    assert!(nrf_usb.init().is_ok());
+    assert!(nrf_usb.send_packet(b"hello").is_ok());
+
+    let mut nrf_nfc = Nrf52840Nfc::new();
+    assert!(nrf_nfc.init().is_ok());
+    assert!(!nrf_nfc.is_field_detected());
+
+    let mut stm_usb = Stm32l4UsbHid::new(TestPin);
+    assert!(stm_usb.init().is_ok());
+    assert!(stm_usb.send_packet(b"world").is_ok());
 }

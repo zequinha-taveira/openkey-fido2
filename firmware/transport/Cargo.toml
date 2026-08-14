@@ -6,13 +6,15 @@ description = "Transport layer for FIDO2 authenticator (USB-HID, CCID, NFC, BLE)
 license = "MIT"
 
 [dependencies]
-log = "0.4"
-thiserror = "2.0"
+log = { version = "0.4", default-features = false }
+thiserror = { version = "2.0", default-features = false }
 
 [dependencies.embedded-hal]
 version = "1.0"
 optional = true
 
 [features]
-default = []
+default = ["std"]
+std = ["thiserror/std"]
 embedded = ["dep:embedded-hal"]
+

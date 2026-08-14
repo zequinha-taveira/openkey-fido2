@@ -309,6 +309,7 @@ fn ctap2_capabilities(caps: &Capabilities) -> ctap2::Ctap2Capabilities {
             unique_id: caps.security.unique_id,
             tamper_detection: caps.security.tamper_detection,
         },
+        max_large_blob_data_size: Some(4096),
     }
 }
 

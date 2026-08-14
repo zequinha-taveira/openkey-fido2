@@ -6,18 +6,26 @@ completos; itens com 🚧 estão em progresso; itens com ❌ são incrementos fu
 ## Estado Atual
 
 ### Core CTAP2
-- ✅ MakeCredential com attestation `none`
-- ✅ GetAssertion com sign counter incremental
-- ✅ GetInfo com capabilities dinâmicas
+- ✅ MakeCredential com attestation `none`, `self`, `packed`
+- ✅ GetAssertion com sign counter incremental e multi-assertion (`GetNextAssertion`)
+- ✅ GetInfo com capabilities dinâmicas e `maxLargeBlobDataSize`
 - ✅ GetVersion
 - ✅ ProcessCommand (dispatch CBOR)
 - ✅ Suporte a allow_list e exclude_list
 - ✅ Rejeição de allow_list de RP incorreto (anti-hijacking)
 - ✅ Rejeição de algoritmo não suportado
+- ✅ **Extensão LargeBlobs (CTAP 2.1 §6.10, Opcode 0x0C)**: leitura e escrita fragmentada com storage seguro de 4096B
+- ✅ **Extensão `largeBlobKey`**: geração de chave simétrica de 32B por credencial e retorno no MakeCredential/GetAssertion
+- ✅ **Credential Management (CTAP 2.1 §6.8, Opcode 0x0A)**: `getCredsMetadata`, `enumerateRPs`, `enumerateCredentials`, `updateUserInformation`, `deleteCredential`
+- ✅ **Enterprise Attestation**: validação contra RP list corporativa e bypass de anonymization
 
 ### Criptografia
 - ✅ Ed25519 key pair generation via `ring`
 - ✅ Sign/Verify Ed25519
+- ✅ ES256 (ECDSA P-256 + SHA-256, alg `-7`)
+- ✅ ES384 (ECDSA P-384 + SHA-384, alg `-35`)
+- ✅ PS256 (RSA-PSS + SHA-256, alg `-37`)
+- ✅ RS256 (RSA PKCS#1 v1.5 + SHA-256, alg `-257`)
 - ✅ HMAC-SHA256
 - ✅ SHA-256
 - ✅ ChaCha20-Poly1305 (encrypt at rest)
@@ -25,17 +33,15 @@ completos; itens com 🚧 estão em progresso; itens com ❌ são incrementos fu
 
 ### Criptografia Híbrida (ECIES)
 - ✅ Módulo `hybrid.rs` com X25519 + HKDF-SHA256 + ChaCha20-Poly1305
-- ✅ `hybrid_encrypt` / `hybrid_decrypt` / `hybrid_generate_keypair`
+- ✅ `hybrid_encrypt` / `hybrid_decrypt` / `hybrid_generate_keypair` (chaves efêmeras via `ring`)
+- ✅ **Suporte a chaves X25519 estáticas persistíveis (`x25519-dalek`)**: `hybrid_generate_static_keypair`, `hybrid_diffie_hellman`, `hybrid_decrypt_static`
 - ✅ KDF simétrico (salt = `ephemeral_pk || recipient_pk` em ambos os lados)
 - ✅ AAD com `ephemeral_public_key` (proteção contra adulteração)
-- ✅ Zeroização best-effort de material sensível (`Zeroizing` wrapper)
-- ✅ 16 testes passando (roundtrip, tamper detection, wrong key, edge cases)
-- ✅ Validação de entrada (tamanho de chaves, ciphertext mínimo)
-- ✅ Integrar com `CryptoEngine` (Ctap2Authenticator implementa `ClientPin` usando `get_crypto()` e `get_storage()`)
+- ✅ Zeroização de material sensível via `zeroize`
+- ✅ Integrar com `CryptoEngine` (`generate_x25519_key_pair`, `x25519_diffie_hellman`, `hybrid_encrypt`, `hybrid_decrypt_static`)
 - ✅ ADR-0006 registrar decisão de design (side-channel mitigation)
-- ✅ Adicionar `zeroize` crate para zeroização robusta
-- ✅ ADR-0008 registrar decisão de design (sealed-box efêmero / ECIES)
-- ⚠️ Limitação: sealed-box efêmero — `ring` 0.17 não suporta chaves estáticas X25519
+- ✅ ADR-0008 registrar decisão de design (sealed-box ECIES com suporte a chaves efêmeras e estáticas)
+- ✅ Limitação anterior do `ring` resolvida com `x25519-dalek` mantendo compatibilidade `no_std`
 
 ### Armazenamento
 - ✅ StorageEngine com encryption at rest
@@ -140,14 +146,18 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 
 - ✅ **Definir trait `Transport` em novo crate `firmware/transport/`** — Métodos: `init()`, `send(data)`, `recv() -> Vec<u8>`, `close()`. Trait object-safe (`Box<dyn Transport>`), erros via `TransportError` (`thiserror`). Inclui `DummyTransport` no-op para testes. Crate: `transport`. Critério: trait definida e compilável.
 - ✅ **Implementar `UsbHidTransport` stub em `firmware/transport/src/usb_hid.rs`** — Placeholder para implementação USB-HID com `usb-device` crate. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
-- ✅ **Implementer `UsbCcidTransport` stub em `firmware/transport/src/usb_ccid.rs`** — Placeholder para implementação CCID. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
+- ✅ **Implementar `UsbCcidTransport` stub em `firmware/transport/src/usb_ccid.rs`** — Placeholder para implementação CCID. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
 - ✅ **Implementar `NfcTransport` stub em `firmware/transport/src/nfc.rs`** — Placeholder para implementação NFC ISO 14443. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
 - ✅ **Implementar `BleGattTransport` stub em `firmware/transport/src/ble_gatt.rs`** — Placeholder para implementação BLE GATT server. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
 - ✅ **Adicionar `TransportConfig` em `firmware/device-profile/src/profile.rs`** — `TransportType` com `UsbHid`, `UsbCcid`, `Nfc`, `BleGatt` e atalhos `TransportConfig::usb_hid()/usb_ccid()/nfc()/ble_gatt()`. Crate: `device-profile`. Critério: `DeviceProfileBuilder::transport_config()` aceita config.
 - ✅ **Integrar transport no `EmbeddedAuthenticator`** — `init_transport` instancia o stub conforme `profile.transport_config`; acessores `transport()` / `transport_mut()`. Crate: `authenticator`. Critério: `EmbeddedAuthenticator` usa transport configurado.
 - ✅ **Testes unitários dos stubs de transporte** — 19 testes em `firmware/transport/src/` (ciclo de vida, `NotInitialized` antes de `init`, `Unimplemented` em I/O, object safety). Crate: `transport`. Critério: `cargo test -p transport` passando.
-- ✅ **Definir trait contracts embedded-hal para transportes** — Módulo `transport::embedded` com traits `UsbHidDevice`, `EmbeddedTransportError`, `StatusLed`. Feature gate `embedded` com `embedded-hal 1.0`. Crate: `transport`. Critério: `cargo build -p transport --features embedded` compila.
-- ✅ **Implementação de referência USB-HID para RP2350** — `Rp2350UsbHid` implementa `UsbHidDevice` com placeholder do periférico USB. 7 testes cobrindo ciclo de vida, buffer too small, timeout, LED. Crate: `transport::embedded::rp2350`. Critério: `cargo test -p transport --features embedded` passando.
+- ✅ **Definir trait contracts embedded-hal para transportes** — Módulo `transport::embedded` com traits `UsbHidDevice`, `UsbCcidDevice`, `NfcDevice`, `BleGattDevice`, `EmbeddedTransportError`, `StatusLed`. Feature gate `embedded` com `embedded-hal 1.0`. Crate: `transport`. Critério: `cargo build -p transport --features embedded` compila.
+- ✅ **Implementação de referência USB-HID para RP2350** — `Rp2350UsbHid` implementa `UsbHidDevice` com placeholder do periférico USB. Crate: `transport::embedded::rp2350`. Critério: `cargo test -p transport --features embedded` passando.
+- ✅ **Implementação completa de CTAPHID Framing e Fragmentação (CTAP 2.1 §8.2)** — Módulo `firmware/transport/src/ctaphid/` com `CtaphidPacket` (INIT e CONT 64B), `CtaphidFragmenter` (segmentação de payloads até 7609B), `CtaphidAssembler` (remontagem com validação de sequência, canal, cancelamento e timeout) e `ChannelManager` (alocação de CIDs e handshake `CTAPHID_INIT`). Crate: `transport`. Critério: testes unitários de fragmentação/montagem passando.
+- ✅ **Implementar reference HALs para NRF52840 e STM32L4** — `Nrf52840UsbHid` (Nordic USBD), `Nrf52840Nfc` (Nordic NFCT Tag Type 4), e `Stm32l4UsbHid` (STM32 USB FS PMA). Crate: `transport::embedded`. Critério: testes de ciclo de vida passando.
+- ✅ **Implementar adaptadores de transporte concreto `FramedUsbHidTransport` e `FramedCcidTransport`** — Bridges que conectam `UsbHidDevice` e `UsbCcidDevice` à trait unificada `Transport`. Crate: `transport`. Critério: testes de envio/recepção de pacotes passando.
+- ✅ **Criar ADR-0009: CTAPHID Framing e Transportes de Hardware Real** — Documentação arquitetural em `docs/adr/ADR-0009-ctaphid-framing-e-hardware-transports.md`. Crate: N/A. Critério: ADR criado e referenciado.
 
 #### Attestation
 
@@ -211,6 +221,24 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Adicionar doc comments em todas as APIs públicas** — `///` comments adicionados em `Ctap2Error` (22 variantes), `Ctap2Command` (11 variantes), todos os request/response structs do CTAP2, módulo e métodos do `webauthn`. Crates: `ctap2`, `webauthn`. Critério: documentação completa nas APIs públicas.
 - ✅ **Adicionar exemplos em `examples/` para cada crate** — Criados `examples/crypto-example/` (Ed25519, ES256, hybrid, HMAC, SHA-256) e `examples/transport-example/` (custom Transport trait impl). Crates: `examples`. Critério: `cargo run -p crypto-example` e `cargo run -p transport-example` funcionam.
 
+#### Hardware Real & Cross-Compilation Targets
+
+- ✅ **Criar ADR-0011: Compilação Cruzada e Targets de Hardware Embarcado (no_std)** — Documentar estratégia de targets bare-metal (`thumbv8m.main-none-eabihf` para RP2350 e `thumbv7em-none-eabihf` para nRF52840/STM32L4), `no_std + alloc` e runners (`probe-rs`). Crate: N/A. Critério: `docs/adr/ADR-0011-hardware-targets-e-cross-compilation.md` criado.
+- ✅ **Configuração de Toolchain e Cargo Config (`.cargo/config.toml`)** — Configuração de flags de link e aliases de compilação cruzada (`check-rp2350`, `check-nrf52840`, `check-stm32l4`, `build-rp2350`, `build-nrf52840`, `build-stm32l4`). Crate: N/A. Critério: `.cargo/config.toml` criado e aliases funcionais.
+- ✅ **Compatibilidade `no_std` em `firmware/transport`** — Ajustar `transport` com `#![cfg_attr(not(feature = "std"), no_std)]`, `extern crate alloc`, imports de `Vec`, `String`, `ToString` e features condicionais. Crate: `transport`. Critério: `cargo check -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features` e `--target thumbv7em-none-eabihf` compilando com 0 erros.
+- ✅ **Atualizar `BUILD.md` e `justfile` com comandos de compilação cruzada** — Adicionar alvos `build-rp2350`, `build-nrf52840`, `build-stm32l4` e `check-targets`. Crate: N/A. Critério: `just check-targets` executando com sucesso.
+- ❌ **Aplicação bare-metal de boot para RP2350 (`examples/rp2350-firmware`)** — Projeto de firmware executável com inicialização de clock, heap allocator (`embedded-alloc`), vetor de interrupção e loop de despacho CTAPHID. Crate: novo `examples/rp2350-firmware`. ⬅️ depende de `transport no_std`. Critério: compilação de binário `.elf` para `thumbv8m.main-none-eabihf`.
+- ❌ **Aplicação bare-metal de boot para nRF52840 (`examples/nrf52840-firmware`)** — Firmware executável para Nordic nRF52840 com suporte a USBD e NFC Tag Type 4. Crate: novo `examples/nrf52840-firmware`. ⬅️ depende de `transport no_std`. Critério: compilação de binário `.elf` para `thumbv7em-none-eabihf`.
+- ❌ **Integração com driver USB real via `usb-device` para RP2350 (`rp2350-usb`)** — Implementar backend concreto de `UsbHidDevice` sobre `usb-device::bus::UsbBusAllocator`. Crate: `transport`. ⬅️ depende de `examples/rp2350-firmware`. Critério: envio e recebimento de pacotes CTAPHID de 64 bytes em hardware.
+
+#### Conformance Testing & Raw CBOR Tooling
+
+- ✅ **Criar ADR-0012: Suporte a Conformance Testing FIDO2 e Interface Raw CBOR** — Documentar modo `--raw-cbor` no simulador e suíte de testes de conformidade. Crate: N/A. Critério: `docs/adr/ADR-0012-fido-conformance-e-raw-cbor-interface.md` criado.
+- ✅ **Implementar modo `--raw-cbor` no `fido2-simulator`** — Suporte a framing binário length-prefixed no stdin/stdout para despacho direto de comandos CTAP2 sem parsing JSON. Crate: `simulator`. Critério: `cargo build -p fido2-simulator` compila e executa.
+- ✅ **Criar transporte `SimulatorClient` em Python (`tests/python/conformance/ctap2_transport.py`)** — Ponte binária Python para comunicação bidirecional com o simulador em modo `--raw-cbor`. Crate: `tests`. Critério: módulo funcional.
+- ✅ **Implementar suíte de testes de conformidade CTAP 2.1 (`tests/python/conformance/`)** — 11 testes automatizados cobrindo GetInfo, MakeCredential, GetAssertion, ClientPIN, CredentialManagement, LargeBlobs e Reset. Crate: `tests`. Critério: `pytest tests/python/conformance/ -v` passando com 100% de sucesso.
+- ❌ **Implementar Virtual CTAPHID Bridge (`tools/ctaphid_bridge.py`)** — Ponte USB-HID virtual (UHID no Linux / virtual authenticator) conectando o simulador ao OS para uso direto com ferramentas oficiais da FIDO Alliance. Crate: `tools`. ⬅️ depende de `fido2-simulator --raw-cbor`. Critério: detecção do dispositivo virtual pelo browser e pelo FIDO Conformance Tool.
+
 ---
 
 ## Convenções
@@ -221,3 +249,4 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - Ao completar um item, mova de ❌ para ✅ com PR reference quando aplicável
 - Itens marcados com ⬅️ depende de X devem ser implementados após X
 - Quick wins podem ser iniciados imediatamente sem dependências
+

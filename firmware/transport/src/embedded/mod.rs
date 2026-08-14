@@ -4,21 +4,47 @@
 //! implement to provide real transport capabilities. The design separates:
 //!
 //! - [`UsbHidDevice`]: USB-HID endpoint operations (interrupt transfers)
-//! - [`UsbCcidDevice`]: CCID bulk transfers (smartcard)
-//! - [`NfcDevice`]: NFC ISO 14443 passive target
+//! - [`UsbCcidDevice`]: CCID bulk transfers and APDU framing (smartcard)
+//! - [`NfcDevice`]: NFC ISO 14443-4 passive target (contactless)
 //! - [`BleGattDevice`]: BLE GATT server notifications
 //!
 //! Each trait is implemented by the board's HAL. The transport crate
 //! provides adapters that implement [`super::Transport`] on top of these.
 
 #[cfg(feature = "embedded")]
+pub mod ble_gatt;
+
+#[cfg(feature = "embedded")]
+pub mod nfc;
+
+#[cfg(feature = "embedded")]
+pub mod nrf52840;
+
+#[cfg(feature = "embedded")]
 pub mod rp2350;
+
+#[cfg(feature = "embedded")]
+pub mod stm32l4;
+
+#[cfg(feature = "embedded")]
+pub mod usb_ccid;
 
 #[cfg(feature = "embedded")]
 pub mod usb_hid;
 
 #[cfg(feature = "embedded")]
+pub use ble_gatt::BleGattDevice;
+
+#[cfg(feature = "embedded")]
+pub use nfc::NfcDevice;
+
+#[cfg(feature = "embedded")]
+pub use usb_ccid::{ApduCommand, ApduResponse, UsbCcidDevice};
+
+#[cfg(feature = "embedded")]
 pub use usb_hid::UsbHidDevice;
+
+use alloc::string::ToString;
 
 /// Errors produced by embedded transport operations.
 ///

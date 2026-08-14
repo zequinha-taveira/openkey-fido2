@@ -124,6 +124,8 @@ Os mesmos comandos estão disponíveis via [`just`](https://github.com/casey/jus
 `just build`, `just test`, `just test-e2e`, `just check`, `just coverage`,
 `just fuzz`. Veja `just --list`.
 
+Para um guia detalhado de compilação, testes, fuzzing e opções de build, consulte [`BUILD.md`](BUILD.md).
+
 ## CI
 
 | Workflow | Arquivo | O que roda |

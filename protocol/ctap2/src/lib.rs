@@ -8,11 +8,19 @@
 pub mod attestation;
 /// Comando ClientPIN (CTAP2 0x06) e gestão do pinUvAuthToken.
 pub mod client_pin;
+/// Comando Credential Management (CTAP2 0x0A).
+pub mod cred_mgmt;
 /// Máquina de estado CTAP2 e tipos de request/response.
 pub mod ctap2;
+/// Comando LargeBlobs (CTAP2 0x0C).
+pub mod large_blobs;
 
 pub use attestation::{
     AttestationCertificate, AttestationFormat, PackedAttestation, SelfAttestation,
+};
+pub use cred_mgmt::{
+    sub_commands as cred_mgmt_subcommands, CredMgmtParams, CredentialManagementRequest,
+    CredsMetadataResponse, EnumerateCredentialsEntryResponse, EnumerateRpsEntryResponse,
 };
 pub use ctap2::{
     decode_cbor, encode_cbor, BioEnrollRequest, BioEnrollResponse, CoseAlgorithmEntry,
@@ -23,5 +31,6 @@ pub use ctap2::{
     MakeCredentialResponse, PublicKeyCredParams, RelyingParty, SecurityFeatures, User,
     UserPresence, AAGUID,
 };
+pub use large_blobs::{LargeBlobsRequest, LargeBlobsResponse};
 
 pub use client_pin::{ClientPin, ClientPinRequest, ClientPinResponse, ClientPinSubCommand};
