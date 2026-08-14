@@ -525,9 +525,7 @@ impl Simulator {
                 if response.len() == 1 && response[0] == 0x00 {
                     json!({"ok": true})
                 } else {
-                    match ciborium::de::from_reader::<ctap2::GetAssertionResponse, _>(
-                        response.as_slice(),
-                    ) {
+                    match ctap2::decode_cbor::<ctap2::GetAssertionResponse>(&response) {
                         Ok(assertion) => json!({
                             "ok": true,
                             "credential_id": b64_encode(&assertion.credential.as_ref().map(|c| c.id.clone()).unwrap_or_default()),
@@ -549,19 +547,15 @@ impl Simulator {
             .get_ctap_mut()
             .process_command(0x3B, vec![])
         {
-            Ok(response) => {
-                match ciborium::de::from_reader::<ctap2::EnumerateRPsResponse, _>(
-                    response.as_slice(),
-                ) {
-                    Ok(rps) => json!({
-                        "ok": true,
-                        "rp": {"id": rps.rp.id, "name": rps.rp.name, "icon": rps.rp.icon},
-                        "rp_hash": b64_encode(&rps.rp_hash),
-                        "total_rps": rps.total_rps,
-                    }),
-                    Err(error) => json!({"ok": false, "code": 0x04, "message": error.to_string()}),
-                }
-            }
+            Ok(response) => match ctap2::decode_cbor::<ctap2::EnumerateRPsResponse>(&response) {
+                Ok(rps) => json!({
+                    "ok": true,
+                    "rp": {"id": rps.rp.id, "name": rps.rp.name, "icon": rps.rp.icon},
+                    "rp_hash": b64_encode(&rps.rp_hash),
+                    "total_rps": rps.total_rps,
+                }),
+                Err(error) => json!({"ok": false, "code": 0x04, "message": error.to_string()}),
+            },
             Err(error) => json!({"ok": false, "code": error.as_u8(), "message": error.to_string()}),
         }
     }
@@ -573,19 +567,15 @@ impl Simulator {
             .get_ctap_mut()
             .process_command(0x3C, vec![])
         {
-            Ok(response) => {
-                match ciborium::de::from_reader::<ctap2::EnumerateRPsResponse, _>(
-                    response.as_slice(),
-                ) {
-                    Ok(rps) => json!({
-                        "ok": true,
-                        "rp": {"id": rps.rp.id, "name": rps.rp.name, "icon": rps.rp.icon},
-                        "rp_hash": b64_encode(&rps.rp_hash),
-                        "total_rps": rps.total_rps,
-                    }),
-                    Err(error) => json!({"ok": false, "code": 0x04, "message": error.to_string()}),
-                }
-            }
+            Ok(response) => match ctap2::decode_cbor::<ctap2::EnumerateRPsResponse>(&response) {
+                Ok(rps) => json!({
+                    "ok": true,
+                    "rp": {"id": rps.rp.id, "name": rps.rp.name, "icon": rps.rp.icon},
+                    "rp_hash": b64_encode(&rps.rp_hash),
+                    "total_rps": rps.total_rps,
+                }),
+                Err(error) => json!({"ok": false, "code": 0x04, "message": error.to_string()}),
+            },
             Err(error) => json!({"ok": false, "code": error.as_u8(), "message": error.to_string()}),
         }
     }
@@ -611,17 +601,14 @@ impl Simulator {
             .get_ctap_mut()
             .process_command(0x09, data)
         {
-            Ok(response) => {
-                match ciborium::de::from_reader::<ctap2::BioEnrollResponse, _>(response.as_slice())
-                {
-                    Ok(bio) => json!({
-                        "ok": true,
-                        "fingerprint_kind": bio.fingerprint_kind,
-                        "max_enrollments": bio.max_enrollments,
-                    }),
-                    Err(_) => json!({"ok": true, "cbor": b64_encode(&response)}),
-                }
-            }
+            Ok(response) => match ctap2::decode_cbor::<ctap2::BioEnrollResponse>(&response) {
+                Ok(bio) => json!({
+                    "ok": true,
+                    "fingerprint_kind": bio.fingerprint_kind,
+                    "max_enrollments": bio.max_enrollments,
+                }),
+                Err(_) => json!({"ok": true, "cbor": b64_encode(&response)}),
+            },
             Err(error) => json!({"ok": false, "code": error.as_u8(), "message": error.to_string()}),
         }
     }

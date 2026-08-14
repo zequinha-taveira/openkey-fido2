@@ -34,22 +34,24 @@ class CtapError:
     INVALID_PARAMETER = 0x02
     INVALID_LENGTH = 0x03
     INVALID_SEQUENCE = 0x04
-    INVALID_STATE = 0x05
-    ACT = 0x06
-    CHANNEL_BUSY = 0x07
-    CREDENTIAL_EXCLUDED = 0x0A
-    UNSUPPORTED_ALGORITHM = 0x0C
-    OPERATION_DENIED = 0x13
-    KEY_NOT_SUPPORTED = 0x27
-    NO_CREDENTIALS = 0x0E
-    USER_NOT_ACTIONED = 0x1B
+    TIMEOUT = 0x05
+    CHANNEL_BUSY = 0x06
+    CREDENTIAL_EXCLUDED = 0x19
+    UNSUPPORTED_ALGORITHM = 0x26
+    OPERATION_DENIED = 0x27
+    KEY_NOT_SUPPORTED = 0x28
+    NO_CREDENTIALS = 0x2E
+    USER_NOT_ACTIONED = 0x23
     PIN_INVALID = 0x31
     PIN_INVALID_RETRIES = 0x32
-    PIN_REQUIRED = 0x33
-    PIN_POLICY_VIOLATION = 0x34
-    PIN_BLOCKED = 0x35
-    PIN_AUTH_INVALID = 0x36
-    PIN_AUTH_BLOCKED = 0x37
+    PIN_REQUIRED = 0x36
+    PIN_POLICY_VIOLATION = 0x37
+    PIN_BLOCKED = 0x32
+    PIN_AUTH_INVALID = 0x33
+    PIN_AUTH_BLOCKED = 0x34
+    PIN_NOT_SET = 0x35
+    REQUEST_TOO_LARGE = 0x39
+    LARGE_BLOB_STORAGE_FULL = 0x18
 
 
 def get_simulator_path() -> Path:
@@ -91,9 +93,16 @@ class SimulatorClient:
         """Encerra o processo do simulador."""
         if self._proc.poll() is None:
             if self._proc.stdin:
-                self._proc.stdin.close()
+                try:
+                    self._proc.stdin.close()
+                except OSError:
+                    pass
             self._proc.terminate()
-            self._proc.wait(timeout=2)
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
 
     def __enter__(self) -> SimulatorClient:
         return self

@@ -355,8 +355,7 @@ fn test_ctap2_process_command_make_credential() {
     let result = authenticator.process_command(0x01, cbor_buf);
     assert!(result.is_ok());
     let response_data = result.unwrap();
-    let response: ctap2::MakeCredentialResponse =
-        ciborium::de::from_reader(&response_data[..]).unwrap();
+    let response: ctap2::MakeCredentialResponse = ctap2::decode_cbor(&response_data).unwrap();
     assert_eq!(response.fmt, "none");
 }
 
@@ -369,7 +368,7 @@ fn test_ctap2_process_command_get_info() {
     let result = authenticator.process_command(0x04, vec![]);
     assert!(result.is_ok());
     let response_data = result.unwrap();
-    let response: ctap2::GetInfoResponse = ciborium::de::from_reader(&response_data[..]).unwrap();
+    let response: ctap2::GetInfoResponse = ctap2::decode_cbor(&response_data).unwrap();
     assert!(response.versions.contains(&"2.0".to_string()));
 }
 
