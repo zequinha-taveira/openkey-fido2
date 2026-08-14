@@ -66,4 +66,4 @@ def test_make_credential_missing_required_fields():
             "options": {"rk": False, "uv": False, "up": True},
         }
         status, _ = client.send_cbor(CtapCmd.MAKE_CREDENTIAL, req)
-        assert status in (CtapError.INVALID_PARAMETER, CtapError.INVALID_SEQUENCE, 0x02, 0x04)
+        assert status == CtapError.INVALID_CBOR

@@ -16,7 +16,7 @@ from fido2.webauthn import sha256
 from virtualauthenticator import Ctap2ResponseError, VirtualAuthenticator
 
 TEST_RP_ID = "example.com"
-ERR_OPERATION_DENIED = 0x13
+ERR_OPERATION_DENIED = 0x27
 
 
 @pytest.fixture

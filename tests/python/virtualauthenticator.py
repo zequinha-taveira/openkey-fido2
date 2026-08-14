@@ -61,6 +61,35 @@ CTAP2_ERROR_NAMES = {
 }
 
 
+# Chaves inteiras CTAP2 (wire format) → nomes de campo da API de alto nível.
+_RESPONSE_KEYS: dict[int, dict[int, str]] = {
+    CMD.MAKE_CREDENTIAL: {0x01: "fmt", 0x02: "authData", 0x03: "attStmt", 0x06: "extensions"},
+    CMD.GET_ASSERTION: {
+        0x01: "credential",
+        0x02: "authData",
+        0x03: "signature",
+        0x04: "user",
+        0x05: "numberOfCredentials",
+        0x06: "extensions",
+    },
+    CMD.GET_INFO: {
+        0x01: "versions",
+        0x02: "extensions",
+        0x03: "aaguid",
+        0x04: "options",
+        0x0A: "algorithms",
+    },
+}
+
+
+def _convert_response_keys(cmd: int, response):
+    """Converte chaves inteiras do wire format CTAP2 para nomes de campo."""
+    key_map = _RESPONSE_KEYS.get(cmd, {})
+    if isinstance(response, dict):
+        return {key_map.get(k, k): v for k, v in response.items()}
+    return response
+
+
 def _compact(data):
     """Remove recursivamente valores `None` (o encoder do fido2 os rejeita)."""
     if isinstance(data, dict):
@@ -145,7 +174,9 @@ class VirtualAuthenticator:
         status, response = self._native.process_command(cmd, data)
         if status != 0:
             raise Ctap2ResponseError(status, name=CTAP2_ERROR_NAMES.get(status))
-        return cbor.decode(response)
+        if not response:
+            return None
+        return _convert_response_keys(cmd, cbor.decode(response))
 
     # ---- comandos de alto nível ----------------------------------------
 

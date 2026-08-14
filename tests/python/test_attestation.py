@@ -203,7 +203,7 @@ def test_unsupported_attestation_format_is_rejected(simulator):
 
     result = simulator.make_credential()
     assert not result["ok"], result
-    assert result["code"] == 0x0D
+    assert result["code"] == 0x2B
 
 
 def test_unknown_attestation_format_string(simulator):
