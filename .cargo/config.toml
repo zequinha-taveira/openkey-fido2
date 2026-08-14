@@ -11,10 +11,13 @@ runner = "probe-rs run --chip RP2350"
 runner = "probe-rs run --chip nRF52840_xxAA"
 
 [alias]
-# Atalhos de compilação cruzada para targets de hardware real
-check-rp2350 = "check -p transport --target thumbv8m.main-none-eabihf --features embedded"
-check-nrf52840 = "check -p transport --target thumbv7em-none-eabihf --features embedded"
-check-stm32l4 = "check -p transport --target thumbv7em-none-eabihf --features embedded"
-build-rp2350 = "build -p transport --target thumbv8m.main-none-eabihf --features embedded"
-build-nrf52840 = "build -p transport --target thumbv7em-none-eabihf --features embedded"
-build-stm32l4 = "build -p transport --target thumbv7em-none-eabihf --features embedded"
+# Atalhos de compilação cruzada para targets de hardware real.
+# NOTA: `--no-default-features` é obrigatório — sem ele o feature `std` fica
+# ativo e `thiserror/std` exige a stdlib, inexistente em targets bare-metal
+# (erro `can't find crate for std`).
+check-rp2350 = "check -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features"
+check-nrf52840 = "check -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features"
+check-stm32l4 = "check -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features"
+build-rp2350 = "build -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features"
+build-nrf52840 = "build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features"
+build-stm32l4 = "build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features"
