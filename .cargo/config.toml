@@ -1,16 +1,14 @@
 [target.thumbv8m.main-none-eabihf]
 # Target para RP2350 (ARM Cortex-M33)
+# NOTA: o linker script `link.x` (do cortex-m-rt) é configurado no
+# `.cargo/config.toml` local de cada binário bare-metal (ex.:
+# examples/rp2350-firmware), não aqui — builds de lib (`-p transport`)
+# não linkam e um `-Tlink.x` global duplicaria o flag em binários.
 runner = "probe-rs run --chip RP2350"
-rustflags = [
-    "-C", "link-arg=-Tlink.x",
-]
 
 [target.thumbv7em-none-eabihf]
 # Target para nRF52840 (Cortex-M4F) e STM32L4 (Cortex-M4F)
 runner = "probe-rs run --chip nRF52840_xxAA"
-rustflags = [
-    "-C", "link-arg=-Tlink.x",
-]
 
 [alias]
 # Atalhos de compilação cruzada para targets de hardware real

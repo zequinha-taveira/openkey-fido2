@@ -1,0 +1,31 @@
+[package]
+name = "nrf52840-firmware"
+version = "0.1.0"
+edition = "2021"
+description = "Bare-metal boot application for the nRF52840 (FIDO2 authenticator firmware skeleton)"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/zequinha-taveira/openkey-fido2"
+repository = "https://github.com/zequinha-taveira/openkey-fido2"
+publish = false
+
+# Crate standalone (fora do workspace principal, como `fuzz/`): binário `no_std`
+# para Cortex-M4F que não compila para o host.
+[workspace]
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+panic-halt = "0.2"
+embedded-alloc = "0.7"
+embedded-hal = "1.0"
+nrf52840-hal = { version = "0.19.0", default-features = false, features = ["rt"] }
+transport = { path = "../../firmware/transport", default-features = false, features = ["embedded"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1

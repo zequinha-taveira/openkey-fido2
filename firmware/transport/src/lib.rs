@@ -34,6 +34,8 @@ pub use ctaphid::{
     ctaphid_capabilities, ChannelManager, CtaphidAssembler, CtaphidCommand, CtaphidErrorCode,
     CtaphidFragmenter, CtaphidKeepaliveStatus, CtaphidMessage, CtaphidPacket,
 };
+#[cfg(feature = "usb-device")]
+pub use embedded::usb_hid_backend::{CtapHidClass, UsbHidBackend};
 #[cfg(feature = "embedded")]
 pub use framed_ccid::FramedCcidTransport;
 #[cfg(feature = "embedded")]

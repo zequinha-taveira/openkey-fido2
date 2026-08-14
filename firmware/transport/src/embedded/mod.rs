@@ -32,6 +32,9 @@ pub mod usb_ccid;
 #[cfg(feature = "embedded")]
 pub mod usb_hid;
 
+#[cfg(feature = "usb-device")]
+pub mod usb_hid_backend;
+
 #[cfg(feature = "embedded")]
 pub use ble_gatt::BleGattDevice;
 
@@ -43,6 +46,9 @@ pub use usb_ccid::{ApduCommand, ApduResponse, UsbCcidDevice};
 
 #[cfg(feature = "embedded")]
 pub use usb_hid::UsbHidDevice;
+
+#[cfg(feature = "usb-device")]
+pub use usb_hid_backend::{CtapHidClass, UsbHidBackend};
 
 use alloc::string::ToString;
 

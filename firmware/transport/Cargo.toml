@@ -13,8 +13,13 @@ thiserror = { version = "2.0", default-features = false }
 version = "1.0"
 optional = true
 
+[dependencies.usb-device]
+version = "0.3"
+optional = true
+
 [features]
 default = ["std"]
 std = ["thiserror/std"]
 embedded = ["dep:embedded-hal"]
+usb-device = ["dep:usb-device", "embedded"]
 
