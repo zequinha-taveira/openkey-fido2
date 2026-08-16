@@ -32,9 +32,14 @@ jobs:
           fi
           # --no-merges: merge commits ("Merge pull request #N", "Merge ... into ...")
           # are auto-generated and don't follow the lowercase convention.
+          # Message and ADR diff must be validated against the SAME commit;
+          # otherwise a merge push diffs HEAD against its first parent and
+          # flags docs/adr changes from the whole PR against the last
+          # non-merge commit message.
+          COMMIT_SHA=$(git log -1 --format=%H --no-merges "$SHA")
           MSG=$(git log -1 --format=%s --no-merges "$SHA")
           echo "message=$MSG" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
 
       - name: Validate format
         run: |
