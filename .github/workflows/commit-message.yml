@@ -63,7 +63,8 @@ jobs:
           echo "✅ Commit message validated"
 
       - name: Comment on PR if invalid
-        if: failure()
+        if: failure() && github.event_name == 'pull_request'
+        continue-on-error: true
         uses: actions/github-script@v9
         with:
           script: |
