@@ -1,6 +1,6 @@
 [package]
 name = "rp2350-firmware"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Bare-metal boot application for the RP2350 (FIDO2 authenticator firmware skeleton)"
 license = "MIT OR Apache-2.0"

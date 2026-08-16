@@ -376,6 +376,17 @@ impl CryptoEngine {
         Ok(in_out)
     }
 
+    /// Cifra dados com nonce aleatório e retorna `(nonce, ciphertext)`.
+    /// O nonce deve ser persistido junto do ciphertext e nunca reutilizado.
+    pub fn encrypt_with_random_nonce(
+        &self,
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+        let nonce = self.random_bytes(12);
+        let ciphertext = self.encrypt(plaintext, &nonce)?;
+        Ok((nonce, ciphertext))
+    }
+
     /// Decifra dados produzidos por [`CryptoEngine::encrypt`].
     ///
     /// Falha se a tag de autenticação não conferir (dado adulterado) ou se a
@@ -539,6 +550,21 @@ mod tests {
         b[0] = 0x01;
         b[31] = 0xFF;
         assert!(!constant_time_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_random_nonce_encrypt_roundtrip_and_uniqueness() {
+        let engine = CryptoEngine::new().unwrap();
+        let plaintext = b"client pin regression test";
+        let (nonce_a, ciphertext_a) = engine.encrypt_with_random_nonce(plaintext).unwrap();
+        let (nonce_b, ciphertext_b) = engine.encrypt_with_random_nonce(plaintext).unwrap();
+
+        assert_eq!(nonce_a.len(), 12);
+        assert_eq!(nonce_b.len(), 12);
+        assert_ne!(nonce_a, nonce_b);
+        assert_ne!(ciphertext_a, ciphertext_b);
+        assert_eq!(engine.decrypt(&ciphertext_a, &nonce_a).unwrap(), plaintext);
+        assert_eq!(engine.decrypt(&ciphertext_b, &nonce_b).unwrap(), plaintext);
     }
 
     #[test]

@@ -63,6 +63,8 @@ def test_get_info_retorna_versoes_e_aaguid(auth):
     assert "2.0" in info["versions"]
     assert "2.1" in info["versions"]
     assert info["aaguid"] == TEST_AAGUID
+    assert type(info["firmwareVersion"]) is int
+    assert info["firmwareVersion"] == 1000
 
 
 def test_get_info_lista_algoritmos_suportados(auth):
@@ -83,6 +85,39 @@ def test_make_credential_produz_attestation_object(auth):
     assert att.auth_data.rp_id_hash == auth.rp_id_hash(TEST_RP_ID)
     assert bytes(att.auth_data.credential_data.aaguid) == TEST_AAGUID
     assert len(att.auth_data.credential_data.credential_id) == 16
+
+
+def test_fluxo_webauthn_registro_e_autenticacao(auth):
+    create_client_data_hash = sha256(
+        b'{"type":"webauthn.create","challenge":"register",'
+        b'"origin":"https://example.com"}'
+    )
+    attestation = auth.make_credential(
+        rp_id=TEST_RP_ID,
+        user_id=b"alice-id",
+        client_data_hash=create_client_data_hash,
+        user_name="alice@example.com",
+        user_display_name="Alice",
+    )
+    credential_data = attestation.auth_data.credential_data
+    credential_id = credential_data.credential_id
+
+    get_client_data_hash = sha256(
+        b'{"type":"webauthn.get","challenge":"login",'
+        b'"origin":"https://example.com"}'
+    )
+    assertion = auth.get_assertion(
+        rp_id=TEST_RP_ID,
+        client_data_hash=get_client_data_hash,
+        allow_list=[{"type": "public-key", "id": credential_id}],
+    )
+
+    assert assertion.credential_id == credential_id
+    assert assertion.user_handle == b"alice-id"
+    assert assertion.auth_data.rp_id_hash == auth.rp_id_hash(TEST_RP_ID)
+    assert assertion.auth_data.is_user_present()
+    assert assertion.auth_data.counter == 1
+    assertion.verify(credential_data.public_key, get_client_data_hash)
 
 
 def test_make_credential_eddsa_por_default(auth):

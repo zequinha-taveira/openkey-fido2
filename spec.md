@@ -223,6 +223,10 @@ struct DeviceProfile {
 }
 ```
 
+`DeviceProfile.firmware_version` permanece uma string semver para configuração
+do produto. O campo `firmwareVersion` do `GetInfo` é convertido para inteiro
+CTAP 2.1 conforme o ADR-0020; `GetVersion` mantém sua resposta textual.
+
 ### 5.3 SecurityFeatures
 
 ```rust
@@ -410,7 +414,7 @@ cargo +nightly fuzz run decode_cbor --fuzz-dir fuzz
 | `TODO.md` | Estado do projeto, incrementos rastreados |
 | `CONTRIBUTING.md` | Padrões de código, testes, processo PR |
 | `architecture.md` | Diagramas, contratos, fluxos de dados |
-| `docs/adr/ADR-*.md` | Decisões de arquitetura (8 ADRs) |
+| `docs/adr/ADR-*.md` | Decisões de arquitetura |
 | `spec.md` | Este arquivo — especificação técnica completa |
 
 ---
@@ -427,6 +431,8 @@ cargo +nightly fuzz run decode_cbor --fuzz-dir fuzz
 | ADR-0006 | Side-channel mitigation | Seção 7.1 (constant-time, zeroize) |
 | ADR-0007 | Arquitetura execução subagents | Processo dev |
 | ADR-0008 | Sealed-box efêmero ECIES | Seção 2.3 (X25519+HKDF+ChaCha20) |
+| ADR-0018 | Roteamento progressivo de contexto | Processo dev (AGENTS.md e subagents) |
+| ADR-0019 | Subagent ciclo de defeitos ponta a ponta | Processo dev (defect-cycle) |
 
 ---
 

@@ -1,6 +1,6 @@
 [package]
 name = "board-generic"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Hardware abstraction layer for embedded FIDO2 authenticators"
 license = "MIT"

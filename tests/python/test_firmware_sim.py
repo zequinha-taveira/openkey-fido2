@@ -180,7 +180,8 @@ def test_get_info_reports_versions_and_aaguid(simulator):
     assert "2.0" in info["versions"]
     assert "2.1" in info["versions"]
     assert info["aaguid"] == "00000000000000000000000000000000"
-    assert info["firmware_version"] == "0.1.0"
+    assert type(info["firmware_version"]) is int
+    assert info["firmware_version"] == 1000
     assert "rk" in info["options"]
     assert "up" in info["options"]
 

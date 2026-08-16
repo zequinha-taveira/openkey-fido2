@@ -8,6 +8,7 @@ use ciborium::Value;
 use crypto::CryptoEngine;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use storage::{Credential, StorageEngine};
 
 extern crate alloc;
@@ -57,6 +58,14 @@ pub struct MakeCredentialRequest {
     pub exclude_list: Vec<CredentialDescriptor>,
     pub extensions: Option<Extensions>,
     pub options: MakeCredentialOptions,
+    /// MAC do `clientDataHash` produzido pelo `pinUvAuthToken`.
+    #[serde(
+        with = "serde_bytes",
+        rename = "pinUvAuthParam",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pin_uv_auth_param: Option<Vec<u8>>,
     #[serde(rename = "pinUvAuthProtocol")]
     pub pin_protocol: Option<u8>,
     #[serde(rename = "enterpriseAttestation")]
@@ -233,6 +242,14 @@ pub struct GetAssertionRequest {
     pub extensions: Option<Extensions>,
     /// Opções do comando.
     pub options: GetAssertionOptions,
+    /// MAC do `clientDataHash` produzido pelo `pinUvAuthToken`.
+    #[serde(
+        with = "serde_bytes",
+        rename = "pinUvAuthParam",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pin_uv_auth_param: Option<Vec<u8>>,
     /// Versão do protocolo PIN/UV auth.
     #[serde(rename = "pinUvAuthProtocol")]
     pub pin_protocol: Option<u8>,
@@ -285,7 +302,14 @@ pub struct GetInfoResponse {
     pub aaguid: Vec<u8>,
     /// Opções habilitadas (e.g. `"rk"`, `"uv"`, `"up"`).
     pub options: Vec<String>,
-    /// Número de relying parties com credenciais armazenadas.
+    /// Protocolos PIN/UV suportados (e.g. `[1, 2]`).
+    #[serde(rename = "pinUvAuthProtocols", default)]
+    pub pin_uv_auth_protocols: Vec<u8>,
+    /// Tamanho máximo de mensagem CTAP suportado.
+    #[serde(default)]
+    pub max_msg_size: u32,
+    /// Número de relying parties com credenciais armazenadas (interno).
+    #[serde(skip_serializing, default)]
     pub rp_count: u32,
     /// Comprimento máximo de credBlob em bytes.
     pub max_cred_blob_length: u32,
@@ -293,8 +317,8 @@ pub struct GetInfoResponse {
     pub max_credential_id_length: u16,
     /// Número máximo de credenciais residentes.
     pub max_credential_count: u16,
-    /// Versão do firmware.
-    pub firmware_version: String,
+    /// Versão numérica do firmware no formato CTAP 2.1 (`firmwareVersion`).
+    pub firmware_version: u32,
     /// Algoritmos COSE suportados.
     pub algorithms: Vec<CoseAlgorithmEntry>,
     /// Recursos de segurança do silício, se houver.
@@ -439,6 +463,8 @@ pub enum Ctap2Error {
     InvalidLength = 0x03,
     /// Dados malformados ou inválidos.
     InvalidData = 0x04,
+    /// Parâmetro obrigatório ausente.
+    MissingParameter = 0x14,
     /// Payload CBOR malformado.
     InvalidCbor = 0x12,
     /// Comando inválido no estado atual.
@@ -463,18 +489,26 @@ pub enum Ctap2Error {
     InvalidKey = 0x22,
     /// Nenhuma credencial correspondente encontrada.
     NoCredentials = 0x2E,
-    /// PIN incorreto.
+    /// PIN incorreto (CTAP2_ERR_PIN_INVALID).
     PinInvalid = 0x31,
-    /// PIN incorreto com contador de tentativas decrementado.
-    PinInvalidRetries = 0x32,
-    /// PIN necessário para continuar.
-    PinRequired = 0x35,
-    /// PIN viola política de segurança.
+    /// PIN bloqueado após esgotar as tentativas (CTAP2_ERR_PIN_BLOCKED).
+    PinBlocked = 0x32,
+    /// Falha na verificação de `pinUvAuthParam` (CTAP2_ERR_PIN_AUTH_INVALID).
+    PinAuthInvalid = 0x33,
+    /// Autenticação de PIN bloqueada; requer power cycle (CTAP2_ERR_PIN_AUTH_BLOCKED).
+    PinAuthBlocked = 0x34,
+    /// Nenhum PIN configurado (CTAP2_ERR_PIN_NOT_SET).
+    PinNotSet = 0x35,
+    /// Um pinUvAuthToken é necessário (CTAP2_ERR_PUAT_REQUIRED / PIN_REQUIRED).
+    PinRequired = 0x36,
+    /// PIN viola política de segurança (CTAP2_ERR_PIN_POLICY_VIOLATION).
     PinPolicyViolation = 0x37,
-    /// Token de autenticação PIN/UV necessário.
-    PinTokenRequired = 0x36,
-    /// Token de autenticação expirado.
+    /// Token de autenticação expirado (CTAP2_ERR_PIN_TOKEN_EXPIRED).
     PinTokenExpired = 0x38,
+    /// `permissions` contém permissão não autorizada (CTAP2_ERR_UNAUTHORIZED_PERMISSION).
+    UnauthorizedPermission = 0x40,
+    /// Verificação de usuário embutida desabilitada (CTAP2_ERR_UV_BLOCKED).
+    UvBlocked = 0x3C,
     /// Token pendente de aprovação do usuário.
     PinTokenPending = 0x23,
 
@@ -536,6 +570,38 @@ fn ctap2_error(error: Box<dyn std::error::Error>) -> Ctap2Error {
 
 pub const AAGUID: [u8; 16] = [0u8; 16];
 
+const FIRMWARE_VERSION_COMPONENT_BASE: u32 = 1_000;
+
+/// Converte o núcleo numérico de uma versão semântica para `firmwareVersion`.
+///
+/// CTAP 2.1 deixa a codificação do inteiro a cargo do fabricante. Cada
+/// componente `major.minor.patch` ocupa três dígitos decimais, preservando a
+/// ordem e evitando colisões para componentes entre 0 e 999. Sufixos de
+/// pré-lançamento ou build não são representáveis e, portanto, são ignorados.
+fn firmware_version_to_ctap_integer(version: &str) -> Result<u32, Ctap2Error> {
+    let numeric_core = version.split(['-', '+']).next().unwrap_or(version);
+    let mut components = numeric_core.split('.');
+    let parse_component = |component: Option<&str>| {
+        component
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value < FIRMWARE_VERSION_COMPONENT_BASE)
+            .ok_or(Ctap2Error::InvalidData)
+    };
+
+    let major = parse_component(components.next())?;
+    let minor = parse_component(components.next())?;
+    let patch = parse_component(components.next())?;
+    if components.next().is_some() {
+        return Err(Ctap2Error::InvalidData);
+    }
+
+    major
+        .checked_mul(FIRMWARE_VERSION_COMPONENT_BASE.pow(2))
+        .and_then(|value| value.checked_add(minor * FIRMWARE_VERSION_COMPONENT_BASE))
+        .and_then(|value| value.checked_add(patch))
+        .ok_or(Ctap2Error::InvalidData)
+}
+
 fn hash_rp_id(rp_id: &str, crypto: &CryptoEngine) -> [u8; 32] {
     let result = crypto.sha256(rp_id.as_bytes());
     let mut rp_hash = [0u8; 32];
@@ -572,12 +638,6 @@ fn ctap_key_to_int(key: &str) -> Option<i64> {
         "algorithms" => 0x0A,
         "fmt" => 0x01,
         "attStmt" => 0x03,
-        "subCommand" => 0x01,
-        "pinProtocol" => 0x02,
-        "keyAgreement" => 0x03,
-        "pinAuth" => 0x04,
-        "newPinEnc" => 0x05,
-        "pinHashEnc" => 0x06,
         "subCommandParams" => 0x03,
         "r#type" => 0x01,
         "id" => 0x02,
@@ -594,6 +654,61 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
     let converted = entries
         .into_iter()
         .map(|(key, val)| {
+            // CTAP GetInfo encodes options as a map of capability names to
+            // booleans. The public model stores enabled names as a Vec, so
+            // adapt only this wire boundary instead of exposing a breaking API.
+            let val = if type_name.contains("GetInfoResponse") {
+                let is_options = if encode {
+                    matches!(&key, Value::Text(name) if name == "options")
+                } else {
+                    matches!(&key, Value::Integer(n) if *n == 4.into())
+                };
+                if is_options {
+                    if encode {
+                        match val {
+                            Value::Array(names)
+                                if names.iter().all(|v| matches!(v, Value::Text(_))) =>
+                            {
+                                Value::Map(
+                                    names
+                                        .into_iter()
+                                        .filter_map(|name| match name {
+                                            Value::Text(name) => {
+                                                Some((Value::Text(name), Value::Bool(true)))
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect(),
+                                )
+                            }
+                            other => other,
+                        }
+                    } else {
+                        match val {
+                            Value::Map(options)
+                                if options.iter().all(|(_, v)| matches!(v, Value::Bool(_))) =>
+                            {
+                                Value::Array(
+                                    options
+                                        .into_iter()
+                                        .filter_map(|(name, enabled)| match (name, enabled) {
+                                            (Value::Text(name), Value::Bool(true)) => {
+                                                Some(Value::Text(name))
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect(),
+                                )
+                            }
+                            other => other,
+                        }
+                    }
+                } else {
+                    val
+                }
+            } else {
+                val
+            };
             if encode {
                 if let Value::Text(name) = key {
                     // The same field name can have different labels in different
@@ -635,6 +750,24 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
                         t if t.contains("GetInfoResponse") && name == "extensions" => Some(0x02),
                         t if t.contains("GetInfoResponse") && name == "aaguid" => Some(0x03),
                         t if t.contains("GetInfoResponse") && name == "options" => Some(0x04),
+                        t if t.contains("GetInfoResponse") && name == "max_msg_size" => Some(0x05),
+                        t if t.contains("GetInfoResponse") && name == "max_credential_count" => {
+                            Some(0x07)
+                        }
+                        t if t.contains("GetInfoResponse")
+                            && name == "max_credential_id_length" =>
+                        {
+                            Some(0x08)
+                        }
+                        t if t.contains("GetInfoResponse") && name == "firmware_version" => {
+                            Some(0x0E)
+                        }
+                        t if t.contains("GetInfoResponse") && name == "max_cred_blob_length" => {
+                            Some(0x0F)
+                        }
+                        t if t.contains("GetInfoResponse") && name == "maxLargeBlobDataSize" => {
+                            Some(0x0B)
+                        }
                         t if t.contains("GetInfoResponse")
                             && name == "max_large_blob_data_size" =>
                         {
@@ -779,10 +912,15 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
                             "options",
                             "maxMsgSize",
                             "pinUvAuthProtocols",
-                            "",
-                            "",
+                            "max_credential_count",
+                            "max_credential_id_length",
                             "",
                             "algorithms",
+                            "maxLargeBlobDataSize",
+                            "",
+                            "",
+                            "firmware_version",
+                            "max_cred_blob_length",
                         ]
                         .get(n as usize)
                         .copied(),
@@ -854,7 +992,11 @@ pub fn encode_cbor<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Ctap2Err
 }
 
 pub fn decode_cbor<T: DeserializeOwned>(data: &[u8]) -> Result<T, Ctap2Error> {
-    let parsed: Value = from_reader(data).map_err(|_| Ctap2Error::InvalidCbor)?;
+    let mut reader = Cursor::new(data);
+    let parsed: Value = from_reader(&mut reader).map_err(|_| Ctap2Error::InvalidCbor)?;
+    if reader.position() != data.len() as u64 {
+        return Err(Ctap2Error::InvalidCbor);
+    }
     let normalized = root_ctap_keys(parsed, false, core::any::type_name::<T>());
     let mut buf = alloc::vec![];
     into_writer(&normalized, &mut buf).map_err(|_| Ctap2Error::InvalidCbor)?;
@@ -903,6 +1045,7 @@ pub struct Ctap2Capabilities {
     pub max_credential_count: u16,
     pub firmware_version: String,
     pub min_pin_length: Option<u32>,
+    pub pin_uv_auth_protocols: Vec<u8>,
     pub security: SecurityFeatures,
     pub max_large_blob_data_size: Option<u32>,
 }
@@ -932,6 +1075,7 @@ impl Default for Ctap2Capabilities {
             max_credential_count: 10,
             firmware_version: "0.1.0".to_string(),
             min_pin_length: Some(4),
+            pin_uv_auth_protocols: vec![1, 2],
             security: SecurityFeatures::default(),
             max_large_blob_data_size: Some(4096),
         }
@@ -971,6 +1115,8 @@ pub struct Ctap2Authenticator {
     cred_mgmt_creds_state: Option<EnumerateCredentialsState>,
     get_next_assertion_state: Option<GetNextAssertionState>,
     user_presence: Option<Box<dyn UserPresence>>,
+    pin_uv_auth_token: Option<client_pin::PinUvAuthTokenState>,
+    pin_agreement_key: Option<crypto::pin_protocol::PinAgreementKey>,
 }
 
 #[derive(Debug)]
@@ -1032,6 +1178,8 @@ impl Ctap2Authenticator {
             cred_mgmt_creds_state: None,
             get_next_assertion_state: None,
             user_presence: None,
+            pin_uv_auth_token: None,
+            pin_agreement_key: None,
         })
     }
 
@@ -1088,6 +1236,19 @@ impl Ctap2Authenticator {
         request: MakeCredentialRequest,
     ) -> Result<MakeCredentialResponse, Box<dyn std::error::Error>> {
         debug!("Processing MakeCredential request");
+
+        let pin_authenticated = self
+            .verify_pin_uv_auth_for_operation(
+                request.pin_protocol,
+                request.pin_uv_auth_param.as_deref(),
+                &request.client_data_hash,
+                client_pin::PERMISSION_MC,
+                Some(&request.rp.id),
+            )
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+        if request.options.uv && client_pin::is_pin_set(&self.storage) && !pin_authenticated {
+            return Err(Box::new(Ctap2Error::PinRequired));
+        }
 
         if request.options.up {
             if let Some(presence) = self.user_presence.as_mut() {
@@ -1191,7 +1352,7 @@ impl Ctap2Authenticator {
         if request.options.up {
             flags |= 0x01;
         }
-        if request.options.uv {
+        if request.options.uv || pin_authenticated {
             flags |= 0x04;
         }
 
@@ -1281,6 +1442,19 @@ impl Ctap2Authenticator {
     ) -> Result<GetAssertionResponse, Box<dyn std::error::Error>> {
         debug!("Processing GetAssertion request");
 
+        let pin_authenticated = self
+            .verify_pin_uv_auth_for_operation(
+                request.pin_protocol,
+                request.pin_uv_auth_param.as_deref(),
+                &request.client_data_hash,
+                client_pin::PERMISSION_GA,
+                Some(&request.rp_id),
+            )
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+        if request.options.uv && client_pin::is_pin_set(&self.storage) && !pin_authenticated {
+            return Err(Box::new(Ctap2Error::PinRequired));
+        }
+
         if request.options.up {
             if let Some(presence) = self.user_presence.as_mut() {
                 if !presence.is_present() {
@@ -1333,7 +1507,7 @@ impl Ctap2Authenticator {
         if request.options.up {
             flags |= 0x01;
         }
-        if request.options.uv {
+        if request.options.uv || pin_authenticated {
             flags |= 0x04;
         }
         let sign_count = credential.sign_count + 1;
@@ -1454,16 +1628,34 @@ impl Ctap2Authenticator {
             None
         };
 
+        // Opções dinâmicas: `clientPin` indica o *suporte* à funcionalidade
+        // (obrigatório para que plataformas possam definir o PIN inicial) e
+        // `pinUvAuthToken` o suporte a tokens. `uv` permanece ausente.
+        let mut options = self.capabilities.options.clone();
+        if !self.capabilities.pin_uv_auth_protocols.is_empty() {
+            if !options.contains(&"pinUvAuthToken".to_string()) {
+                options.push("pinUvAuthToken".to_string());
+            }
+            if client_pin::is_pin_set(&self.storage) && !options.contains(&"clientPin".to_string())
+            {
+                options.push("clientPin".to_string());
+            }
+        }
+
         Ok(GetInfoResponse {
             versions: self.capabilities.versions.clone(),
             extensions: self.capabilities.extensions.clone(),
             aaguid: self.capabilities.aaguid.to_vec(),
-            options: self.capabilities.options.clone(),
+            options,
+            pin_uv_auth_protocols: self.capabilities.pin_uv_auth_protocols.clone(),
+            max_msg_size: 1200,
             rp_count: self.capabilities.rp_count,
             max_cred_blob_length: self.capabilities.max_cred_blob_length,
             max_credential_id_length: self.capabilities.max_credential_id_length,
             max_credential_count: self.capabilities.max_credential_count,
-            firmware_version: self.capabilities.firmware_version.clone(),
+            firmware_version: firmware_version_to_ctap_integer(
+                &self.capabilities.firmware_version,
+            )?,
             algorithms: vec![
                 CoseAlgorithmEntry {
                     alg: -7,
@@ -1547,10 +1739,7 @@ impl Ctap2Authenticator {
     }
 
     fn handle_client_pin(&mut self, data: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
-        let request: client_pin::ClientPinRequest = decode_cbor(data)?;
-        let response = client_pin::handle_client_pin(self, request)?;
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
-        Ok(encoded)
+        client_pin::handle_client_pin(self, data)
     }
 
     fn handle_reset(&mut self) -> Result<Vec<u8>, Ctap2Error> {
@@ -1719,6 +1908,18 @@ impl Ctap2Authenticator {
     fn handle_credential_management(&mut self, data: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
         let request: cred_mgmt::CredentialManagementRequest =
             decode_cbor(data).map_err(|_| Ctap2Error::InvalidParameter)?;
+
+        let auth_message = credential_management_auth_message(data)?;
+        let pin_authenticated = self.verify_pin_uv_auth_for_operation(
+            request.pin_uv_auth_protocol,
+            request.pin_uv_auth_param.as_deref(),
+            &auth_message,
+            client_pin::PERMISSION_CM,
+            None,
+        )?;
+        if client_pin::is_pin_set(&self.storage) && !pin_authenticated {
+            return Err(Ctap2Error::PinRequired);
+        }
 
         match request.sub_command {
             cred_mgmt::sub_commands::GET_CREDS_METADATA => self.handle_cred_mgmt_get_metadata(),
@@ -2065,100 +2266,58 @@ impl Ctap2Authenticator {
 
 impl client_pin::ClientPin for Ctap2Authenticator {
     fn get_pin_retries(&self) -> u8 {
-        self.storage
-            .retrieve(client_pin::PIN_RETRIES_KEY)
-            .ok()
-            .and_then(|data| alloc::string::String::from_utf8(data).ok())
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(client_pin::PIN_MAX_RETRIES)
+        client_pin::read_retries(&self.storage)
     }
 
-    fn get_pin_token(&mut self) -> Result<Vec<u8>, Ctap2Error> {
-        let pin_hash = self
-            .storage
-            .retrieve(client_pin::PIN_STORAGE_KEY)
-            .map_err(|_| Ctap2Error::PinRequired)?;
-
-        let shared_secret = self
-            .storage
-            .retrieve(client_pin::SHARED_SECRET_KEY)
-            .map_err(|_| Ctap2Error::InvalidState)?;
-
-        let hmac_key = self
-            .crypto
-            .compute_hmac(&shared_secret, &pin_hash)
-            .map_err(|_| Ctap2Error::InvalidData)?;
-
-        let token = self
-            .crypto
-            .compute_hmac(b"pinUvAuthToken", &hmac_key)
-            .map_err(|_| Ctap2Error::InvalidData)?;
-
-        self.crypto
-            .encrypt(&token, &[0u8; 12])
-            .map_err(|_| Ctap2Error::InvalidData)
-    }
-
+    /// Armazena `LEFT(SHA-256(pin), 16)` — o formato `CurrentStoredPIN`
+    /// exigido pelo CTAP 2.1 §6.5.5.5. O PIN nunca é armazenado em claro.
     fn set_pin(&mut self, pin: &[u8]) -> Result<(), Ctap2Error> {
         if pin.len() < client_pin::PIN_MIN_LENGTH {
             return Err(Ctap2Error::PinPolicyViolation);
         }
+        if pin.len() > client_pin::PIN_MAX_LENGTH {
+            return Err(Ctap2Error::PinPolicyViolation);
+        }
 
-        let hash = self.crypto.sha256(pin);
+        let full_hash = self.crypto.sha256(pin);
+        let stored_hash = full_hash[..16].to_vec();
         self.storage
-            .store(client_pin::PIN_STORAGE_KEY, hash)
-            .map_err(|_| Ctap2Error::InvalidData)?;
-
-        let shared_secret = self.crypto.random_bytes(32);
-        self.storage
-            .store(client_pin::SHARED_SECRET_KEY, shared_secret)
+            .store(client_pin::PIN_STORAGE_KEY, stored_hash)
             .map_err(|_| Ctap2Error::InvalidData)?;
 
         self.reset_pin_retries();
+        self.pin_uv_auth_token = None;
 
         Ok(())
     }
 
     fn change_pin(&mut self, old_pin: &[u8], new_pin: &[u8]) -> Result<(), Ctap2Error> {
-        if new_pin.len() < client_pin::PIN_MIN_LENGTH {
+        if new_pin.len() < client_pin::PIN_MIN_LENGTH || new_pin.len() > client_pin::PIN_MAX_LENGTH
+        {
             return Err(Ctap2Error::PinPolicyViolation);
         }
 
         let stored_hash = self
             .storage
             .retrieve(client_pin::PIN_STORAGE_KEY)
-            .map_err(|_| Ctap2Error::PinRequired)?;
+            .map_err(|_| Ctap2Error::PinNotSet)?;
 
-        let old_hash = self.crypto.sha256(old_pin);
-        if !crypto::constant_time_eq(&old_hash, &stored_hash) {
+        let old_full_hash = self.crypto.sha256(old_pin);
+        if !crypto::constant_time_eq(&old_full_hash[..16], &stored_hash) {
             self.decrement_pin_retries();
             return Err(Ctap2Error::PinInvalid);
         }
 
         self.reset_pin_retries();
 
-        let new_hash = self.crypto.sha256(new_pin);
+        let new_full_hash = self.crypto.sha256(new_pin);
         self.storage
-            .store(client_pin::PIN_STORAGE_KEY, new_hash)
+            .store(client_pin::PIN_STORAGE_KEY, new_full_hash[..16].to_vec())
             .map_err(|_| Ctap2Error::InvalidData)?;
 
-        let shared_secret = self.crypto.random_bytes(32);
-        self.storage
-            .store(client_pin::SHARED_SECRET_KEY, shared_secret)
-            .map_err(|_| Ctap2Error::InvalidData)?;
+        self.pin_uv_auth_token = None;
 
         Ok(())
-    }
-
-    fn get_pin_hash_enc(&mut self) -> Result<Vec<u8>, Ctap2Error> {
-        let pin_hash = self
-            .storage
-            .retrieve(client_pin::PIN_STORAGE_KEY)
-            .map_err(|_| Ctap2Error::PinRequired)?;
-
-        self.crypto
-            .encrypt(&pin_hash, &[0u8; 12])
-            .map_err(|_| Ctap2Error::InvalidData)
     }
 
     fn reset_pin_retries(&mut self) {
@@ -2178,23 +2337,174 @@ impl client_pin::ClientPin for Ctap2Authenticator {
 
     fn verify_pin(&mut self, pin: &[u8]) -> Result<(), Ctap2Error> {
         if !client_pin::is_pin_set(self.get_storage()) {
-            return Err(Ctap2Error::PinRequired);
+            return Err(Ctap2Error::PinNotSet);
         }
         if client_pin::is_pin_blocked(self.get_storage()) {
-            return Err(Ctap2Error::PinInvalid);
+            return Err(Ctap2Error::PinBlocked);
         }
         let stored_hash = self
             .storage
             .retrieve(client_pin::PIN_STORAGE_KEY)
-            .map_err(|_| Ctap2Error::PinRequired)?;
-        let submitted_hash = self.crypto.sha256(pin);
-        if !crypto::constant_time_eq(&submitted_hash, &stored_hash) {
+            .map_err(|_| Ctap2Error::PinNotSet)?;
+        let submitted_full_hash = self.crypto.sha256(pin);
+        if !crypto::constant_time_eq(&submitted_full_hash[..16], &stored_hash) {
             self.decrement_pin_retries();
             return Err(Ctap2Error::PinInvalid);
         }
         self.reset_pin_retries();
         Ok(())
     }
+}
+
+impl Ctap2Authenticator {
+    /// Armazena o pinUvAuthToken da sessão atual (CTAP 2.1 §6.5.2.1).
+    pub(crate) fn set_pin_uv_auth_token(
+        &mut self,
+        token: Vec<u8>,
+        permissions: u8,
+        permissions_rp_id: Option<String>,
+        protocol: u8,
+    ) {
+        self.pin_uv_auth_token = Some(client_pin::PinUvAuthTokenState::new(
+            token,
+            permissions,
+            permissions_rp_id,
+            protocol,
+        ));
+    }
+
+    /// Invalida o pinUvAuthToken da sessão (resetPinUvAuthToken).
+    pub(crate) fn invalidate_pin_uv_auth_token(&mut self) {
+        self.pin_uv_auth_token = None;
+    }
+
+    /// Registra a chave de acordo P-256 anunciada em getKeyAgreement.
+    /// A mesma chave privada é usada no subcomando seguinte da transação
+    /// (`decapsulate`, CTAP 2.1 §6.5.4).
+    pub(crate) fn set_pin_agreement_key(&mut self, key: crypto::pin_protocol::PinAgreementKey) {
+        self.pin_agreement_key = Some(key);
+    }
+
+    /// Consome a chave de acordo P-256 da transação atual. Cada chave é usada
+    /// uma única vez (CTAP 2.1 §6.5.5.4: novo segredo a cada transação).
+    pub(crate) fn take_pin_agreement_key(
+        &mut self,
+    ) -> Option<crypto::pin_protocol::PinAgreementKey> {
+        self.pin_agreement_key.take()
+    }
+
+    /// Verifica um `pinUvAuthParam` contra o pinUvAuthToken da sessão.
+    ///
+    /// O argumento autenticado é o `clientDataHash` (32 bytes), conforme
+    /// CTAP 2.1 §6.5.8. Retorna [`Ctap2Error::PinAuthInvalid`] se o token
+    /// estiver ausente, expirado ou o MAC não conferir (comparação em tempo
+    /// constante via [`crypto::constant_time_eq`]).
+    pub fn verify_pin_uv_auth_param(
+        &self,
+        pin_protocol: u8,
+        pin_uv_auth_param: &[u8],
+        client_data_hash: &[u8],
+    ) -> Result<(), Ctap2Error> {
+        self.verify_pin_uv_auth_message(pin_protocol, pin_uv_auth_param, client_data_hash)
+    }
+
+    fn verify_pin_uv_auth_message(
+        &self,
+        pin_protocol: u8,
+        pin_uv_auth_param: &[u8],
+        message: &[u8],
+    ) -> Result<(), Ctap2Error> {
+        let state = self
+            .pin_uv_auth_token
+            .as_ref()
+            .ok_or(Ctap2Error::PinAuthInvalid)?;
+        if state.protocol != pin_protocol {
+            return Err(Ctap2Error::PinAuthInvalid);
+        }
+        let mac = crypto::pin_protocol::PinUvProtocol::new(state.protocol)
+            .map_err(|_| Ctap2Error::PinAuthInvalid)?
+            .authenticate(&state.token, message)
+            .map_err(|_| Ctap2Error::PinAuthInvalid)?;
+        if !crypto::constant_time_eq(&mac, pin_uv_auth_param) {
+            return Err(Ctap2Error::PinAuthInvalid);
+        }
+        Ok(())
+    }
+
+    /// Verifica um `pinUvAuthParam` e as permissões/RP associados ao token.
+    fn verify_pin_uv_auth_for_operation(
+        &self,
+        pin_protocol: Option<u8>,
+        pin_uv_auth_param: Option<&[u8]>,
+        message: &[u8],
+        required_permission: u8,
+        rp_id: Option<&str>,
+    ) -> Result<bool, Ctap2Error> {
+        match (pin_protocol, pin_uv_auth_param) {
+            (None, None) => return Ok(false),
+            (Some(_), None) | (None, Some(_)) => return Err(Ctap2Error::MissingParameter),
+            (Some(protocol), Some(param)) => {
+                self.verify_pin_uv_auth_message(protocol, param, message)?;
+            }
+        }
+
+        let state = self
+            .pin_uv_auth_token
+            .as_ref()
+            .ok_or(Ctap2Error::PinAuthInvalid)?;
+        if state.permissions & required_permission != required_permission {
+            return Err(Ctap2Error::UnauthorizedPermission);
+        }
+        if let Some(bound_rp_id) = state.permissions_rp_id.as_deref() {
+            if rp_id != Some(bound_rp_id) {
+                return Err(Ctap2Error::UnauthorizedPermission);
+            }
+        }
+
+        Ok(true)
+    }
+}
+
+/// Reconstitui a mensagem autenticada de Credential Management.
+///
+/// A mensagem é `subCommand || subCommandParams`, usando os bytes CBOR do
+/// mapa de parâmetros exatamente como chegaram no request. Isso evita alterar
+/// a codificação de descritores ou entidades de usuário durante a verificação.
+fn credential_management_auth_message(data: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
+    let mut reader = Cursor::new(data);
+    let value: Value = from_reader(&mut reader).map_err(|_| Ctap2Error::InvalidCbor)?;
+    if reader.position() != data.len() as u64 {
+        return Err(Ctap2Error::InvalidCbor);
+    }
+
+    let Value::Map(entries) = value else {
+        return Err(Ctap2Error::InvalidCbor);
+    };
+
+    let mut sub_command = None;
+    let mut sub_command_params = None;
+    for (key, value) in entries {
+        match key {
+            Value::Integer(number) if number == 1.into() => sub_command = Some(value),
+            Value::Text(name) if name == "subCommand" => sub_command = Some(value),
+            Value::Integer(number) if number == 2.into() => sub_command_params = Some(value),
+            Value::Text(name) if name == "subCommandParams" => sub_command_params = Some(value),
+            _ => {}
+        }
+    }
+
+    let sub_command = sub_command
+        .and_then(|value| match value {
+            Value::Integer(number) => u8::try_from(number).ok(),
+            _ => None,
+        })
+        .ok_or(Ctap2Error::InvalidParameter)?;
+
+    let mut message = vec![sub_command];
+    if let Some(params) = sub_command_params {
+        into_writer(&params, &mut message).map_err(|_| Ctap2Error::InvalidCbor)?;
+    }
+    Ok(message)
 }
 
 /// Builds a COSE_Key CBOR map for an Ed25519 (EdDSA, alg -8) public key.
@@ -2257,6 +2567,46 @@ fn build_cose_key_rsa_pss(n: &[u8], e: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_decode_cbor_rejects_trailing_bytes() {
+        let request = MakeCredentialRequest {
+            client_data_hash: b"test".to_vec(),
+            rp: RelyingParty {
+                id: "example.com".to_string(),
+                name: None,
+                icon: None,
+            },
+            user: User {
+                id: b"user".to_vec(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            },
+            pub_key_cred_params: vec![PublicKeyCredParams {
+                r#type: "public-key".to_string(),
+                algorithms: -7,
+            }],
+            exclude_list: vec![],
+            extensions: None,
+            options: MakeCredentialOptions {
+                rk: false,
+                uv: false,
+                up: true,
+                extended: false,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            enterprise_protections: None,
+        };
+        let mut encoded = encode_cbor(&request).unwrap();
+        encoded.push(0);
+
+        assert!(matches!(
+            decode_cbor::<MakeCredentialRequest>(&encoded),
+            Err(Ctap2Error::InvalidCbor)
+        ));
+    }
 
     #[test]
     fn test_cred_protect_default() {
@@ -2323,6 +2673,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2404,6 +2755,7 @@ mod tests {
                 up,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         }
@@ -2478,6 +2830,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2498,6 +2851,69 @@ mod tests {
         assert!(info.extensions.contains(&"credBlob".to_string()));
         assert!(info.extensions.contains(&"minPinLength".to_string()));
         assert!(info.extensions.contains(&"hmac-secret".to_string()));
+    }
+
+    #[test]
+    fn test_firmware_version_mapping() {
+        assert_eq!(firmware_version_to_ctap_integer("0.1.0"), Ok(1_000));
+        assert_eq!(firmware_version_to_ctap_integer("3.1.0"), Ok(3_001_000));
+        assert_eq!(
+            firmware_version_to_ctap_integer("1.2.3-beta+build.7"),
+            Ok(1_002_003)
+        );
+        assert_eq!(
+            firmware_version_to_ctap_integer("1000.0.0"),
+            Err(Ctap2Error::InvalidData)
+        );
+    }
+
+    #[test]
+    fn test_get_info_firmware_version_is_integer_on_wire() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let info = authenticator.get_info().unwrap();
+
+        let wire = encode_cbor(&info).unwrap();
+        let Value::Map(entries) = ciborium::de::from_reader(wire.as_slice()).unwrap() else {
+            panic!("GetInfo não é mapa");
+        };
+        let firmware_version = entries.into_iter().find_map(|(key, value)| match key {
+            Value::Integer(number) if number == 0x0E.into() => Some(value),
+            _ => None,
+        });
+
+        assert_eq!(firmware_version, Some(Value::Integer(1_000.into())));
+    }
+
+    #[test]
+    fn test_get_info_options_use_ctap_map_on_wire() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let info = authenticator.get_info().unwrap();
+
+        let wire = encode_cbor(&info).unwrap();
+        let value: Value = ciborium::de::from_reader(wire.as_slice()).unwrap();
+        let Value::Map(entries) = value else {
+            panic!("GetInfo não é mapa")
+        };
+        let options = entries
+            .into_iter()
+            .find_map(|(key, value)| match key {
+                Value::Integer(n) if n == 4.into() => Some(value),
+                _ => None,
+            })
+            .expect("GetInfo deve conter options na chave 0x04");
+        let Value::Map(options) = options else {
+            panic!("options deve ser mapa CTAP")
+        };
+        assert!(options.iter().any(|(key, value)| {
+            matches!((key, value), (Value::Text(name), Value::Bool(true)) if name == "rk")
+        }));
+        assert!(options.iter().any(|(key, value)| {
+            matches!((key, value), (Value::Text(name), Value::Bool(true)) if name == "up")
+        }));
     }
 
     #[test]
@@ -2535,6 +2951,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2559,6 +2976,7 @@ mod tests {
                 ..Default::default()
             }),
             options: GetAssertionOptions { up: true, uv: true },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             uv: Some(true),
         };
@@ -2603,6 +3021,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2650,6 +3069,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2696,6 +3116,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2737,6 +3158,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2766,6 +3188,7 @@ mod tests {
                 ..Default::default()
             }),
             options: GetAssertionOptions { up: true, uv: true },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             uv: Some(true),
         };
@@ -2837,6 +3260,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2899,6 +3323,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -2941,6 +3366,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -3024,6 +3450,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -3046,6 +3473,7 @@ mod tests {
                 }],
                 extensions: None,
                 options: GetAssertionOptions { up: true, uv: true },
+                pin_uv_auth_param: None,
                 pin_protocol: None,
                 uv: None,
             })
@@ -3088,6 +3516,7 @@ mod tests {
                 up: true,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         }
@@ -3236,6 +3665,7 @@ mod tests {
                     up: true,
                     extended: false,
                 },
+                pin_uv_auth_param: None,
                 pin_protocol: None,
                 enterprise_protections: None,
             })
@@ -3282,6 +3712,7 @@ mod tests {
                         up: true,
                         extended: false,
                     },
+                    pin_uv_auth_param: None,
                     pin_protocol: None,
                     enterprise_protections: None,
                 })
@@ -3300,6 +3731,7 @@ mod tests {
                 up: false,
                 uv: true,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             uv: None,
         };
@@ -3361,6 +3793,7 @@ mod tests {
                         up: true,
                         extended: false,
                     },
+                    pin_uv_auth_param: None,
                     pin_protocol: None,
                     enterprise_protections: None,
                 })
@@ -3409,6 +3842,7 @@ mod tests {
                         up: true,
                         extended: false,
                     },
+                    pin_uv_auth_param: None,
                     pin_protocol: None,
                     enterprise_protections: None,
                 })
@@ -3545,6 +3979,7 @@ mod tests {
                 up: false,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -3562,6 +3997,7 @@ mod tests {
                 uv: false,
                 up: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             uv: None,
         };
@@ -3601,6 +4037,7 @@ mod tests {
                 up: false,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -3618,12 +4055,199 @@ mod tests {
                 uv: false,
                 up: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             uv: None,
         };
 
         let assert_resp = authenticator.get_assertion(get_req).unwrap();
         assert!(!assert_resp.signature.is_empty());
+    }
+
+    fn pin_uv_auth_param(token: &[u8], protocol: u8, message: &[u8]) -> Vec<u8> {
+        crypto::pin_protocol::PinUvProtocol::new(protocol)
+            .unwrap()
+            .authenticate(token, message)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_pin_uv_auth_param_is_verified_by_make_and_get_assertion() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let token = vec![0xA5; 32];
+        let client_data_hash = vec![0x42; 32];
+
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_MC_GA, None, 2);
+
+        let mut make_request = make_credential_request(false);
+        make_request.client_data_hash = client_data_hash.clone();
+        make_request.options.uv = false;
+        make_request.pin_protocol = Some(2);
+        make_request.pin_uv_auth_param = Some(pin_uv_auth_param(&token, 2, &client_data_hash));
+
+        let response = authenticator.make_credential(make_request).unwrap();
+        assert_ne!(response.auth_data[32] & 0x04, 0);
+
+        let credential_id = authenticator.get_storage().list_credentials()[0]
+            .credential_id
+            .clone();
+        let assertion_hash = vec![0x24; 32];
+        let assertion = authenticator
+            .get_assertion(GetAssertionRequest {
+                rp_id: "example.com".to_string(),
+                credentials: vec![CredentialDescriptor {
+                    r#type: "public-key".to_string(),
+                    id: credential_id,
+                    transports: None,
+                }],
+                allow_list: None,
+                client_data_hash: assertion_hash.clone(),
+                extensions: None,
+                options: GetAssertionOptions {
+                    up: false,
+                    uv: false,
+                },
+                pin_uv_auth_param: Some(pin_uv_auth_param(&token, 2, &assertion_hash)),
+                pin_protocol: Some(2),
+                uv: None,
+            })
+            .unwrap();
+        assert_ne!(assertion.auth_data[32] & 0x04, 0);
+    }
+
+    #[test]
+    fn test_pin_uv_auth_param_rejects_invalid_or_incomplete_authentication() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let token = vec![0x5A; 32];
+        authenticator.set_pin_uv_auth_token(token, client_pin::PERMISSION_MC, None, 2);
+
+        let mut invalid = make_credential_request(false);
+        invalid.options.uv = false;
+        invalid.pin_protocol = Some(2);
+        invalid.pin_uv_auth_param = Some(vec![0u8; 32]);
+        let error = authenticator.make_credential(invalid).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::PinAuthInvalid)
+        );
+
+        let mut incomplete = make_credential_request(false);
+        incomplete.options.uv = false;
+        incomplete.pin_protocol = Some(2);
+        let error = authenticator.make_credential(incomplete).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::MissingParameter)
+        );
+        assert!(authenticator.get_storage().list_credentials().is_empty());
+    }
+
+    #[test]
+    fn test_pin_uv_auth_is_required_when_pin_is_configured() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        client_pin::ClientPin::set_pin(&mut authenticator, b"1234").unwrap();
+
+        let mut make_request = make_credential_request(false);
+        make_request.options.uv = true;
+        let error = authenticator.make_credential(make_request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::PinRequired)
+        );
+
+        let request = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::GET_CREDS_METADATA,
+            sub_command_params: None,
+            pin_uv_auth_protocol: None,
+            pin_uv_auth_param: None,
+        };
+        let error = authenticator
+            .process_command(0x0A, encode_cbor(&request).unwrap())
+            .unwrap_err();
+        assert_eq!(error, Ctap2Error::PinRequired);
+    }
+
+    #[test]
+    fn test_pin_uv_auth_permissions_and_rp_binding_are_enforced() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let token = vec![0x3C; 32];
+        let client_data_hash = vec![0x11; 32];
+
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_GA, None, 2);
+        let mut make_request = make_credential_request(false);
+        make_request.options.uv = false;
+        make_request.pin_protocol = Some(2);
+        make_request.pin_uv_auth_param =
+            Some(pin_uv_auth_param(&token, 2, &make_request.client_data_hash));
+        let error = authenticator.make_credential(make_request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::UnauthorizedPermission)
+        );
+
+        authenticator.set_pin_uv_auth_token(
+            token.clone(),
+            client_pin::PERMISSION_MC,
+            Some("other.example".to_string()),
+            2,
+        );
+        let mut bound_request = make_credential_request(false);
+        bound_request.options.uv = false;
+        bound_request.client_data_hash = client_data_hash.clone();
+        bound_request.pin_protocol = Some(2);
+        bound_request.pin_uv_auth_param = Some(pin_uv_auth_param(&token, 2, &client_data_hash));
+        let error = authenticator.make_credential(bound_request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::UnauthorizedPermission)
+        );
+    }
+
+    #[test]
+    fn test_pin_uv_auth_param_is_verified_by_credential_management() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let token = vec![0xC3; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_CM, None, 2);
+
+        let unsigned = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::GET_CREDS_METADATA,
+            sub_command_params: None,
+            pin_uv_auth_protocol: Some(2),
+            pin_uv_auth_param: None,
+        };
+        let unsigned_bytes = encode_cbor(&unsigned).unwrap();
+        let auth_message = credential_management_auth_message(&unsigned_bytes).unwrap();
+        let request = cred_mgmt::CredentialManagementRequest {
+            pin_uv_auth_param: Some(pin_uv_auth_param(&token, 2, &auth_message)),
+            ..unsigned
+        };
+
+        let response = authenticator
+            .process_command(0x0A, encode_cbor(&request).unwrap())
+            .unwrap();
+        let metadata: cred_mgmt::CredsMetadataResponse = decode_cbor(&response).unwrap();
+        assert_eq!(metadata.existing_resident_credentials_count, 0);
+
+        let invalid = cred_mgmt::CredentialManagementRequest {
+            pin_uv_auth_param: Some(vec![0u8; 32]),
+            ..request
+        };
+        assert_eq!(
+            authenticator
+                .process_command(0x0A, encode_cbor(&invalid).unwrap())
+                .unwrap_err(),
+            Ctap2Error::PinAuthInvalid
+        );
     }
 
     #[test]
@@ -3697,6 +4321,7 @@ mod tests {
                 up: false,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };

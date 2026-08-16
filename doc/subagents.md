@@ -43,7 +43,7 @@ distribuindo contexto mínimo e coletando outputs estruturados.
 | Característica       | Detalhe                                         |
 |----------------------|-------------------------------------------------|
 | **Uso**              | Localizar definições, mapear dependências       |
-| **Contexto recebido**| Paths relevantes + pergunta específica          |
+| **Contexto recebido**| Issue + especificação/ADR/paths relevantes      |
 | **Ferramentas**      | Glob, Grep, Read, Task                          |
 | **Output esperado**  | `path/arquivo.rs:linha` + resumo                |
 | **Restrições**       | Não modificar código, não commitar              |
@@ -55,37 +55,47 @@ distribuindo contexto mínimo e coletando outputs estruturados.
 | Característica       | Detalhe                                         |
 |----------------------|-------------------------------------------------|
 | **Uso**              | Implementar incrementos, escrever código        |
-| **Contexto recebido**| TODO.md (seção) + paths + convenções            |
+| **Contexto recebido**| Issue + TODO.md (seção) + spec/ADR/paths        |
 | **Ferramentas**      | Write, Edit, Bash, Read                         |
 | **Output esperado**  | Código + testes passando + resumo               |
 | **Restrições**       | Seguir ADRs, não commitar sem permissão         |
+
+### 2.3 `defect-cycle` — Ciclo de Defeito (ADR-0019)
+
+**Finalidade:** Levar um bug, regressão ou falha de conformidade da detecção à
+reprodução, correção mínima e validação ponta a ponta.
+
+| Característica       | Detalhe                                         |
+|----------------------|-------------------------------------------------|
+| **Uso**              | Falha confirmada que exige código + regressão   |
+| **Contexto recebido**| Issue + spec/ADR/paths/testes relevantes        |
+| **Output esperado**  | Status + evidência das quatro fases             |
+| **Restrições**       | Não commitar, fazer push, resetar ou descartar  |
+
+O agente deve retornar `fixed`, `not_reproduced`, `blocked`, `no_fix_needed` ou
+`partially_fixed`. O status `fixed` exige um reproducer que falhava antes e a
+mesma validação passando depois da correção. A configuração completa está em
+`.opencode/agents/defect-cycle.md`.
+A decisão arquitetural está registrada em
+`docs/adr/ADR-0019-subagent-ciclo-defeitos-ponta-a-ponta.md`.
 
 ---
 
 ## 3. Estratégia de Carregamento de Contexto
 
-```
-Agente Principal carrega contexto em 4 camadas:
+O agente principal segue a rota canônica definida em [`AGENTS.md`](../AGENTS.md)
+e no [`ADR-0018`](../docs/adr/ADR-0018-roteamento-progressivo-contexto.md):
 
-┌─────────────────────────────────────┐
-│ Camada 1: AGENTS.md                 │ ◄── sempre carregado
-│ - Guia de workflow                  │
-│ - Mapeamento de crates              │
-├─────────────────────────────────────┤
-│ Camada 2: TODO.md (seção)           │ ◄── apenas itens relevantes
-│ - Incremento alvo                   │
-│ - Dependências                      │
-├─────────────────────────────────────┤
-│ Camada 3: Código específico         │ ◄── paths identificados
-│ - Arquivos a modificar              │
-├─────────────────────────────────────┤
-│ Camada 4: ADRs relevantes           │ ◄── apenas quando necessário
-│ - Decisões de design                │
-└─────────────────────────────────────┘
-
-Regra: Não carregue camada N+1 se camada N
-contém informação suficiente para a tarefa.
+```text
+Issue → AGENTS.md → especificação relevante → ADR relevante →
+arquivos fonte relevantes → skill relevante
 ```
+
+O item relacionado do `TODO.md` é consultado durante a identificação do Issue,
+sem carregar o arquivo inteiro. Cada etapa carrega somente seções e paths
+necessários. A busca pode localizar arquivos fonte antes da leitura, mas os
+requisitos da especificação e as decisões dos ADRs orientam a interpretação do
+código.
 
 ---
 
@@ -176,7 +186,7 @@ sequenceDiagram
 TASK: Implementar `getPINRetries` no módulo client_pin
 
 CONTEXT:
-- AGENTS.md:155-162 — Como criar um ADR
+- AGENTS.md:193-199 — Como criar um ADR
 - TODO.md:92 — Critério: teste unitário `test_get_pin_retries` passando
 - protocol/ctap2/src/client_pin.rs — trait ClientPin já definida
 - firmware/storage/src/storage.rs:12-20 — StorageEngine interface
@@ -249,9 +259,11 @@ Quando falhar após 2 re-prompts:
 ## 7. Referências Externas
 
 - **ADR-0005:** `docs/adr/ADR-0005-isolamento-contexto-agentes.md`
+- **ADR-0018:** `docs/adr/ADR-0018-roteamento-progressivo-contexto.md`
 - **AGENTS.md:** Guide de workflow do agente
 - **TODO.md:** Fonte de incrementos com dependências
-- **Criar novo ADR:** `AGENTS.md:155-162`
+- **Skills:** `.opencode/skills/` — contexto operacional específico por tarefa
+- **Criar novo ADR:** `AGENTS.md:193-199`
 
 ```
 ┌─────────────────┐         ┌──────────────────┐
@@ -269,5 +281,5 @@ Quando falhar após 2 re-prompts:
 
 ---
 
-*Documento criado em 2026-08-09 baseado no ADR-0007 e padrões estabelecidos em AGENTS.md:*
-*49-70.*
+*Documento criado em 2026-08-09 baseado no ADR-0007, atualizado para a rota do
+ADR-0018 e os padrões estabelecidos em AGENTS.md.*

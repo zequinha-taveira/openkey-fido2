@@ -9,8 +9,9 @@ próprios que não devem afetar `cargo build --workspace`.
 
 ## Pré-requisitos
 
-`libFuzzer` exige toolchain nightly e um alvo Unix (Linux/macOS). No Windows,
-use WSL ou o CI.
+`libFuzzer` exige toolchain nightly, `cargo-fuzz` e um alvo Unix
+(Linux/macOS). No Windows, use WSL ou o CI. A presença dos alvos abaixo só
+garante que eles compilam; nenhuma execução é implícita.
 
 ```bash
 rustup toolchain install nightly
@@ -43,6 +44,8 @@ cd fuzz && cargo +nightly fuzz run decode_cbor
 | Alvo | O que exercita |
 |------|----------------|
 | `decode_cbor` | `ctap2::decode_cbor` para `MakeCredentialRequest`, `GetAssertionRequest`, `ClientPinRequest`, `BioEnrollRequest` e `ciborium::value::Value` (inclui roundtrip encode/decode). |
+| `ctap2_dispatch` | Despacho de comandos CTAP2 com payloads arbitrários em um autenticador novo. |
+| `ctaphid_framing` | Decodificação e remontagem de sequências de pacotes CTAPHID de 64 bytes. |
 
 O alvo verifica duas propriedades:
 

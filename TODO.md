@@ -14,6 +14,7 @@ completos; itens com 🚧 estão em progresso; itens com ❌ são incrementos fu
 - ✅ Suporte a allow_list e exclude_list
 - ✅ Rejeição de allow_list de RP incorreto (anti-hijacking)
 - ✅ Rejeição de algoritmo não suportado
+- ✅ Rejeição de payload CBOR com bytes residuais após o item completo
 - ✅ **Extensão LargeBlobs (CTAP 2.1 §6.10, Opcode 0x0C)**: leitura e escrita fragmentada com storage seguro de 4096B
 - ✅ **Extensão `largeBlobKey`**: geração de chave simétrica de 32B por credencial e retorno no MakeCredential/GetAssertion
 - ✅ **Credential Management (CTAP 2.1 §6.8, Opcode 0x0A)**: `getCredsMetadata`, `enumerateRPs`, `enumerateCredentials`, `updateUserInformation`, `deleteCredential`
@@ -96,16 +97,24 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 #### ClientPIN (CTAP2 0x06)
 
 - ✅ **Definir módulo `client_pin.rs` em `protocol/ctap2/src/`** — Criar structs: `ClientPinRequest` (subCommand, pinProtocol, keyAgreement, pinAuth, newPinEnc, pinHashEnc), `ClientPinResponse` (keyAgreement, pinUvAuthToken, retries, powerCycleState). Crate: `ctap2`. Critério: módulo compila com `cargo build -p ctap2`.
-- ✅ **Implementar trait `ClientPin` em `protocol/ctap2/src/client_pin.rs`** — Definir trait com métodos: `get_pin_retries()`, `get_pin_token()`, `set_pin()`, `change_pin()`, `get_pin_hash_enc()`. Crate: `ctap2`. Critério: trait definida e compilável.
-- ✅ **Implementar `getPINRetries` (subCommand 0x03)** — Retornar contador de tentativas atuais (iniciar em 8). Crate: `ctap2`, `storage`. Critério: teste unitário `test_get_pin_retries` passando.
-- ✅ **Implementar `setPIN` (subCommand 0x01)** — Validar comprimento mínimo (4 bytes), criptografar PIN com SHA-256, armazenar hash no storage. Crate: `ctap2`, `storage`, `crypto`. Critério: teste unitário `test_set_pin` passando, rejeitar PIN < 4 chars.
-- ✅ **Implementar `changePIN` (subCommand 0x02)** — Verificar PIN atual via hash, validar novo PIN, atualizar hash. Crate: `ctap2`, `storage`, `crypto`. Critério: teste unitário `test_change_pin` passando, rejeitar PIN atual errado.
-- ✅ **Implementar `getPINToken` (subCommand 0x05)** — Derivar token via HMAC-SHA256(key=platformKey, data=pinHash), criptografar token com ChaCha20-Poly1305. Crate: `ctap2`, `crypto`. ⬅️ depende de `setPIN`. Critério: teste unitário `test_get_pin_token` passando.
-- ✅ **Implementar `getPINHashEnc` (subCommand 0x06)** — Retornar hash do PIN criptografado com keyAgreement. Crate: `ctap2`, `crypto`. ⬅️ depende de `setPIN`. Critério: teste unitário `test_get_pin_hash_enc` passando.
-- ✅ **Adicionar `pinUvAuthProtocol` negotiation** — Suportar protocolos 1 e 2, retornar versão no response. Crate: `ctap2`. Critério: teste unitário `test_pin_protocol_negotiation` passando.
-- ✅ **Implementar PIN retry counter decrement/increment** — Decrementar em tentativa falha, reset em sucesso, bloquear após 3 falhas consecutivas (powerCycleState=true). Crate: `ctap2`, `storage`. ⬅️ depende de `getPINRetries`. Critério: teste unitário `test_pin_retry_counter` passando.
-- ✅ **Adicionar handler `ClientPIN` no `process_command`** — Mapear subCommands para métodos do trait. Crate: `ctap2`. ⬅️ depende de todos os subitens acima. Critério: `cargo test -p ctap2 -- client_pin` passando.
-- ✅ **Testes E2E Python: `tests/python/test_client_pin.py`** — Testar fluxo completo: setPIN → getPINRetries → getPINToken → changePIN. Crate: `tests`. ⬅️ depende do handler. Critério: `pytest tests/python/test_client_pin.py -v` passando.
+- ✅ **Implementar trait `ClientPin` em `protocol/ctap2/src/client_pin.rs`** — Definir trait com métodos: `get_pin_retries()`, `set_pin()`, `change_pin()`, `verify_pin()`. Crate: `ctap2`. Critério: trait definida e compilável.
+- ✅ **Implementar `getPINRetries` (subCommand 0x01)** — Retornar contador de tentativas atual (iniciar em 8). Crate: `ctap2`, `storage`. Critério: teste unitário `test_get_pin_retries` passando.
+- ✅ **Implementar `setPIN` (subCommand 0x03)** — Validar comprimento mínimo (4 bytes), armazenar `LEFT(SHA-256(pin), 16)` no storage. Crate: `ctap2`, `storage`, `crypto`. Critério: teste unitário `test_set_pin` passando, rejeitar PIN < 4 chars.
+- ✅ **Implementar `changePIN` (subCommand 0x04)** — Verificar PIN atual via hash, validar novo PIN, atualizar hash. Crate: `ctap2`, `storage`, `crypto`. Critério: teste unitário `test_change_pin` passando, rejeitar PIN atual errado.
+- ✅ **Migrar `getPINToken` (subCommand 0x05) para CTAP2** — P-256 ECDH, AES-256-CBC e HMAC conforme CTAP 2.1 §6.5.5.7.1; pinHashEnc decifrado e comparado em tempo constante; decremento de retries antes da verificação.
+- ✅ **Substituir `getPINHashEnc` legado** — O subcomando não existe em CTAP 2.1; o fluxo é coberto por `getPinUvAuthTokenUsingPinWithPermissions` (0x09).
+- ✅ **Implementar `getKeyAgreement` (subCommand 0x02)** — Par P-256 efêmero via `ring::agreement::ECDH_P256`, retorno de COSE_Key `{1:2, 3:-25, -1:1, -2:x, -3:y}`; chave privada mantida na sessão e consumida no subcomando seguinte (nunca reutilizada entre transações).
+- ✅ **Negociar `pinUvAuthProtocol` conforme CTAP2** — Protocolos 1 e 2 em `crypto::pin_protocol` (KDF SHA-256/HKDF, AES-256-CBC, HMAC-SHA-256 truncado/completo), migração registrada em `docs/adr/ADR-0017-clientpin-ctap2-wire-format.md`.
+- ✅ **Implementar `getPinUvAuthTokenUsingPinWithPermissions` (subCommand 0x09)** — permissions/rpId, validação de permissões contra GetInfo (`UNAUTHORIZED_PERMISSION 0x40`), token de 32 bytes cifrado por subcomando.
+- ✅ **Implementar `getPinUvAuthTokenUsingUvWithPermissions` (subCommand 0x06)** — Sem built-in UV, retorna `UV_BLOCKED` (0x3C).
+- ✅ **Implementar PIN retry counter decrement/increment** — Decrementar em tentativa falha, reset em sucesso, bloquear após 3 falhas consecutivas (powerCycleState=true, `PIN_AUTH_BLOCKED`). Crate: `ctap2`, `storage`. Critério: testes unitários de retry passando.
+- ✅ **Adicionar handler `ClientPIN` no `process_command`** — Codec próprio de array/mapa CBOR (chaves inteiras 0x01..0x0A) e response em mapa canônico 0x01..0x05. Critério: `cargo test -p ctap2 -- client_pin` passando.
+- ✅ **Erros CTAP2 de PIN no `Ctap2Error`** — `PinInvalid` 0x31, `PinBlocked` 0x32, `PinAuthInvalid` 0x33, `PinAuthBlocked` 0x34, `PinNotSet` 0x35, `PinRequired` 0x36, `PinPolicyViolation` 0x37, `PinTokenExpired` 0x38, `UvBlocked` 0x3C, `UnauthorizedPermission` 0x40, `MissingParameter` 0x14.
+- ✅ **GetInfo com `pinUvAuthProtocols` [1, 2] e options `clientPin`/`pinUvAuthToken`** — `uv` permanece ausente; `clientPin` anunciado como suporte da feature (exigido pelo python-fido2 para enviar setPIN).
+- ✅ **Testes E2E Python: `tests/python/conformance/test_client_pin.py`** — Fluxo completo com `fido2.ctap2.pin.ClientPin` (python-fido2 2.2.1) nos protocolos 1 e 2: setPIN → getPINRetries → getPINToken → changePIN → getPINToken+permissions, com códigos de erro da spec. Critério: `pytest tests/python/conformance/test_client_pin.py -v` passando (15 testes).
+- ✅ **Wiring do `pinUvAuthParam` em MakeCredential/GetAssertion/CredentialManagement** — Requests carregam o campo CTAP2.1; MakeCredential/GetAssertion validam MAC sobre `clientDataHash`, permissões e binding de RP; Credential Management valida MAC sobre `subCommand || subCommandParams`. Cobertura Rust e E2E Python adicionada.
+- ✅ **`firmwareVersion` do GetInfo como inteiro (CTAP 2.1 §6.4)** — Mapeamento determinístico do semver do perfil documentado no ADR-0020; wire e consumidores Python validam tipo e valor.
+- 🚧 **Built-in UV (`uv` option e `getUVRetries` 0x07)** — Depende de hardware de verificação de usuário embutida; hoje `getUVRetries` retorna `UnsupportedOption`.
 
 #### Extensões WebAuthn
 
@@ -124,7 +133,7 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Adicionar trait `StorageBackend` em `firmware/storage/src/storage.rs`** — Definir trait com métodos: `read(key) -> Vec<u8>`, `write(key, value) -> Result`, `delete(key) -> Result`. Crate: `storage`. Critério: trait definida e compilável.
 - ✅ **Implementar `FileStorageBackend` em `firmware/storage/src/storage.rs`** — Backend usando arquivo JSON local para desenvolvimento. Crate: `storage`. Critério: teste unitário `test_file_storage` passando.
 - ✅ **Adicionar `StorageEngine::with_backend(backend: Box<dyn StorageBackend>)`** — Permitir injeção de backend customizado. Crate: `storage`. ⬅️ depende de `StorageBackend`. Critério: `StorageEngine` aceita backend customizado.
-- ✅ **Implementar `FlashStorageBackend` stub em `firmware/storage/src/storage.rs`** — Backend placeholder para flash embedded (no_std compatível). Crate: `storage`. Critério: compila com `no_std`.
+- ✅ **Implementar backend de flash simulado em `firmware/storage/src/storage.rs`** — `FlashDevice`, `SimulatedFlash` e `FlashStorageBackend` modelam erase/program, commits em dois slots e recuperação de power-loss. Adaptadores físicos por board permanecem pendentes; ver `docs/adr/ADR-0016-flash-simulada-e-gates-de-release.md`.
 - ✅ **Adicionar wear leveling básico em `firmware/storage/src/storage.rs`** — Implementar contador de writes por setor, rotacionar quando threshold atingido. Crate: `storage`. ⬅️ depende de `FlashStorageBackend`. Critério: teste unitário `test_wear_leveling` passando.
 - ✅ **Implementar credential pruning em `firmware/storage/src/storage.rs`** — Remover credenciais mais antigas quando `max_credential_count` atingido (LRU). Crate: `storage`. Critério: teste unitário `test_credential_pruning` passando, respeitar `max_credential_count`.
 - ✅ **Adicionar `created_at` timestamp real em `Credential`** — Usar `embedded-hal` timer ou timestamp do sistema. Crate: `storage`. Critério: credenciais têm timestamp válido.
@@ -145,10 +154,10 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 #### Transportes
 
 - ✅ **Definir trait `Transport` em novo crate `firmware/transport/`** — Métodos: `init()`, `send(data)`, `recv() -> Vec<u8>`, `close()`. Trait object-safe (`Box<dyn Transport>`), erros via `TransportError` (`thiserror`). Inclui `DummyTransport` no-op para testes. Crate: `transport`. Critério: trait definida e compilável.
-- ✅ **Implementar `UsbHidTransport` stub em `firmware/transport/src/usb_hid.rs`** — Placeholder para implementação USB-HID com `usb-device` crate. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
-- ✅ **Implementar `UsbCcidTransport` stub em `firmware/transport/src/usb_ccid.rs`** — Placeholder para implementação CCID. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
-- ✅ **Implementar `NfcTransport` stub em `firmware/transport/src/nfc.rs`** — Placeholder para implementação NFC ISO 14443. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
-- ✅ **Implementar `BleGattTransport` stub em `firmware/transport/src/ble_gatt.rs`** — Placeholder para implementação BLE GATT server. Crate: `transport`. Critério: compila, retorna `Unimplemented`.
+- ✅ **Integrar `UsbHidTransport` por injeção host-verificável** — `EmbeddedAuthenticator::new_with_profile_and_transport` aceita `Box<dyn Transport>` e mantém o ciclo de vida explícito; composição, erros e framing multipartido são testados com mocks no host. Drivers/periféricos concretos de board e validação física permanecem pendentes.
+- 🚧 **Integrar `UsbCcidTransport`** — parcela host-verificável concluída: `FramedCcidTransport` pode ser injetado no `EmbeddedAuthenticator`, inicializado explicitamente e exercitado com APDU e propagação de erros em mock; falta ligar um driver USB-CCID concreto de board e validar em hardware.
+- 🚧 **Implementar `NfcTransport` em `firmware/transport/src/nfc.rs`** — O tipo atual ainda é um stub; falta integrar frontend NFC ISO 14443 e o stack de hardware. Crate: `transport`.
+- 🚧 **Implementar `BleGattTransport` em `firmware/transport/src/ble_gatt.rs`** — O tipo atual ainda é um stub; falta integrar um servidor BLE GATT e stack Bluetooth. Crate: `transport`.
 - ✅ **Adicionar `TransportConfig` em `firmware/device-profile/src/profile.rs`** — `TransportType` com `UsbHid`, `UsbCcid`, `Nfc`, `BleGatt` e atalhos `TransportConfig::usb_hid()/usb_ccid()/nfc()/ble_gatt()`. Crate: `device-profile`. Critério: `DeviceProfileBuilder::transport_config()` aceita config.
 - ✅ **Integrar transport no `EmbeddedAuthenticator`** — `init_transport` instancia o stub conforme `profile.transport_config`; acessores `transport()` / `transport_mut()`. Crate: `authenticator`. Critério: `EmbeddedAuthenticator` usa transport configurado.
 - ✅ **Testes unitários dos stubs de transporte** — 19 testes em `firmware/transport/src/` (ciclo de vida, `NotInitialized` antes de `init`, `Unimplemented` em I/O, object safety). Crate: `transport`. Critério: `cargo test -p transport` passando.
@@ -227,8 +236,8 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Configuração de Toolchain e Cargo Config (`.cargo/config.toml`)** — Configuração de flags de link e aliases de compilação cruzada (`check-rp2350`, `check-nrf52840`, `check-stm32l4`, `build-rp2350`, `build-nrf52840`, `build-stm32l4`). Crate: N/A. Critério: `.cargo/config.toml` criado e aliases funcionais.
 - ✅ **Compatibilidade `no_std` em `firmware/transport`** — Ajustar `transport` com `#![cfg_attr(not(feature = "std"), no_std)]`, `extern crate alloc`, imports de `Vec`, `String`, `ToString` e features condicionais. Crate: `transport`. Critério: `cargo check -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features` e `--target thumbv7em-none-eabihf` compilando com 0 erros.
 - ✅ **Atualizar `BUILD.md` e `justfile` com comandos de compilação cruzada** — Adicionar alvos `build-rp2350`, `build-nrf52840`, `build-stm32l4` e `check-targets`. Crate: N/A. Critério: `just check-targets` executando com sucesso.
-- ✅ **Aplicação bare-metal de boot para RP2350 (`examples/rp2350-firmware`)** — Projeto de firmware executável com inicialização de clock real via `rp235x-hal` (XOSC + PLLs), heap allocator (`embedded-alloc`), vetor de interrupção (`cortex-m-rt` + `hal::entry`) e loop de despacho CTAPHID sobre o crate `transport`. Crate: novo `examples/rp2350-firmware` (standalone, workspace próprio). ⬅️ depende de `transport no_std`. Critério: compilação de binário `.elf` para `thumbv8m.main-none-eabihf`.
-- ✅ **Aplicação bare-metal de boot para nRF52840 (`examples/nrf52840-firmware`)** — Firmware executável para Nordic nRF52840 com clocks reais via `nrf52840-hal` (HFCLK externo), heap (`embedded-alloc`), vetor de interrupção (`cortex-m-rt`) e loop de despacho CTAPHID (referência `Nrf52840UsbHid`/`Nrf52840Nfc`). Crate: novo `examples/nrf52840-firmware` (standalone, workspace próprio). ⬅️ depende de `transport no_std`. Critério: compilação de binário `.elf` para `thumbv7em-none-eabihf`.
+- ✅ **Aplicação bare-metal de boot para RP2350 (`examples/rp2350-firmware`)** — Build cruzado reproduzível até ELF com `cargo build -p rp2350-firmware` a partir de `examples/rp2350-firmware/`; `memory.x` mantém `.start_block`/`.bi_entries` e o `link.x` do `cortex-m-rt` resolve os símbolos de runtime exigidos por `rp_binary_info`. Não há validação física.
+- ✅ **Aplicação bare-metal de boot para nRF52840 (`examples/nrf52840-firmware`)** — A partir de `examples/nrf52840-firmware/`, `cargo check --locked --target thumbv7em-none-eabihf` e `cargo build --locked --target thumbv7em-none-eabihf` concluem sem o warning de `_start` nem erros de símbolos de runtime, gerando ELF em `target/thumbv7em-none-eabihf/debug/nrf52840-firmware`. Isso cobre somente compilação/link; probe-rs, USB/clocks em placa e validação física permanecem abertos.
 - ✅ **Integração com driver USB real via `usb-device` para RP2350 (`rp2350-usb`)** — Backend concreto de `UsbHidDevice` sobre `usb-device::bus::UsbBusAllocator` (módulo `transport::embedded::usb_hid_backend`: `CtapHidClass` com report descriptor FIDO `0xF1D0` + `UsbHidBackend`), integrado ao `rp2350-firmware`. Crate: `transport`. ⬅️ depende de `examples/rp2350-firmware`. Critério: envio e recebimento de pacotes CTAPHID de 64 bytes em hardware (verificado em host via `MockUsbBus`).
 
 #### Conformance Testing & Raw CBOR Tooling
@@ -236,7 +245,7 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Criar ADR-0012: Suporte a Conformance Testing FIDO2 e Interface Raw CBOR** — Documentar modo `--raw-cbor` no simulador e suíte de testes de conformidade. Crate: N/A. Critério: `docs/adr/ADR-0012-fido-conformance-e-raw-cbor-interface.md` criado.
 - ✅ **Implementar modo `--raw-cbor` no `fido2-simulator`** — Suporte a framing binário length-prefixed no stdin/stdout para despacho direto de comandos CTAP2 sem parsing JSON. Crate: `simulator`. Critério: `cargo build -p fido2-simulator` compila e executa.
 - ✅ **Criar transporte `SimulatorClient` em Python (`tests/python/conformance/ctap2_transport.py`)** — Ponte binária Python para comunicação bidirecional com o simulador em modo `--raw-cbor`. Crate: `tests`. Critério: módulo funcional.
-- ✅ **Implementar suíte de testes de conformidade CTAP 2.1 (`tests/python/conformance/`)** — 11 testes automatizados cobrindo GetInfo, MakeCredential, GetAssertion, ClientPIN, CredentialManagement, LargeBlobs e Reset. Crate: `tests`. Critério: `pytest tests/python/conformance/ -v` passando com 100% de sucesso.
+- ✅ **Implementar suíte de testes de conformidade CTAP 2.1 (`tests/python/conformance/`)** — 12 testes automatizados cobrindo GetInfo, MakeCredential, GetAssertion, ClientPIN, CredentialManagement, LargeBlobs e Reset. Crate: `tests`. Critério: `pytest tests/python/conformance/ -v` passando com 100% de sucesso.
 - ✅ **Implementar Virtual CTAPHID Bridge (`tools/ctaphid_bridge.py`)** — Ponte USB-HID virtual (UHID no Linux) conectando o simulador `--raw-cbor` ao OS para uso direto com ferramentas oficiais da FIDO Alliance. Framing CTAPHID + wrapping CBOR testados em host (`tests/python/test_ctaphid_bridge.py`, 14 testes). Crate: `tools`. ⬅️ depende de `fido2-simulator --raw-cbor`. Critério: detecção do dispositivo virtual pelo browser e pelo FIDO Conformance Tool (requer Linux/UHID).
 
 ---
@@ -249,4 +258,18 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - Ao completar um item, mova de ❌ para ✅ com PR reference quando aplicável
 - Itens marcados com ⬅️ depende de X devem ser implementados após X
 - Quick wins podem ser iniciados imediatamente sem dependências
+
+## Verificação de Segurança e Release (2026-08-14)
+
+- ✅ `AttestationCertificate.private_key` usa `zeroize` no drop em `protocol/ctap2/src/attestation.rs`.
+- ✅ API genérica de criptografia com nonce aleatório e teste de unicidade/round trip em `protocol/crypto/src/crypto.rs`.
+- ✅ Alvos buildáveis `ctap2_dispatch` e `ctaphid_framing` adicionados ao fuzzing; `cargo-fuzz` instalado.
+- 🚧 Execução do fuzzing no Windows bloqueada: ASan não suporta o alvo GNU e o alvo MSVC exige `link.exe` (Visual C++ Build Tools).
+- ✅ `CHANGELOG.md` criado; o workspace está em `0.1.1`, sem release publicado durante esta preparação.
+- ✅ Workflow de release publica `SHA256SUMS`; nenhuma chave ou assinatura foi criada.
+- ✅ **ClientPIN CTAP2.1 interoperável** — Handler substituído (array/mapa CBOR com chaves inteiras, subcomandos da spec, P-256 ECDH + AES-256-CBC + HKDF/HMAC, erros CTAP2), validado por E2E com `fido2.ctap2.pin.ClientPin` (python-fido2 2.2.1) nos protocolos 1 e 2. Detalhes e desvios em `docs/adr/ADR-0017-clientpin-ctap2-wire-format.md`.
+- ✅ `FlashStorageBackend` simulado implementa semântica testável de erase/program e recuperação. Isso não prova atomicidade de energia da flash real; ver `docs/adr/ADR-0016-flash-simulada-e-gates-de-release.md`.
+- 🚧 Assinatura criptográfica de artefatos está configurada no workflow, mas permanece bloqueada neste ambiente até secrets protegidos serem fornecidos; checksums não são assinatura.
+- 🚧 Probe-rs, validação física em RP2350/nRF52840/STM32L4 e execução do FIDO Conformance Tool dependem de ferramentas/placas externas e não foram alegados como executados.
+- 🚧 A página oficial da FIDO confirma que o FIDO2 Conformance Test Tool requer registro/acesso de participante; nenhuma ferramenta oficial local foi encontrada ou executada.
 

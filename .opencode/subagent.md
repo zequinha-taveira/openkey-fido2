@@ -20,6 +20,7 @@ It is organized as a Cargo workspace with separate crates for each protocol laye
 | `docs/adr/` | Architecture Decision Records (see ADR list below) |
 | `docs/architecture.md` | Module contracts and request flows |
 | `.opencode/subagent.md` | This file (subagent config) |
+| `.opencode/skills/` | Task-specific operational context |
 
 ## Workspace Structure
 
@@ -33,11 +34,7 @@ openkey-fido2/
 ├── docs/
 │   ├── adr/                      # Architecture Decision Records
 │   │   ├── ADR-0000-template.md
-│   │   ├── ADR-0001-ring-para-criptografia.md
-│   │   ├── ADR-0002-simulador-json-line-protocol.md
-│   │   ├── ADR-0003-arquitetura-em-camadas.md
-│   │   ├── ADR-0004-std-vs-no-std.md
-│   │   └── ADR-0005-isolamento-contexto-agentes.md
+│   │   └── ADR-*.md                # Decisions affecting implementation
 │   └── architecture.md           # Module contracts & flows
 ├── firmware/
 │   ├── authenticator/            # Core authenticator logic (API final)
@@ -81,6 +78,7 @@ authenticator
 3. **Layered architecture** (ADR-0003): Unidirectional dependencies, each layer testable in isolation
 4. **std/no_std stratification** (ADR-0004): Core uses `alloc` only, simulator/tests use `std`
 5. **context isolation** (ADR-0005): Subagents receive only task-relevant context, no shared memory state
+6. **progressive context routing** (ADR-0018): Load issue, specification, ADR, source, and skill context in order
 
 ## Context Isolation (ADR-0005)
 
@@ -108,6 +106,18 @@ authenticator
 - Arquivos do repositório (`TODO.md`, `AGENTS.md`, ADRs) como fonte de verdade
 - Mensagens estruturadas de retorno como contratos entre agentes
 
+## Context Routing (ADR-0018)
+
+Follow the canonical route in `AGENTS.md`:
+
+```text
+Issue → AGENTS.md → relevant specification → relevant ADR →
+relevant source files → relevant skill
+```
+
+Load only the sections and files relevant to the current task. This file
+defines subagent configuration and does not replace the canonical workflow.
+
 ## Subagent Responsibilities
 
 - Implement CTAP2 protocol state machine
@@ -118,12 +128,20 @@ authenticator
 - Write integration tests for protocol layers
 - Maintain architecture documentation in sync with code
 
+### Specialized Agents
+
+- `real-code-quality` — audit-only review of bugs, security risks, regressions,
+  and missing tests; it does not modify files.
+- `defect-cycle` (ADR-0019) — execute the complete detection → reproduction →
+  correction → validation cycle for a confirmed defect or conformance failure.
+
 ## Workflow Rules
 
 1. Read `AGENTS.md` before starting any non-trivial task
-2. Check `TODO.md` for existing task mapping
-3. Plan with small, verifiable steps before implementing
-4. Update `TODO.md` when completing increments
-5. Create ADRs for significant design decisions
-6. Run `just ci` (or equivalent) before considering work done
-7. Apply context isolation per ADR-0005 when delegating to subagents
+2. Identify the Issue and consult only the related `TODO.md` section
+3. Load relevant specification, ADR, source files, and skill in the `AGENTS.md` order
+4. Plan with small, verifiable steps before implementing
+5. Update `TODO.md` when completing increments
+6. Create ADRs for significant design decisions
+7. Run `just ci` (or equivalent) before considering work done
+8. Apply context isolation per ADR-0005 when delegating to subagents

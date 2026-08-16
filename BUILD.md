@@ -129,14 +129,27 @@ Há um binário equivalente para o **nRF52840** (Nordic, Cortex-M4F) em
 
 ```bash
 # Gerar o binário ELF para o nRF52840 (Cortex-M4F)
-cd examples/nrf52840-firmware && cargo build
+cd examples/nrf52840-firmware
+cargo build --locked --target thumbv7em-none-eabihf
 
-# Via just
+# Verificar o crate sem gerar o firmware
+cargo check --locked --target thumbv7em-none-eabihf
+```
+
+```bash
+# Via just, a partir da raiz do repositório
 just build-nrf52840-firmware
 ```
 
 Configura clocks reais via `nrf52840-hal` (HFCLK externo), heap
 `embedded-alloc` e o loop CTAPHID (referência `Nrf52840UsbHid`/`Nrf52840Nfc`).
+O artefato ELF fica em
+`examples/nrf52840-firmware/target/thumbv7em-none-eabihf/debug/nrf52840-firmware`.
+Esses comandos verificam compilação e link; probe-rs e validação em placa física
+continuam pendentes.
+Execute o build no diretório do exemplo para carregar seu `.cargo/config.toml`,
+que fornece `link.x`; passar apenas `--manifest-path` a partir da raiz não
+carrega essa configuração e reproduz o warning de `_start` ausente.
 
 #### Virtual CTAPHID Bridge (Linux/UHID)
 

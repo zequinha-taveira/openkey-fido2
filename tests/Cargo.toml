@@ -1,6 +1,6 @@
 [package]
 name = "test-suite"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Integration tests for openkey-fido2 protocols"
 license = "MIT"

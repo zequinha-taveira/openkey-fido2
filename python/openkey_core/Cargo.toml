@@ -1,6 +1,6 @@
 [package]
 name = "openkey-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Extensão Python (pyo3) expondo o núcleo Rust FIDO2 como VirtualAuthenticator"
 license = "MIT"

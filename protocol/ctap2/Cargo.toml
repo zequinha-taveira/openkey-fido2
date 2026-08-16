@@ -1,6 +1,6 @@
 [package]
 name = "ctap2"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "CTAP2 protocol implementation for FIDO2 authenticators"
 license = "MIT"
@@ -14,3 +14,4 @@ serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 ciborium = "0.2"
 ring = "0.17"
+zeroize = { workspace = true }

@@ -39,6 +39,7 @@ fn make_request(user_id: &[u8]) -> MakeCredentialRequest {
             up: true,
             extended: false,
         },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         enterprise_protections: None,
     }
@@ -70,6 +71,7 @@ fn make_request_es256(user_id: &[u8]) -> MakeCredentialRequest {
             up: true,
             extended: false,
         },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         enterprise_protections: None,
     }
@@ -92,6 +94,7 @@ fn make_assert_request(
         client_data_hash: authenticator.get_crypto().sha256(b"client data hash"),
         extensions: None,
         options: GetAssertionOptions { up: true, uv: true },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         uv: Some(true),
     }
@@ -184,6 +187,7 @@ fn test_ctap2_make_credential_stores_credential() {
             up: true,
             extended: false,
         },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         enterprise_protections: None,
     };
@@ -224,6 +228,7 @@ fn test_ctap2_get_assertion_signs_data() {
             up: true,
             extended: false,
         },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         enterprise_protections: None,
     };
@@ -247,6 +252,7 @@ fn test_ctap2_get_assertion_signs_data() {
         client_data_hash: client_data_hash_clone,
         extensions: None,
         options: GetAssertionOptions { up: true, uv: true },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         uv: Some(true),
     };
@@ -281,6 +287,7 @@ fn test_ctap2_get_info() {
     assert_eq!(info.aaguid, vec![0u8; 16]);
     assert!(info.options.contains(&"rk".to_string()));
     assert!(info.options.contains(&"up".to_string()));
+    assert_eq!(info.firmware_version, 1_000);
 }
 
 #[test]
@@ -346,6 +353,7 @@ fn test_ctap2_process_command_make_credential() {
             up: true,
             extended: false,
         },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         enterprise_protections: None,
     };
@@ -368,6 +376,18 @@ fn test_ctap2_process_command_get_info() {
     let result = authenticator.process_command(0x04, vec![]);
     assert!(result.is_ok());
     let response_data = result.unwrap();
+    let wire: ciborium::Value = ciborium::de::from_reader(response_data.as_slice()).unwrap();
+    let firmware_version = match wire {
+        ciborium::Value::Map(entries) => entries.into_iter().find_map(|(key, value)| match key {
+            ciborium::Value::Integer(number) if number == 0x0E.into() => Some(value),
+            _ => None,
+        }),
+        _ => None,
+    };
+    assert_eq!(
+        firmware_version,
+        Some(ciborium::Value::Integer(1_000.into()))
+    );
     let response: ctap2::GetInfoResponse = ctap2::decode_cbor(&response_data).unwrap();
     assert!(response.versions.contains(&"2.0".to_string()));
 }
@@ -669,7 +689,7 @@ fn test_embedded_authenticator_capabilities_drive_get_info() {
     assert!(caps.client_pin_available);
 
     let info = authenticator.get_info().unwrap();
-    assert_eq!(info.firmware_version, "3.1.0");
+    assert_eq!(info.firmware_version, 3_001_000);
     assert!(info.options.contains(&"rk".to_string()));
     assert!(info.options.contains(&"clientPin".to_string()));
     assert_eq!(info.max_credential_id_length, 128);
@@ -980,18 +1000,19 @@ fn test_file_storage_backend_persistence() {
 }
 
 #[test]
-fn test_flash_storage_backend_stub() {
-    use storage::{FlashStorageBackend, StorageBackend};
+fn test_flash_storage_backend_power_loss_recovery() {
+    use storage::{FlashStorageBackend, SimulatedFlash, StorageBackend};
 
-    let mut backend = FlashStorageBackend::new();
-    let result = backend.read("any_key");
-    assert!(result.is_err());
-
-    let result = backend.write("any_key", b"value");
-    assert!(result.is_err());
-
-    let result = backend.delete("any_key");
-    assert!(result.is_err());
+    let mut flash = SimulatedFlash::new(512, 2);
+    let mut backend = FlashStorageBackend::new(flash).unwrap();
+    backend.write("key", b"old").unwrap();
+    flash = backend.into_device();
+    flash.fail_after_program_bytes(3);
+    let mut interrupted = FlashStorageBackend::new(flash).unwrap();
+    assert!(interrupted.write("key", b"new").is_err());
+    flash = interrupted.into_device();
+    let recovered = FlashStorageBackend::new(flash).unwrap();
+    assert_eq!(recovered.read("key").unwrap(), Some(b"old".to_vec()));
 }
 
 #[test]
@@ -1147,6 +1168,277 @@ fn test_embedded_authenticator_without_transport() {
     let profile = DeviceProfileBuilder::new().build();
     let authenticator = EmbeddedAuthenticator::new_with_profile(profile).unwrap();
     assert!(authenticator.transport().is_none());
+}
+
+#[cfg(test)]
+mod embedded_authenticator_transport_tests {
+    use authenticator::EmbeddedAuthenticator;
+    use device_profile::{DeviceProfileBuilder, TransportConfig};
+    use embedded_hal::digital::{ErrorType, OutputPin};
+    use std::sync::{Arc, Mutex};
+    use transport::embedded::rp2350::{Rp2350UsbHid, Rp2350UsbPeriph};
+    use transport::embedded::{EmbeddedTransportError, UsbCcidDevice};
+    use transport::{FramedCcidTransport, FramedUsbHidTransport, Transport, TransportError};
+
+    struct TestPin;
+
+    impl ErrorType for TestPin {
+        type Error = core::convert::Infallible;
+    }
+
+    impl OutputPin for TestPin {
+        fn set_low(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn set_high(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MockCcidState {
+        initialized: bool,
+        init_calls: usize,
+        sent_blocks: Vec<Vec<u8>>,
+        recv_block: Vec<u8>,
+    }
+
+    struct MockCcid {
+        state: Arc<Mutex<MockCcidState>>,
+        recv_error: Option<EmbeddedTransportError>,
+    }
+
+    impl MockCcid {
+        fn new(state: Arc<Mutex<MockCcidState>>, recv_block: Vec<u8>) -> Self {
+            state.lock().unwrap().recv_block = recv_block;
+            Self {
+                state,
+                recv_error: None,
+            }
+        }
+
+        fn failing_recv(state: Arc<Mutex<MockCcidState>>) -> Self {
+            Self {
+                state,
+                recv_error: Some(EmbeddedTransportError::Timeout),
+            }
+        }
+    }
+
+    impl UsbCcidDevice for MockCcid {
+        fn init(&mut self) -> Result<(), EmbeddedTransportError> {
+            let mut state = self.state.lock().unwrap();
+            state.initialized = true;
+            state.init_calls += 1;
+            Ok(())
+        }
+
+        fn send_ccid_block(&mut self, buf: &[u8]) -> Result<(), EmbeddedTransportError> {
+            let mut state = self.state.lock().unwrap();
+            if !state.initialized {
+                return Err(EmbeddedTransportError::NotInitialized);
+            }
+            state.sent_blocks.push(buf.to_vec());
+            Ok(())
+        }
+
+        fn recv_ccid_block(&mut self, buf: &mut [u8]) -> Result<usize, EmbeddedTransportError> {
+            if let Some(error) = &self.recv_error {
+                return Err(error.clone());
+            }
+
+            let state = self.state.lock().unwrap();
+            if !state.initialized {
+                return Err(EmbeddedTransportError::NotInitialized);
+            }
+            let len = state.recv_block.len();
+            buf[..len].copy_from_slice(&state.recv_block);
+            Ok(len)
+        }
+    }
+
+    #[derive(Default)]
+    struct MockTransportState {
+        initialized: bool,
+        init_calls: usize,
+        sent_frames: Vec<Vec<u8>>,
+    }
+
+    struct MockTransport {
+        state: Arc<Mutex<MockTransportState>>,
+        init_error: Option<&'static str>,
+    }
+
+    impl MockTransport {
+        fn new(state: Arc<Mutex<MockTransportState>>) -> Self {
+            Self {
+                state,
+                init_error: None,
+            }
+        }
+
+        fn failing(state: Arc<Mutex<MockTransportState>>) -> Self {
+            Self {
+                state,
+                init_error: Some("mock init failure"),
+            }
+        }
+    }
+
+    impl Transport for MockTransport {
+        fn init(&mut self) -> Result<(), TransportError> {
+            let mut state = self.state.lock().unwrap();
+            state.init_calls += 1;
+            if let Some(message) = self.init_error {
+                return Err(TransportError::RecvError(message.to_string()));
+            }
+            state.initialized = true;
+            Ok(())
+        }
+
+        fn send(&mut self, data: &[u8]) -> Result<(), TransportError> {
+            let mut state = self.state.lock().unwrap();
+            if !state.initialized {
+                return Err(TransportError::NotInitialized);
+            }
+            state.sent_frames.push(data.to_vec());
+            Ok(())
+        }
+
+        fn recv(&mut self) -> Result<Vec<u8>, TransportError> {
+            if !self.state.lock().unwrap().initialized {
+                return Err(TransportError::NotInitialized);
+            }
+            Ok(Vec::new())
+        }
+
+        fn close(&mut self) -> Result<(), TransportError> {
+            self.state.lock().unwrap().initialized = false;
+            Ok(())
+        }
+    }
+
+    fn usb_hid_profile() -> device_profile::DeviceProfile {
+        DeviceProfileBuilder::new()
+            .transport_config(TransportConfig::usb_hid())
+            .build()
+    }
+
+    fn usb_ccid_profile() -> device_profile::DeviceProfile {
+        DeviceProfileBuilder::new()
+            .transport_config(TransportConfig::usb_ccid())
+            .build()
+    }
+
+    #[test]
+    fn injected_transport_is_composed_and_initialized_explicitly() {
+        let state = Arc::new(Mutex::new(MockTransportState::default()));
+        let mut authenticator = EmbeddedAuthenticator::new_with_profile_and_transport(
+            usb_hid_profile(),
+            Box::new(MockTransport::new(state.clone())),
+        )
+        .unwrap();
+
+        assert!(authenticator.transport().is_some());
+        assert_eq!(state.lock().unwrap().init_calls, 0);
+
+        authenticator.transport_mut().unwrap().init().unwrap();
+        authenticator
+            .transport_mut()
+            .unwrap()
+            .send(b"injected frame")
+            .unwrap();
+
+        let state = state.lock().unwrap();
+        assert!(state.initialized);
+        assert_eq!(state.init_calls, 1);
+        assert_eq!(state.sent_frames, vec![b"injected frame".to_vec()]);
+    }
+
+    #[test]
+    fn injected_transport_init_error_is_propagated() {
+        let state = Arc::new(Mutex::new(MockTransportState::default()));
+        let mut authenticator = EmbeddedAuthenticator::new_with_profile_and_transport(
+            usb_hid_profile(),
+            Box::new(MockTransport::failing(state.clone())),
+        )
+        .unwrap();
+
+        let error = authenticator.transport_mut().unwrap().init().unwrap_err();
+        assert!(matches!(
+            error,
+            TransportError::RecvError(message) if message == "mock init failure"
+        ));
+        assert_eq!(state.lock().unwrap().init_calls, 1);
+    }
+
+    #[test]
+    fn injected_framed_usb_hid_transport_composes_on_host() {
+        let device = Rp2350UsbHid::new(Rp2350UsbPeriph::new(), TestPin);
+        let transport = FramedUsbHidTransport::new(device);
+        let mut authenticator = EmbeddedAuthenticator::new_with_profile_and_transport(
+            usb_hid_profile(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        authenticator.transport_mut().unwrap().init().unwrap();
+        authenticator
+            .transport_mut()
+            .unwrap()
+            .send(&[0xA5; 120])
+            .unwrap();
+    }
+
+    #[test]
+    fn injected_framed_ccid_transport_round_trips_on_host() {
+        let state = Arc::new(Mutex::new(MockCcidState::default()));
+        let raw_apdu = vec![0x00, 0x10, 0x00, 0x00, 0x03, 1, 2, 3];
+        let transport = FramedCcidTransport::new(MockCcid::new(state.clone(), raw_apdu));
+        let mut authenticator = EmbeddedAuthenticator::new_with_profile_and_transport(
+            usb_ccid_profile(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        let before_init = authenticator
+            .transport_mut()
+            .unwrap()
+            .send(b"before init")
+            .unwrap_err();
+        assert!(matches!(before_init, TransportError::NotInitialized));
+        assert_eq!(state.lock().unwrap().init_calls, 0);
+
+        let transport = authenticator.transport_mut().unwrap();
+        transport.init().unwrap();
+        transport.send(&[4, 5, 6]).unwrap();
+        assert_eq!(transport.recv().unwrap(), vec![1, 2, 3]);
+
+        let state = state.lock().unwrap();
+        assert!(state.initialized);
+        assert_eq!(state.init_calls, 1);
+        assert_eq!(state.sent_blocks, vec![vec![4, 5, 6, 0x90, 0x00]]);
+    }
+
+    #[test]
+    fn injected_framed_ccid_transport_propagates_host_errors() {
+        let state = Arc::new(Mutex::new(MockCcidState::default()));
+        let transport = FramedCcidTransport::new(MockCcid::failing_recv(state.clone()));
+        let mut authenticator = EmbeddedAuthenticator::new_with_profile_and_transport(
+            usb_ccid_profile(),
+            Box::new(transport),
+        )
+        .unwrap();
+
+        authenticator.transport_mut().unwrap().init().unwrap();
+        let error = authenticator.transport_mut().unwrap().recv().unwrap_err();
+        assert!(matches!(
+            error,
+            TransportError::RecvError(message) if message == "timeout"
+        ));
+        assert_eq!(state.lock().unwrap().init_calls, 1);
+    }
 }
 
 #[test]
