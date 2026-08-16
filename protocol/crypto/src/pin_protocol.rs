@@ -162,6 +162,7 @@ impl PinUvProtocol {
     /// - Protocolo 1: AES-256-CBC com chave `shared_secret` e IV zero.
     /// - Protocolo 2: AES-256-CBC com a metade AES de `shared_secret`
     ///   (64 bytes) e IV aleatório de 16 bytes prefixado ao ciphertext.
+    #[allow(clippy::manual_is_multiple_of)]
     pub fn encrypt(&self, shared_secret: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
         if plaintext.len() % AES_BLOCK_LEN != 0 {
             return Err(format!(
@@ -273,6 +274,7 @@ impl hkdf::KeyType for OkmLen {
 
 /// AES-256-CBC bruto (sem padding) — o protocolo CTAP2 exige plaintexts
 /// múltiplos do bloco e nunca adiciona padding (CTAP 2.1 §6.5.6/§6.5.7).
+#[allow(clippy::manual_is_multiple_of)]
 pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
     if key.len() != 32 {
         return Err("AES-256 key must be 32 bytes".into());
@@ -295,6 +297,7 @@ pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
 
 /// AES-256-CBC bruto (sem padding), decifrando dados de
 /// [`aes256_cbc_encrypt`].
+#[allow(clippy::manual_is_multiple_of)]
 pub fn aes256_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
     if key.len() != 32 {
         return Err("AES-256 key must be 32 bytes".into());
