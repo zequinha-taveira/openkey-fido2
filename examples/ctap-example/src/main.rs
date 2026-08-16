@@ -52,6 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             up: true,
             extended: false,
         },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         enterprise_protections: None,
     };
@@ -71,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_data_hash: [0u8; 32].to_vec(),
         extensions: None,
         options: ctap2::GetAssertionOptions { up: true, uv: true },
+        pin_uv_auth_param: None,
         pin_protocol: None,
         uv: None,
     };

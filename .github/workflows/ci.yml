@@ -80,6 +80,12 @@ jobs:
       - name: Run decode_cbor target
         run: cargo fuzz run decode_cbor --fuzz-dir fuzz -- -max_total_time=60
 
+      - name: Run CTAP2 dispatch target
+        run: cargo fuzz run ctap2_dispatch --fuzz-dir fuzz -- -max_total_time=60
+
+      - name: Run CTAPHID framing target
+        run: cargo fuzz run ctaphid_framing --fuzz-dir fuzz -- -max_total_time=60
+
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v7

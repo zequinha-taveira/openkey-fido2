@@ -9,26 +9,45 @@ description: Use when working on the openkey-fido2 project — a FIDO2/WebAuthn 
 
 Openkey-fido2 is an embedded FIDO2/WebAuthn authenticator firmware written in Rust. It implements the CTAP2 (Client to Authenticator Protocol v2) and WebAuthn standards for passwordless authentication.
 
-The project is structured as a Cargo workspace with 11 crates covering protocol implementation, cryptography, storage, board abstraction, and a host simulator for testing.
+The project is structured as a Cargo workspace with 16 crates covering protocol implementation, cryptography, storage, board abstraction, transports, examples, and host tooling.
+
+## Context Routing
+
+Load this skill only when the task concerns openkey-fido2 or its FIDO2/WebAuthn
+implementation. It is the final project-specific context layer in the route
+defined by `AGENTS.md` and ADR-0018:
+
+```text
+Issue → AGENTS.md → relevant specification → relevant ADR →
+relevant source files → relevant skill
+```
+
+Use the skill for project conventions, structure, and current-state pointers.
+Do not treat it as a replacement for protocol specifications, ADRs, or source
+code.
 
 ## Current State
 
 ### Completed (✅)
-- Core CTAP2: MakeCredential, GetAssertion, GetInfo, GetVersion, ProcessCommand
-- Crypto: Ed25519, HMAC-SHA256, SHA-256, ChaCha20-Poly1305, SystemRandom nonces
-- Storage: Encryption at rest, credential lookup, sign counter, encrypted private keys
-- Device Profile: BoardDefinition builder, DeviceProfileBuilder, CapabilityDiscovery
-- 5 pre-defined board profiles: NRF52840, STM32L4, ESP32C3, RP2350, GENERIC
-- All Quick Wins: CredProtect enum, Reset handler, Selection handler, justfile, docs metadata
+- Core CTAP2: MakeCredential, GetAssertion, GetInfo, GetVersion, Reset, Selection, GetNextAssertion, LargeBlobs, Credential Management, and Enterprise Attestation
+- ClientPIN CTAP 2.1 wire format with protocols 1 and 2, retry handling, permissions, and Python conformance coverage
+- WebAuthn extensions: credProtect, credBlob, minPinLength, hmac-secret, and largeBlobKey
+- Crypto: Ed25519, ES256, ES384, PS256, RS256, HMAC-SHA256, SHA-256, ChaCha20-Poly1305, hybrid X25519, and SystemRandom nonces
+- Storage: encryption at rest, file and simulated flash backends, wear leveling, credential pruning, RP enumeration, and sign counter persistence
+- Device Profile: BoardDefinition builder, DeviceProfileBuilder, CapabilityDiscovery, security features, and five board profiles
+- Attestation: None, Packed, and Self formats with configurable device profiles
+- Transport infrastructure: CTAPHID framing, channel management, reference HALs, USB-HID/CCID adapters, and the RP2350 usb-device backend
+- Conformance tooling: raw CBOR simulator mode, Python CTAP 2.1 tests, and the virtual CTAPHID bridge
+- GetInfo `firmwareVersion` exposed as a CTAP 2.1 integer with deterministic profile mapping
+- Quick Wins: credProtect enum, Reset, Selection, justfile, and docs metadata
 
-### Not Started (❌)
-- ClientPIN (CTAP2 0x06)
-- WebAuthn Extensions integration (credProtect in MakeCredential, credBlob, minPinLength, hmac-secret)
-- Real persistence backends (FileStorage, FlashStorage)
-- Additional algorithms: ES256, RS256
-- Transports: USB-HID, CCID, NFC, BLE GATT
-- Attestation formats: Packed, Self
-- Remaining CTAP2 commands: GetNextAssertion, EnumerateRPs, BioEnroll
+### Remaining Work (🚧)
+- Wire `pinUvAuthParam` validation into MakeCredential, GetAssertion, and Credential Management
+- Implement built-in UV and `getUVRetries` when supported by hardware
+- Connect concrete board drivers to the authenticator for USB-HID and USB-CCID
+- Integrate NFC ISO 14443 and BLE GATT stacks; current types remain hardware stubs
+- Resolve bare-metal linker/runtime gaps and validate firmware on physical boards
+- Run FIDO Conformance Tool and artifact signing when external access and protected secrets are available
 
 ## Workspace Structure
 

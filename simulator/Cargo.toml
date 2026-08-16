@@ -1,6 +1,6 @@
 [package]
 name = "fido2-simulator"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Host simulator exposing the FIDO2 firmware over a JSON line protocol (no hardware required)"
 license = "MIT"

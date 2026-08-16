@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "nrf52840-firmware"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "embedded-hal 1.0.0",
  "log",

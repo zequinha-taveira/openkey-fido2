@@ -2,6 +2,7 @@
 
 import hashlib
 import pytest
+from fido2 import cbor
 from .ctap2_transport import CtapCmd, CtapError, SimulatorClient
 
 
@@ -10,12 +11,12 @@ def make_sample_request(rp_id="example.com", user_id=b"user_123", alg=-7, rk=Fal
     client_data_hash = hashlib.sha256(client_data).digest()
 
     return {
-        "clientDataHash": client_data_hash,
-        "rp": {"id": rp_id, "name": "Example Corp"},
-        "user": {"id": user_id, "name": "alice@example.com", "displayName": "Alice"},
-        "pubKeyCredParams": [{"type": "public-key", "alg": alg}],
-        "excludeList": [],
-        "options": {"rk": rk, "uv": False, "up": True},
+        0x01: client_data_hash,
+        0x02: {"id": rp_id, "name": "Example Corp"},
+        0x03: {"id": user_id, "name": "alice@example.com", "displayName": "Alice"},
+        0x04: [{"type": "public-key", "alg": alg}],
+        0x05: [],
+        0x07: {"rk": rk, "uv": False, "up": True},
     }
 
 
@@ -59,11 +60,19 @@ def test_make_credential_missing_required_fields():
     """Valida que request sem clientDataHash retorna INVALID_DATA ou INVALID_PARAMETER."""
     with SimulatorClient() as client:
         req = {
-            "rp": {"id": "example.com", "name": "Example Corp"},
-            "user": {"id": b"user_1", "name": "alice"},
-            "pubKeyCredParams": [{"type": "public-key", "alg": -7}],
-            "excludeList": [],
-            "options": {"rk": False, "uv": False, "up": True},
+            0x02: {"id": "example.com", "name": "Example Corp"},
+            0x03: {"id": b"user_1", "name": "alice"},
+            0x04: [{"type": "public-key", "alg": -7}],
+            0x05: [],
+            0x07: {"rk": False, "uv": False, "up": True},
         }
         status, _ = client.send_cbor(CtapCmd.MAKE_CREDENTIAL, req)
+        assert status == CtapError.INVALID_CBOR
+
+
+def test_make_credential_rejects_trailing_cbor_bytes():
+    """Rejeita payloads com bytes após o item CBOR completo."""
+    with SimulatorClient() as client:
+        payload = cbor.encode(make_sample_request()) + b"\x00"
+        status, _ = client.send_raw(CtapCmd.MAKE_CREDENTIAL, payload)
         assert status == CtapError.INVALID_CBOR

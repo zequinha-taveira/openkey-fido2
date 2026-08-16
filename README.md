@@ -51,7 +51,8 @@ Firmware FIDO2/WebAuthn em Rust para authenticators embarcados. Implementa CTAP2
 ### Core CTAP2
 - **MakeCredential** — criação de credenciais com attestation `none`
 - **GetAssertion** — assertions com allow_list, exclude_list, sign counter
-- **GetInfo** — capacidades dinâmicas (algoritmos, extensões, transports)
+- **GetInfo** — capacidades dinâmicas (algoritmos, extensões, transports) e
+  `firmwareVersion` inteiro no wire format CTAP 2.1
 - **GetNextAssertion** — suporte a múltiplas credenciais
 - **Reset** — limpeza de credenciais e PIN
 - **Selection** — seleção de dispositivo
@@ -60,10 +61,11 @@ Firmware FIDO2/WebAuthn em Rust para authenticators embarcados. Implementa CTAP2
 - `getPINRetries` — contador de tentativas (inicial: 8)
 - `setPIN` — configurar PIN (mínimo 4 bytes)
 - `changePIN` — trocar PIN com verificação
-- `getPINToken` — derivar token via HMAC-SHA256
-- `getPINHashEnc` — hash criptografado do PIN
-- Bloqueio após 3 tentativas consecutivas
-- PIN protocols 1 e 2 suportados
+- `getPINToken` e `getPinUvAuthTokenUsingPinWithPermissions` — tokens via PIN
+- Protocolos PIN/UV 1 e 2 — P-256 ECDH, AES-CBC e HMAC conforme CTAP2.1
+- `pinUvAuthParam` — verificação de MAC, permissões e binding de RP em MakeCredential,
+  GetAssertion e Credential Management
+- Bloqueio após 3 tentativas consecutivas, com estado persistido
 
 ### Criptografia
 - **Ed25519** — assinatura/verificação via `ring`
@@ -81,13 +83,13 @@ Firmware FIDO2/WebAuthn em Rust para authenticators embarcados. Implementa CTAP2
 ### Armazenamento
 - **Encryption at rest** — chaves privadas nunca em plaintext
 - **FileStorageBackend** — persistência local em JSON (dev)
-- **FlashStorageBackend** — stub para flash embedded
+- **FlashStorageBackend** — backend de dois slots sobre `FlashDevice`, com `SimulatedFlash` para testes de power-loss
 - **Wear leveling** — rotação de writes
 - **Credential pruning** — LRU quando `max_credential_count` atingido
 
 ### Transportes
-- **USB-HID** — stub (host) + backend real via `usb-device` para RP2350 (`transport::UsbHidBackend`, feature `usb-device`)
-- **CCID** stub — interface para smartcard
+- **USB-HID** — framing/adaptador concreto via `usb-device`; `EmbeddedAuthenticator` aceita `Box<dyn Transport>` por injeção, enquanto drivers de board e validação física permanecem pendentes
+- **CCID** — `FramedCcidTransport` com framing APDU pode ser injetado no `EmbeddedAuthenticator` e é verificável no host com mocks; driver USB-CCID de board e validação física ainda pendentes
 - **Firmware bare-metal** — `examples/rp2350-firmware` e `examples/nrf52840-firmware` (boot + loop CTAPHID)
 - **Virtual CTAPHID Bridge** — `tools/ctaphid_bridge.py` (UHID, Linux)
 

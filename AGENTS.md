@@ -9,8 +9,8 @@ Ele é a **fonte de verdade para o fluxo de trabalho**, não instruções passag
 
 Antes de escrever código para qualquer funcionalidade não-trivial:
 
-1. Leia este `AGENTS.md` e o `README.md` para entender a arquitetura
-2. Consulte `TODO.md` para verificar se a tarefa já está mapeada
+1. Leia este `AGENTS.md`; carregue apenas a seção do `README.md` necessária à tarefa
+2. Identifique o Issue e consulte somente o item correspondente no `TODO.md`
 3. Identifique quais crates serão afetadas (veja "Mapeamento de Crates")
 4. Escreva um plano com etapas pequenas e verificáveis
 5. Apresente o plano antes de implementar
@@ -46,14 +46,45 @@ Antes de escrever código para qualquer funcionalidade não-trivial:
 
 Não repita instruções de conversa em código ou docs. Referencie estes arquivos.
 
-### Documentação como Roteador de Contexto (ADR-0005)
+### Documentação como Roteador de Contexto (ADR-0018)
 
 A documentação deste repositório funciona como **roteador de contexto** para
-agentes de IA. O fluxo é:
+agentes de IA. Para cada tarefa, o fluxo progressivo é:
 
 ```
-AGENTS.md (guia) → TODO.md (tarefas) → carrega apenas o contexto necessário
+Issue
+  ↓
+AGENTS.md
+  ↓
+Especificação relevante
+  ↓
+ADR relevante
+  ↓
+Arquivos fonte relevantes
+  ↓
+Skill relevante
 ```
+
+As etapas significam:
+
+1. **Issue** — delimite o objetivo, o comportamento esperado e o critério de
+   aceitação. O Issue pode ser um relato do usuário, uma issue do GitHub ou um
+   item do `TODO.md`.
+2. **`AGENTS.md`** — carregue este guia para obter regras de segurança, o mapa
+   de crates e o fluxo de trabalho. Consulte somente o item relacionado no
+   `TODO.md` quando houver um incremento correspondente.
+3. **Especificação relevante** — carregue apenas as seções aplicáveis da
+   especificação do protocolo ou requisito do produto, como CTAP2 ou WebAuthn.
+   Se nenhuma especificação se aplicar, registre essa conclusão no plano.
+4. **ADR relevante** — carregue as decisões arquiteturais que restringem a
+   solução. Se a tarefa exigir uma decisão nova, planeje um ADR em vez de
+   alterar um ADR aceito.
+5. **Arquivos fonte relevantes** — use busca para localizar paths e símbolos,
+   mas leia somente os arquivos necessários depois de identificar as regras da
+   especificação e dos ADRs.
+6. **Skill relevante** — carregue a skill cujo gatilho corresponda à tarefa;
+   ela fornece contexto operacional específico e não substitui a
+   especificação, os ADRs ou o código.
 
 **Princípios:**
 - **Fonte única da verdade** — informação vive em um arquivo, não em instruções
@@ -62,11 +93,17 @@ AGENTS.md (guia) → TODO.md (tarefas) → carrega apenas o contexto necessário
   apenas o contexto necessário para a tarefa atual
 - **Sem duplicação** — não copie conteúdo entre arquivos; referencie com paths
   (`arquivo:linha`)
+- **Ordem explícita** — especificação e ADRs relevantes orientam a leitura do
+  código, e não o contrário
+- **Aplicabilidade** — quando uma etapa não se aplicar, registre o motivo sem
+  carregar documentos irrelevantes
 
 **Para subagents:**
 - Forneça apenas task description, minimum context, output criteria e explicit
   restrictions
 - Não despeje TODO.md/AGENTS.md completos quando apenas uma seção é relevante
+- Forneça paths e seções específicas, não cópias completas de especificações,
+  ADRs ou skills
 - Estado compartilhado existe apenas em arquivos do repositório
 
 ---

@@ -1,6 +1,6 @@
 [package]
 name = "storage"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Persistent storage engine for FIDO2 authenticator credentials"
 license = "MIT"

@@ -43,28 +43,15 @@ Antes de escrever código para qualquer funcionalidade não-trivial:
 
 Não repita instruções de conversa em código ou docs. Referencie estes arquivos.
 
-### 5. Documentação como Roteador de Contexto (ADR-0005)
+### 5. Roteamento progressivo de contexto
 
-A documentação deste repositório funciona como **roteador de contexto** para
-agentes de IA. O fluxo é:
+A rota canônica de contexto está em [`AGENTS.md`](AGENTS.md), na seção
+"Documentação como Roteador de Contexto". A decisão arquitetural está registrada
+em [`ADR-0018`](docs/adr/ADR-0018-roteamento-progressivo-contexto.md).
 
-```
-AGENTS.md (guia) → TODO.md (tarefas) → carrega apenas o contexto necessário
-```
-
-**Princípios:**
-- **Fonte única da verdade** — informação vive em um arquivo, não em instruções
-  de conversa passadas
-- **Divulgação progressiva** — agente lê o guia, consulta o manifesto, carrega
-  apenas o contexto necessário para a tarefa atual
-- **Sem duplicação** — não copie conteúdo entre arquivos; referencie com paths
-  (`arquivo:linha`)
-
-**Para subagents:**
-- Forneça apenas task description, minimum context, output criteria e explicit
-  restrictions
-- Não despeje TODO.md/AGENTS.md completos quando apenas uma seção é relevante
-- Estado compartilhado existe apenas em arquivos do repositório
+Este arquivo não duplica as etapas nem as regras dessa rota. Consulte o guia
+canônico e carregue somente as especificações, ADRs, arquivos fonte e skills
+relevantes para a tarefa atual.
 
 ---
 

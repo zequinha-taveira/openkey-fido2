@@ -6,6 +6,7 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
 use std::path::PathBuf;
 use zeroize::Zeroize;
 
@@ -67,6 +68,7 @@ pub trait StorageBackend: Send + Sync {
 /// do processo não perca credenciais já registradas.
 pub struct FileStorageBackend {
     path: PathBuf,
+    journal_path: PathBuf,
     cache: HashMap<String, Vec<u8>>,
     dirty: bool,
 }
@@ -74,21 +76,36 @@ pub struct FileStorageBackend {
 impl FileStorageBackend {
     /// Abre (ou cria) o arquivo em `path` e carrega seu conteúdo no cache.
     pub fn new(path: PathBuf) -> Result<Self, StorageError> {
-        let cache = if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            if content.trim().is_empty() {
-                HashMap::new()
-            } else {
-                serde_json::from_str(&content)?
-            }
-        } else {
-            HashMap::new()
-        };
+        let journal_path = path.with_extension("journal");
+        let cache = Self::load_snapshot(&path, &journal_path)?;
         Ok(Self {
             path,
+            journal_path,
             cache,
             dirty: false,
         })
+    }
+
+    fn load_snapshot(
+        path: &PathBuf,
+        journal_path: &PathBuf,
+    ) -> Result<HashMap<String, Vec<u8>>, StorageError> {
+        let snapshot_path = if journal_path.exists() {
+            journal_path
+        } else {
+            path
+        };
+
+        if !snapshot_path.exists() {
+            return Ok(HashMap::new());
+        }
+
+        let content = fs::read_to_string(snapshot_path)?;
+        if content.trim().is_empty() {
+            Ok(HashMap::new())
+        } else {
+            Ok(serde_json::from_str(&content)?)
+        }
     }
 
     /// Grava o cache em disco quando houver alterações pendentes.
@@ -100,11 +117,42 @@ impl FileStorageBackend {
                     fs::create_dir_all(parent)?;
                 }
             }
-            fs::write(&self.path, json)?;
+            if let Some(parent) = self.journal_path.parent() {
+                if !parent.as_os_str().is_empty() && !parent.exists() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+
+            // The journal is durable before the main file is replaced. If the
+            // process loses power during replacement, startup can recover it.
+            write_durable(&self.journal_path, json.as_bytes())?;
+
+            let temporary_path = self.path.with_extension("tmp");
+            write_durable(&temporary_path, json.as_bytes())?;
+            replace_file(&temporary_path, &self.path)?;
+            fs::remove_file(&self.journal_path)?;
             self.dirty = false;
         }
         Ok(())
     }
+}
+
+fn write_durable(path: &PathBuf, contents: &[u8]) -> Result<(), StorageError> {
+    let mut file = File::create(path)?;
+    use std::io::Write;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn replace_file(source: &PathBuf, destination: &PathBuf) -> Result<(), StorageError> {
+    // Windows cannot rename over an existing file. The journal still makes
+    // this two-step replacement recoverable if power fails between operations.
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    fs::rename(source, destination)?;
+    Ok(())
 }
 
 impl StorageBackend for FileStorageBackend {
@@ -131,48 +179,237 @@ impl StorageBackend for FileStorageBackend {
     }
 }
 
-/// Stub de backend em flash para targets embarcados.
+/// Contrato mínimo que uma HAL de flash deve adaptar.
 ///
-/// Todas as operações retornam [`StorageError::BackendError`]: o objetivo é
-/// fixar o contrato antes da implementação por board (ver `TODO.md`).
-pub struct FlashStorageBackend;
+/// `program` só pode mudar bits de 1 para 0; apagar restaura um setor inteiro
+/// para `0xff`. A implementação concreta deve garantir essas regras também
+/// quando o dispositivo for real.
+pub trait FlashDevice: Send + Sync {
+    fn capacity(&self) -> usize;
+    fn sector_size(&self) -> usize;
+    fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), StorageError>;
+    fn erase_sector(&mut self, sector: usize) -> Result<(), StorageError>;
+    fn program(&mut self, offset: usize, data: &[u8]) -> Result<(), StorageError>;
+}
 
-impl FlashStorageBackend {
-    /// Cria o stub. Nenhum recurso de hardware é reservado.
-    pub fn new() -> Self {
-        Self
+/// Flash NOR determinística para testes de backend e de power-loss.
+pub struct SimulatedFlash {
+    bytes: Vec<u8>,
+    sector_size: usize,
+    fail_after_program_bytes: Option<usize>,
+}
+
+impl SimulatedFlash {
+    /// Cria uma flash apagada com dois ou mais setores.
+    pub fn new(sector_size: usize, sectors: usize) -> Self {
+        assert!(sector_size > 0 && sectors >= 2);
+        Self {
+            bytes: vec![0xff; sector_size * sectors],
+            sector_size,
+            fail_after_program_bytes: None,
+        }
+    }
+
+    /// Faz a próxima operação `program` falhar depois de programar `bytes`.
+    pub fn fail_after_program_bytes(&mut self, bytes: usize) {
+        self.fail_after_program_bytes = Some(bytes);
     }
 }
 
-impl Default for FlashStorageBackend {
-    fn default() -> Self {
-        Self::new()
+impl FlashDevice for SimulatedFlash {
+    fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn sector_size(&self) -> usize {
+        self.sector_size
+    }
+
+    fn read(&self, offset: usize, out: &mut [u8]) -> Result<(), StorageError> {
+        let end = offset
+            .checked_add(out.len())
+            .ok_or_else(|| StorageError::BackendError("flash read overflow".into()))?;
+        if end > self.bytes.len() {
+            return Err(StorageError::BackendError(
+                "flash read out of bounds".into(),
+            ));
+        }
+        out.copy_from_slice(&self.bytes[offset..end]);
+        Ok(())
+    }
+
+    fn erase_sector(&mut self, sector: usize) -> Result<(), StorageError> {
+        let start = sector
+            .checked_mul(self.sector_size)
+            .ok_or_else(|| StorageError::BackendError("flash sector overflow".into()))?;
+        let end = start + self.sector_size;
+        if end > self.bytes.len() {
+            return Err(StorageError::BackendError(
+                "flash sector out of bounds".into(),
+            ));
+        }
+        self.bytes[start..end].fill(0xff);
+        Ok(())
+    }
+
+    fn program(&mut self, offset: usize, data: &[u8]) -> Result<(), StorageError> {
+        let end = offset
+            .checked_add(data.len())
+            .ok_or_else(|| StorageError::BackendError("flash program overflow".into()))?;
+        if end > self.bytes.len() {
+            return Err(StorageError::BackendError(
+                "flash program out of bounds".into(),
+            ));
+        }
+        let mut allowed = data.len();
+        if let Some(limit) = self.fail_after_program_bytes.take() {
+            allowed = limit.min(data.len());
+        }
+        for (old, new) in self.bytes[offset..offset + allowed]
+            .iter_mut()
+            .zip(&data[..allowed])
+        {
+            if (*old | *new) != *old {
+                return Err(StorageError::BackendError(
+                    "flash program attempted 0 to 1".into(),
+                ));
+            }
+            *old &= *new;
+        }
+        if allowed != data.len() {
+            return Err(StorageError::BackendError(
+                "simulated power loss during flash program".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
-impl StorageBackend for FlashStorageBackend {
-    fn read(&self, _key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        Err(StorageError::BackendError(
-            "FlashStorageBackend is a stub — not yet implemented for embedded targets".to_string(),
-        ))
+const FLASH_MAGIC: &[u8; 4] = b"OKF1";
+const FLASH_HEADER_SIZE: usize = 20;
+type FlashSnapshot = (u64, HashMap<String, Vec<u8>>);
+
+/// Backend crash-safe de dois slots para uma flash NOR adaptada por [`FlashDevice`].
+pub struct FlashStorageBackend<D: FlashDevice> {
+    device: D,
+    cache: HashMap<String, Vec<u8>>,
+    active_sector: usize,
+    generation: u64,
+}
+
+impl<D: FlashDevice> FlashStorageBackend<D> {
+    /// Abre a versão válida mais recente; setores incompletos são ignorados.
+    pub fn new(device: D) -> Result<Self, StorageError> {
+        if device.capacity() < device.sector_size() * 2 || device.sector_size() <= FLASH_HEADER_SIZE
+        {
+            return Err(StorageError::BackendError(
+                "flash must provide two usable sectors".into(),
+            ));
+        }
+        let mut backend = Self {
+            device,
+            cache: HashMap::new(),
+            active_sector: 0,
+            generation: 0,
+        };
+        backend.load_latest()?;
+        Ok(backend)
     }
 
-    fn write(&mut self, _key: &str, _value: &[u8]) -> Result<(), StorageError> {
-        Err(StorageError::BackendError(
-            "FlashStorageBackend is a stub — not yet implemented for embedded targets".to_string(),
-        ))
+    /// Recupera o dispositivo para simular uma reinicialização.
+    pub fn into_device(self) -> D {
+        self.device
     }
 
-    fn delete(&mut self, _key: &str) -> Result<(), StorageError> {
-        Err(StorageError::BackendError(
-            "FlashStorageBackend is a stub — not yet implemented for embedded targets".to_string(),
-        ))
+    fn checksum(data: &[u8]) -> u32 {
+        data.iter().fold(2166136261u32, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(16777619)
+        })
+    }
+
+    fn read_slot(&self, sector: usize) -> Result<Option<FlashSnapshot>, StorageError> {
+        let size = self.device.sector_size();
+        let mut raw = vec![0xff; size];
+        self.device.read(sector * size, &mut raw)?;
+        if &raw[..4] != FLASH_MAGIC {
+            return Ok(None);
+        }
+        let generation = u64::from_le_bytes(raw[4..12].try_into().unwrap());
+        let len = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
+        let checksum = u32::from_le_bytes(raw[16..20].try_into().unwrap());
+        if len > size - FLASH_HEADER_SIZE {
+            return Ok(None);
+        }
+        let payload = &raw[FLASH_HEADER_SIZE..FLASH_HEADER_SIZE + len];
+        if Self::checksum(payload) != checksum {
+            return Ok(None);
+        }
+        let cache = serde_json::from_slice(payload)
+            .map_err(|_| StorageError::BackendError("invalid flash snapshot".into()))?;
+        Ok(Some((generation, cache)))
+    }
+
+    fn load_latest(&mut self) -> Result<(), StorageError> {
+        for sector in 0..2 {
+            if let Some((generation, cache)) = self.read_slot(sector)? {
+                if generation >= self.generation {
+                    self.generation = generation;
+                    self.active_sector = sector;
+                    self.cache = cache;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, cache: &HashMap<String, Vec<u8>>) -> Result<(), StorageError> {
+        let payload = serde_json::to_vec(cache)?;
+        let size = self.device.sector_size();
+        if payload.len() > size - FLASH_HEADER_SIZE {
+            return Err(StorageError::BackendError(
+                "flash snapshot exceeds sector capacity".into(),
+            ));
+        }
+        let target = 1 - self.active_sector;
+        self.device.erase_sector(target)?;
+        let generation = self.generation + 1;
+        let mut header = [0xff; FLASH_HEADER_SIZE];
+        header[..4].copy_from_slice(FLASH_MAGIC);
+        header[4..12].copy_from_slice(&generation.to_le_bytes());
+        header[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        header[16..20].copy_from_slice(&Self::checksum(&payload).to_le_bytes());
+        let offset = target * size;
+        self.device.program(offset, &header)?;
+        self.device.program(offset + FLASH_HEADER_SIZE, &payload)?;
+        self.active_sector = target;
+        self.generation = generation;
+        Ok(())
+    }
+}
+
+impl<D: FlashDevice> StorageBackend for FlashStorageBackend<D> {
+    fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(self.cache.get(key).cloned())
+    }
+
+    fn write(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        let mut next = self.cache.clone();
+        next.insert(key.to_string(), value.to_vec());
+        self.commit(&next)?;
+        self.cache = next;
+        Ok(())
+    }
+
+    fn delete(&mut self, key: &str) -> Result<(), StorageError> {
+        let mut next = self.cache.clone();
+        next.remove(key);
+        self.commit(&next)?;
+        self.cache = next;
+        Ok(())
     }
 
     fn list_keys(&self) -> Result<Vec<String>, StorageError> {
-        Err(StorageError::BackendError(
-            "FlashStorageBackend is a stub — not yet implemented for embedded targets".to_string(),
-        ))
+        Ok(self.cache.keys().cloned().collect())
     }
 }
 
@@ -760,5 +997,49 @@ mod tests {
             private_key.iter().all(|&b| b == 0),
             "private_key was not zeroized"
         );
+    }
+
+    #[test]
+    fn test_file_storage_recovers_from_journal() {
+        let root = std::env::temp_dir().join(format!("openkey-storage-{}", std::process::id()));
+        let path = root.join("store.json");
+        let journal_path = path.with_extension("journal");
+        let _ = fs::remove_dir_all(&root);
+
+        let mut backend = FileStorageBackend::new(path.clone()).unwrap();
+        backend.write("pin", b"old").unwrap();
+
+        let snapshot =
+            serde_json::to_vec(&HashMap::from([("pin".to_string(), b"recovered".to_vec())]))
+                .unwrap();
+        write_durable(&journal_path, &snapshot).unwrap();
+        fs::write(&path, b"{").unwrap();
+
+        let recovered = FileStorageBackend::new(path.clone()).unwrap();
+        assert_eq!(recovered.read("pin").unwrap(), Some(b"recovered".to_vec()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_simulated_flash_enforces_nor_programming() {
+        let mut flash = SimulatedFlash::new(128, 2);
+        flash.program(0, &[0x0f]).unwrap();
+        assert!(flash.program(0, &[0xff]).is_err());
+        flash.erase_sector(0).unwrap();
+        flash.program(0, &[0xff]).unwrap();
+    }
+
+    #[test]
+    fn test_flash_backend_recovers_previous_slot_after_interruption() {
+        let mut flash = SimulatedFlash::new(256, 2);
+        let mut backend = FlashStorageBackend::new(flash).unwrap();
+        backend.write("state", b"stable").unwrap();
+        flash = backend.into_device();
+        flash.fail_after_program_bytes(2);
+        let mut interrupted = FlashStorageBackend::new(flash).unwrap();
+        assert!(interrupted.write("state", b"partial").is_err());
+        let recovered = FlashStorageBackend::new(interrupted.into_device()).unwrap();
+        assert_eq!(recovered.read("state").unwrap(), Some(b"stable".to_vec()));
     }
 }

@@ -11,13 +11,21 @@ use ctap2::{
     GetAssertionOptions, GetAssertionRequest, HmacSecretInput, MakeCredentialOptions,
     MakeCredentialRequest, PublicKeyCredParams, RelyingParty, User,
 };
-use device_profile::DeviceProfileBuilder;
+use device_profile::{DeviceProfile, DeviceProfileBuilder, PinPolicy};
 use serde_json::{json, Value};
 
 const ERR_JSON_INVALID: u8 = 0x02;
 
 /// Placeholder DER blob used as the packed attestation certificate in tests.
 const TEST_ATTESTATION_CERT: &[u8] = &[0x30, 0x82, 0x01, 0x00, 0xDE, 0xAD, 0xBE, 0xEF];
+
+/// Perfil do simulador: habilita o clientPin para que o GetInfo anuncie
+/// `clientPin`/`pinUvAuthToken` e o fluxo PIN possa ser exercitado.
+fn simulator_profile() -> DeviceProfile {
+    DeviceProfileBuilder::new()
+        .pin_policy(PinPolicy::Optional)
+        .build()
+}
 
 struct Simulator {
     auth: EmbeddedAuthenticator,
@@ -112,25 +120,23 @@ fn build_extensions(ext_val: Option<&Value>) -> Option<Extensions> {
 impl Simulator {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            auth: EmbeddedAuthenticator::new()?,
+            auth: EmbeddedAuthenticator::new_with_profile(simulator_profile())?,
             storage_path: None,
         })
     }
 
     fn with_storage_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
-        let profile = DeviceProfileBuilder::new().build();
         Ok(Self {
-            auth: EmbeddedAuthenticator::new_with_storage_path(path.clone(), profile)?,
+            auth: EmbeddedAuthenticator::new_with_storage_path(path.clone(), simulator_profile())?,
             storage_path: Some(path),
         })
     }
 
     fn reset(&mut self) -> Value {
         let result = if let Some(path) = &self.storage_path {
-            let profile = DeviceProfileBuilder::new().build();
-            EmbeddedAuthenticator::new_with_storage_path(path.clone(), profile)
+            EmbeddedAuthenticator::new_with_storage_path(path.clone(), simulator_profile())
         } else {
-            EmbeddedAuthenticator::new()
+            EmbeddedAuthenticator::new_with_profile(simulator_profile())
         };
         match result {
             Ok(auth) => {
@@ -243,6 +249,7 @@ impl Simulator {
             exclude_list,
             extensions,
             options: mc_options,
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         };
@@ -345,6 +352,7 @@ impl Simulator {
             client_data_hash,
             extensions,
             options: GetAssertionOptions { up, uv },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             uv: Some(uv),
         };
@@ -495,22 +503,20 @@ impl Simulator {
                 }
             },
             ClientPinSubCommand::GetPINToken => match ctap.verify_pin(&pin) {
-                Ok(()) => match ctap.get_pin_token() {
-                    Ok(token) => json!({"ok": true, "pin_uv_auth_token": b64_encode(&token)}),
-                    Err(error) => {
-                        json!({"ok": false, "code": error.as_u8(), "message": error.to_string()})
-                    }
-                },
+                Ok(()) => {
+                    // Rota JSON de conveniência para testes: o token do wire
+                    // CTAP2 exige acordo de chaves; aqui devolve-se um valor
+                    // opaco de 32 bytes.
+                    let token = ctap.get_crypto().random_bytes(32);
+                    json!({"ok": true, "pin_uv_auth_token": b64_encode(&token)})
+                }
                 Err(error) => {
                     json!({"ok": false, "code": error.as_u8(), "message": error.to_string()})
                 }
             },
-            ClientPinSubCommand::GetPINHashEnc => match ctap.get_pin_hash_enc() {
-                Ok(hash_enc) => json!({"ok": true, "key_agreement": b64_encode(&hash_enc)}),
-                Err(error) => {
-                    json!({"ok": false, "code": error.as_u8(), "message": error.to_string()})
-                }
-            },
+            _ => {
+                json!({"ok": false, "code": 0x2E, "message": "sub_command nao suportado no modo JSON"})
+            }
         }
     }
 

@@ -213,4 +213,22 @@ mod tests {
         assert_eq!(received, payload);
         assert_eq!(transport.cid(), 0x44332211);
     }
+
+    #[test]
+    fn test_framed_usb_hid_recv_multi_packet() {
+        let mut mock = MockUsbHid::new();
+        let payload = (0..120).map(|i| (i % 256) as u8).collect::<Vec<_>>();
+        let pkts = CtaphidFragmenter::fragment(0x11223344, CtaphidCommand::Cbor, &payload).unwrap();
+
+        assert_eq!(pkts.len(), 3);
+        for pkt in pkts {
+            mock.queue_packet(pkt);
+        }
+
+        let mut transport = FramedUsbHidTransport::new(mock);
+        transport.init().unwrap();
+
+        assert_eq!(transport.recv().unwrap(), payload);
+        assert_eq!(transport.cid(), 0x11223344);
+    }
 }

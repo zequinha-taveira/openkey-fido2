@@ -1,6 +1,8 @@
 """Testes end-to-end do ClientPIN via simulador.
 
-Cobra getPINRetries, setPIN, changePIN, getPINToken e getPINHashEnc.
+Cobre getPINRetries, setPIN, changePIN e getPINToken pela rota JSON de
+conveniência do simulador (subcomandos com numeração CTAP 2.1). O fluxo
+criptográfico completo do wire é coberto em `conformance/test_client_pin.py`.
 """
 
 import base64
@@ -17,8 +19,14 @@ SIM_BIN = WORKSPACE_ROOT / "target" / "debug" / f"fido2-simulator{_EXE}"
 BUILD_TIMEOUT_S = 600
 RUN_TIMEOUT_S = 30
 
+# Subcomandos authenticatorClientPIN (CTAP 2.1 §6.5.5)
+SUB_GET_PIN_RETRIES = 0x01
+SUB_SET_PIN = 0x03
+SUB_CHANGE_PIN = 0x04
+SUB_GET_PIN_TOKEN = 0x05
+
 ERR_PIN_INVALID = 0x31
-ERR_PIN_REQUIRED = 0x35
+ERR_PIN_NOT_SET = 0x35
 ERR_PIN_POLICY_VIOLATION = 0x37
 
 
@@ -102,111 +110,106 @@ def simulator():
 
 
 class TestClientPIN:
-    """Testes do modulo ClientPIN via operacao `client_pin` do simulador."""
+    """Testes do módulo ClientPIN via operação `client_pin` do simulador."""
 
     def test_get_pin_retries_initial(self, simulator):
-        """PIN retries deve comecar em 8 quando nao configurado."""
+        """PIN retries deve começar em 8 quando não configurado."""
         simulator.reset()
-        result = simulator.client_pin(sub_command=0x03)
+        result = simulator.client_pin(sub_command=SUB_GET_PIN_RETRIES)
         assert result["ok"], result
         assert result["retries"] == 8
         assert result["power_cycle_state"] is False
 
     def test_set_pin_success(self, simulator):
-        """setPIN com PIN valido (>= 4 bytes) deve retornar sucesso."""
+        """setPIN com PIN válido (>= 4 bytes) deve retornar sucesso."""
         simulator.reset()
-        result = simulator.client_pin(sub_command=0x01, pin=b"1234")
+        result = simulator.client_pin(sub_command=SUB_SET_PIN, pin=b"1234")
         assert result["ok"], result
 
     def test_set_pin_too_short(self, simulator):
         """setPIN com PIN < 4 bytes deve retornar erro."""
         simulator.reset()
-        result = simulator.client_pin(sub_command=0x01, pin=b"12")
+        result = simulator.client_pin(sub_command=SUB_SET_PIN, pin=b"12")
         assert not result["ok"]
         assert result["code"] == ERR_PIN_POLICY_VIOLATION
 
     def test_change_pin_success(self, simulator):
-        """changePIN com PIN atual correto e novo PIN valido."""
+        """changePIN com PIN atual correto e novo PIN válido."""
         simulator.reset()
-        simulator.client_pin(sub_command=0x01, pin=b"1234")
-        result = simulator.client_pin(sub_command=0x02, pin=b"1234", new_pin=b"5678")
+        simulator.client_pin(sub_command=SUB_SET_PIN, pin=b"1234")
+        result = simulator.client_pin(
+            sub_command=SUB_CHANGE_PIN, pin=b"1234", new_pin=b"5678"
+        )
         assert result["ok"], result
 
     def test_change_pin_wrong_old_pin(self, simulator):
         """changePIN com PIN atual errado deve decrementar retries."""
         simulator.reset()
-        simulator.client_pin(sub_command=0x01, pin=b"1234")
+        simulator.client_pin(sub_command=SUB_SET_PIN, pin=b"1234")
 
-        result = simulator.client_pin(sub_command=0x02, pin=b"9999", new_pin=b"5678")
+        result = simulator.client_pin(
+            sub_command=SUB_CHANGE_PIN, pin=b"9999", new_pin=b"5678"
+        )
         assert not result["ok"]
         assert result["code"] == ERR_PIN_INVALID
 
-        retries = simulator.client_pin(sub_command=0x03)
+        retries = simulator.client_pin(sub_command=SUB_GET_PIN_RETRIES)
         assert retries["retries"] == 7
 
     def test_get_pin_token_after_set(self, simulator):
-        """getPINToken apos setPIN deve retornar token valido."""
+        """getPINToken após setPIN deve retornar token valido."""
         simulator.reset()
-        simulator.client_pin(sub_command=0x01, pin=b"1234")
+        simulator.client_pin(sub_command=SUB_SET_PIN, pin=b"1234")
 
-        result = simulator.client_pin(sub_command=0x05, pin=b"1234")
+        result = simulator.client_pin(sub_command=SUB_GET_PIN_TOKEN, pin=b"1234")
         assert result["ok"], result
         assert result["pin_uv_auth_token"]
         token = base64.b64decode(result["pin_uv_auth_token"])
         assert len(token) > 0
 
-    def test_get_pin_hash_enc(self, simulator):
-        """getPINHashEnc apos setPIN deve retornar hash criptografado."""
-        simulator.reset()
-        simulator.client_pin(sub_command=0x01, pin=b"1234")
-
-        result = simulator.client_pin(sub_command=0x06)
-        assert result["ok"], result
-        assert result["key_agreement"]
-        hash_enc = base64.b64decode(result["key_agreement"])
-        assert len(hash_enc) > 0
-
     def test_pin_retry_counter_decrement(self, simulator):
         """Retries deve decrementar em tentativa falha."""
         simulator.reset()
-        simulator.client_pin(sub_command=0x01, pin=b"1234")
+        simulator.client_pin(sub_command=SUB_SET_PIN, pin=b"1234")
 
-        simulator.client_pin(sub_command=0x02, pin=b"0000", new_pin=b"9999")
-        assert simulator.client_pin(sub_command=0x03)["retries"] == 7
+        simulator.client_pin(sub_command=SUB_CHANGE_PIN, pin=b"0000", new_pin=b"9999")
+        assert simulator.client_pin(sub_command=SUB_GET_PIN_RETRIES)["retries"] == 7
 
-        simulator.client_pin(sub_command=0x02, pin=b"0000", new_pin=b"9999")
-        assert simulator.client_pin(sub_command=0x03)["retries"] == 6
+        simulator.client_pin(sub_command=SUB_CHANGE_PIN, pin=b"0000", new_pin=b"9999")
+        assert simulator.client_pin(sub_command=SUB_GET_PIN_RETRIES)["retries"] == 6
 
     def test_pin_block_after_max_retries(self, simulator):
-        """PIN deve bloquear apos retries abaixo do threshold (powerCycleState)."""
+        """PIN deve bloquear após retries abaixo do threshold (powerCycleState)."""
         simulator.reset()
-        simulator.client_pin(sub_command=0x01, pin=b"1234")
+        simulator.client_pin(sub_command=SUB_SET_PIN, pin=b"1234")
 
         for _ in range(6):
-            simulator.client_pin(sub_command=0x02, pin=b"0000", new_pin=b"9999")
+            simulator.client_pin(sub_command=SUB_CHANGE_PIN, pin=b"0000", new_pin=b"9999")
 
-        result = simulator.client_pin(sub_command=0x03)
+        result = simulator.client_pin(sub_command=SUB_GET_PIN_RETRIES)
         assert result["power_cycle_state"] is True
 
     def test_get_pin_token_wrong_pin(self, simulator):
         """getPINToken com PIN errado deve retornar PinInvalid."""
         simulator.reset()
-        simulator.client_pin(sub_command=0x01, pin=b"1234")
+        simulator.client_pin(sub_command=SUB_SET_PIN, pin=b"1234")
 
-        result = simulator.client_pin(sub_command=0x05, pin=b"9999")
+        result = simulator.client_pin(sub_command=SUB_GET_PIN_TOKEN, pin=b"9999")
         assert not result["ok"]
         assert result["code"] == ERR_PIN_INVALID
 
     def test_get_pin_token_no_pin_set(self, simulator):
-        """getPINToken sem PIN configurado deve retornar PinRequired."""
+        """getPINToken sem PIN configurado deve retornar PinNotSet."""
         simulator.reset()
-        result = simulator.client_pin(sub_command=0x05, pin=b"1234")
+        result = simulator.client_pin(sub_command=SUB_GET_PIN_TOKEN, pin=b"1234")
         assert not result["ok"]
-        assert result["code"] == ERR_PIN_REQUIRED
+        assert result["code"] == ERR_PIN_NOT_SET
 
-    def test_get_pin_hash_enc_no_pin_set(self, simulator):
-        """getPINHashEnc sem PIN configurado deve retornar PinRequired."""
+    def test_change_pin_no_pin_set(self, simulator):
+        """changePIN sem PIN configurado deve retornar PinNotSet."""
         simulator.reset()
-        result = simulator.client_pin(sub_command=0x06)
+        result = simulator.client_pin(
+            sub_command=SUB_CHANGE_PIN, pin=b"1234", new_pin=b"5678"
+        )
         assert not result["ok"]
-        assert result["code"] == ERR_PIN_REQUIRED
+        assert result["code"] == ERR_PIN_NOT_SET

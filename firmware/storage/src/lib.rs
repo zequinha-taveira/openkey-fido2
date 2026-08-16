@@ -7,6 +7,6 @@
 pub mod storage;
 
 pub use storage::{
-    Credential, FileStorageBackend, FlashStorageBackend, StorageBackend, StorageEngine,
-    StorageError, StoredCredential,
+    Credential, FileStorageBackend, FlashDevice, FlashStorageBackend, SimulatedFlash,
+    StorageBackend, StorageEngine, StorageError, StoredCredential,
 };

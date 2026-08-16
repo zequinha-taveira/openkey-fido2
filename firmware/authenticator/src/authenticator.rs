@@ -61,17 +61,30 @@ impl EmbeddedAuthenticator {
     pub fn new_with_profile(profile: DeviceProfile) -> Result<Self, Box<dyn std::error::Error>> {
         let crypto = CryptoEngine::new()?;
         let storage = StorageEngine::new()?;
-        let mut webauthn = WebAuthnAuthenticator::new(profile.aaguid, crypto, storage)?;
-        let transport = init_transport(&profile.transport_config);
-        let discovery = CapabilityDiscovery::new(profile);
-        webauthn.set_capabilities(ctap2_capabilities(&discovery.capabilities()));
+        let authenticator = Self::from_profile_and_storage(profile, crypto, storage, None)?;
 
         info!("FIDO2 Embedded Authenticator initialized");
-        Ok(Self {
-            webauthn,
-            discovery,
-            transport,
-        })
+        Ok(authenticator)
+    }
+
+    /// Cria um autenticador com um perfil e um transporte fornecidos pelo chamador.
+    ///
+    /// O transporte injetado substitui o stub derivado de
+    /// `profile.transport_config`. Ele não é inicializado implicitamente;
+    /// controle o ciclo de vida por [`EmbeddedAuthenticator::transport_mut`].
+    /// Isso permite compor um adaptador USB-HID com um backend de host ou de
+    /// hardware sem alterar os construtores existentes.
+    pub fn new_with_profile_and_transport(
+        profile: DeviceProfile,
+        transport: Box<dyn Transport>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let crypto = CryptoEngine::new()?;
+        let storage = StorageEngine::new()?;
+        let authenticator =
+            Self::from_profile_and_storage(profile, crypto, storage, Some(transport))?;
+
+        info!("FIDO2 Embedded Authenticator initialized with injected transport");
+        Ok(authenticator)
     }
 
     /// Cria um autenticador com credenciais persistidas em arquivo.
@@ -87,12 +100,23 @@ impl EmbeddedAuthenticator {
         let crypto = CryptoEngine::from_key(key);
         let backend = FileStorageBackend::new(path)?;
         let storage = StorageEngine::with_backend(Box::new(backend));
+        let authenticator = Self::from_profile_and_storage(profile, crypto, storage, None)?;
+
+        info!("FIDO2 Embedded Authenticator initialized with persistent storage");
+        Ok(authenticator)
+    }
+
+    fn from_profile_and_storage(
+        profile: DeviceProfile,
+        crypto: CryptoEngine,
+        storage: StorageEngine,
+        injected_transport: Option<Box<dyn Transport>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut webauthn = WebAuthnAuthenticator::new(profile.aaguid, crypto, storage)?;
-        let transport = init_transport(&profile.transport_config);
+        let transport = injected_transport.or_else(|| init_transport(&profile.transport_config));
         let discovery = CapabilityDiscovery::new(profile);
         webauthn.set_capabilities(ctap2_capabilities(&discovery.capabilities()));
 
-        info!("FIDO2 Embedded Authenticator initialized with persistent storage");
         Ok(Self {
             webauthn,
             discovery,
@@ -100,7 +124,7 @@ impl EmbeddedAuthenticator {
         })
     }
 
-    /// Transporte configurado no perfil, quando houver.
+    /// Transporte configurado no perfil ou injetado pelo chamador, quando houver.
     pub fn transport(&self) -> Option<&dyn Transport> {
         self.transport.as_deref()
     }
@@ -286,7 +310,17 @@ fn ctap2_capabilities(caps: &Capabilities) -> ctap2::Ctap2Capabilities {
     }
     if caps.client_pin_available {
         options.push("clientPin".to_string());
+        options.push("pinUvAuthToken".to_string());
     }
+    // Credential Management é implementado pela máquina CTAP2 e precisa ser
+    // anunciado para permitir tokens PIN com escopo CM.
+    options.push("credMgmt".to_string());
+
+    let pin_uv_auth_protocols = if caps.client_pin_available || caps.uv {
+        alloc::vec![1, 2]
+    } else {
+        alloc::vec::Vec::new()
+    };
 
     ctap2::Ctap2Capabilities {
         aaguid: caps.aaguid,
@@ -299,6 +333,7 @@ fn ctap2_capabilities(caps: &Capabilities) -> ctap2::Ctap2Capabilities {
         max_credential_count: caps.max_credentials,
         firmware_version: caps.firmware_version.to_string(),
         min_pin_length: Some(4),
+        pin_uv_auth_protocols,
         security: ctap2::SecurityFeatures {
             secure_boot: caps.security.secure_boot,
             trust_zone: caps.security.trust_zone,
@@ -343,6 +378,7 @@ mod tests {
                 up,
                 extended: false,
             },
+            pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
         }

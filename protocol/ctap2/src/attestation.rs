@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use ciborium::value::Integer;
 use ciborium::Value;
 use crypto::CryptoEngine;
+use zeroize::Zeroize;
 
 extern crate alloc;
 
@@ -40,7 +41,8 @@ impl AttestationFormat {
 }
 
 /// X.509 attestation certificate and its private key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize)]
+#[zeroize(drop)]
 pub struct AttestationCertificate {
     /// Certificado X.509 em DER, publicado no campo `x5c`.
     pub cert: Vec<u8>,
@@ -198,5 +200,17 @@ mod tests {
         assert!(att_stmt.contains_key(&3));
         assert!(att_stmt.contains_key(&2));
         assert!(att_stmt.contains_key(&1));
+    }
+
+    #[test]
+    fn test_attestation_private_key_zeroization() {
+        let mut cert = AttestationCertificate {
+            cert: vec![0x30, 0x01],
+            private_key: vec![0xAA; 32],
+        };
+
+        cert.zeroize();
+
+        assert!(cert.private_key.iter().all(|byte| *byte == 0));
     }
 }

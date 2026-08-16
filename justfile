@@ -101,11 +101,11 @@ check-rp2350-firmware:
 
 # Compilar o firmware bare-metal completo para nRF52840 (gera .elf)
 build-nrf52840-firmware:
-    cd examples/nrf52840-firmware && cargo build
+    cd examples/nrf52840-firmware && cargo build --locked --target thumbv7em-none-eabihf
 
 # Checar o firmware bare-metal do nRF52840 sem gerar binario
 check-nrf52840-firmware:
-    cd examples/nrf52840-firmware && cargo check
+    cd examples/nrf52840-firmware && cargo check --locked --target thumbv7em-none-eabihf
 
 # Compilacao cruzada para nRF52840 (ARM Cortex-M4F)
 build-nrf52840:

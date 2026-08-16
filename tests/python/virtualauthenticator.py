@@ -78,6 +78,7 @@ _RESPONSE_KEYS: dict[int, dict[int, str]] = {
         0x03: "aaguid",
         0x04: "options",
         0x0A: "algorithms",
+        0x0E: "firmwareVersion",
     },
 }
 
