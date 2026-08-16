@@ -163,7 +163,7 @@ impl PinUvProtocol {
     /// - Protocolo 2: AES-256-CBC com a metade AES de `shared_secret`
     ///   (64 bytes) e IV aleatório de 16 bytes prefixado ao ciphertext.
     pub fn encrypt(&self, shared_secret: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
-        if !plaintext.len().is_multiple_of(AES_BLOCK_LEN) {
+        if plaintext.len() % AES_BLOCK_LEN != 0 {
             return Err(format!(
                 "Plaintext must be a multiple of {} bytes, got {}",
                 AES_BLOCK_LEN,
@@ -280,7 +280,7 @@ pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
     if iv.len() != AES_BLOCK_LEN {
         return Err("AES IV must be 16 bytes".into());
     }
-    if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+    if data.len() % AES_BLOCK_LEN != 0 {
         return Err("AES-CBC input must be a multiple of 16 bytes".into());
     }
     let mut buf = data.to_vec();
@@ -302,7 +302,7 @@ pub fn aes256_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
     if iv.len() != AES_BLOCK_LEN {
         return Err("AES IV must be 16 bytes".into());
     }
-    if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+    if data.len() % AES_BLOCK_LEN != 0 {
         return Err("AES-CBC input must be a multiple of 16 bytes".into());
     }
     let mut buf = data.to_vec();

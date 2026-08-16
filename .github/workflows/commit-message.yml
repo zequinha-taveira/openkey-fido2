@@ -34,6 +34,7 @@ jobs:
           # are auto-generated and don't follow the lowercase convention.
           MSG=$(git log -1 --format=%s --no-merges "$SHA")
           echo "message=$MSG" >> $GITHUB_OUTPUT
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
 
       - name: Validate format
         run: |
@@ -48,7 +49,8 @@ jobs:
             exit 1
           fi
           # Check for ADR reference when docs/adr changed
-          if git diff HEAD~1 HEAD --name-only | grep -q '^docs/adr/'; then
+          COMMIT_SHA="${{ steps.get-message.outputs.sha }}"
+          if git diff "${COMMIT_SHA}^" "$COMMIT_SHA" --name-only | grep -q '^docs/adr/'; then
             if [[ ! $MSG =~ adr: ]]; then
               echo "❌ ADR files changed but no 'adr: ADR-XXXX' reference"
               exit 1
