@@ -45,7 +45,7 @@ zeroize = { version = "1.7", features = ["derive"] }
 rand = "0.8"
 x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }
 aes = "0.8"
-cbc = "0.1"
+cbc = "0.2"
 
 [profile.dev]
 opt-level = 2
