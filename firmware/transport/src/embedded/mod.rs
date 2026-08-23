@@ -35,6 +35,9 @@ pub mod usb_hid;
 #[cfg(feature = "usb-device")]
 pub mod usb_hid_backend;
 
+#[cfg(feature = "usb-device")]
+pub mod usb_ccid_backend;
+
 #[cfg(feature = "embedded")]
 pub use ble_gatt::BleGattDevice;
 
@@ -46,6 +49,9 @@ pub use usb_ccid::{ApduCommand, ApduResponse, UsbCcidDevice};
 
 #[cfg(feature = "embedded")]
 pub use usb_hid::UsbHidDevice;
+
+#[cfg(feature = "usb-device")]
+pub use usb_ccid_backend::{CcidApduHandler, CcidClass, UsbCcidBackend};
 
 #[cfg(feature = "usb-device")]
 pub use usb_hid_backend::{CtapHidClass, UsbHidBackend};

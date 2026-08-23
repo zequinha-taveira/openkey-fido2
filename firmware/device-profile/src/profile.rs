@@ -1,3 +1,4 @@
+use alloc::vec;
 use alloc::vec::Vec;
 use board_generic::BoardDefinition;
 use board_generic::{

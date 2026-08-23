@@ -24,6 +24,9 @@ class CtapCmd:
     CRED_MGMT = 0x0A
     SELECTION = 0x0B
     LARGE_BLOBS = 0x0C
+    AUTHNR_CONFIG = 0x0D
+    ENUMERATE_RPS_INITIAL = 0x3B
+    ENUMERATE_RPS_NEXT = 0x3C
 
 
 class CtapError:
@@ -36,6 +39,9 @@ class CtapError:
     INVALID_SEQUENCE = 0x04
     INVALID_CBOR = 0x12
     TIMEOUT = 0x05
+    # CTAP2_ERR_NOT_ALLOWED: comando não permitido no estado atual
+    # (ex.: GetNextAssertion sem GetAssertion prévio).
+    INVALID_STATE = NOT_ALLOWED = 0x30
     CHANNEL_BUSY = 0x06
     CREDENTIAL_EXCLUDED = 0x19
     UNSUPPORTED_ALGORITHM = 0x26
@@ -128,6 +134,32 @@ class SimulatorClient:
             chunks.append(chunk)
             remaining -= len(chunk)
         return b"".join(chunks)
+
+    def send_frame(self, frame: bytes) -> None:
+        """Escreve bytes crus no stdin sem montar framing válido.
+
+        Usado por testes de injeção de falha na camada de transporte: o
+        chamador controla exatamente o que entra no pipe (frames com
+        comprimento zero, truncados etc.) e observa a reação do simulador.
+        """
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(frame)
+        self._proc.stdin.flush()
+
+    def close_stdin(self) -> None:
+        """Fecha o stdin para sinalizar fim do stream ao simulador."""
+        if self._proc.stdin and not self._proc.stdin.closed:
+            try:
+                self._proc.stdin.close()
+            except OSError:
+                pass
+
+    def wait_exited(self, timeout: float = 5.0) -> int | None:
+        """Aguarda o processo terminar e retorna seu código de saída."""
+        try:
+            return self._proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
 
     def send_raw(self, cmd: int, payload: bytes = b"") -> tuple[int, bytes]:
         """Envia um comando CTAP2 cru e retorna (status_code, response_bytes)."""

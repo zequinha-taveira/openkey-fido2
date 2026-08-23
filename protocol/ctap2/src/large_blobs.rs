@@ -1,5 +1,8 @@
 //! Estruturas de requisição e resposta do comando LargeBlobs (CTAP 2.1 §6.10, Opcode 0x0C).
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// Requisição para o comando LargeBlobs (0x0C).

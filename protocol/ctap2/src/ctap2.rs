@@ -1,5 +1,7 @@
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use ciborium::de::from_reader;
 use ciborium::ser::into_writer;
@@ -8,14 +10,14 @@ use ciborium::Value;
 use crypto::CryptoEngine;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
-use storage::{Credential, StorageEngine};
+use storage::{Credential, StorageEngine, CRED_PROTECT_UV_REQUIRED, MAX_LARGE_BLOBS_SIZE};
 
 extern crate alloc;
 
 use crate::attestation::{AttestationFormat, PackedAttestation, SelfAttestation};
 use crate::client_pin;
 use crate::cred_mgmt;
+use crate::hmac_secret;
 use crate::large_blobs;
 
 /// Comando CTAP2 serializado para transporte.
@@ -105,16 +107,62 @@ pub struct CredentialDescriptor {
     pub transports: Option<Vec<String>>,
 }
 
+/// Helpers serde para campos `Option<Vec<u8>>` que representam byte strings
+/// CBOR.
+///
+/// `#[serde(with = "serde_bytes")]` sobre um campo opcional deserializa via
+/// `Option<Vec<u8>>::deserialize`, que chega ao formato CBOR como sequência
+/// (`deserialize_seq`) — o ciborium rejeita uma byte string nesse caminho e
+/// a requisição vira `InvalidCbor`. O módulo abaixo força o caminho correto:
+/// `deserialize_option` seguido de `deserialize_byte_buf`.
+mod serde_bytes_opt {
+    extern crate alloc;
+    use alloc::vec::Vec;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use serde_bytes::ByteBuf;
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Option::<ByteBuf>::deserialize(deserializer)?.map(ByteBuf::into_vec))
+    }
+
+    pub(super) fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(bytes) => serializer.serialize_some(&ByteBuf::from(bytes.as_slice())),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Extensions {
-    #[serde(rename = "credProtect")]
-    pub cred_protect: Option<CredProtectPolicy>,
-    #[serde(with = "serde_bytes", rename = "credBlob")]
+    // Campos opcionais exigem `default` explícito quando usam helper serde.
+    /// Nível cru da extensão `credProtect` (CTAP 2.1 §12.2.2). O wire codifica
+    /// um inteiro CBOR (1..3), não um enum com tags — portanto o campo é
+    /// `u8` e a conversão para [`CredProtectPolicy`] acontece nos pontos de
+    /// uso via [`From<u8>`].
+    #[serde(rename = "credProtect", default)]
+    pub cred_protect: Option<u8>,
+    /// Blob customizado da credencial (`credBlob`, byte string CBOR).
+    #[serde(with = "serde_bytes_opt", rename = "credBlob", default)]
     pub cred_blob: Option<Vec<u8>>,
     #[serde(rename = "minPinLength", default)]
     pub min_pin_length: bool,
-    #[serde(rename = "hmac-secret")]
-    pub hmac_secret: Option<HmacSecretInput>,
+    /// Entrada bruta da extensão `hmac-secret` (CTAP 2.1 §12.5): booleano no
+    /// MakeCredential ou mapa `{1: keyAgreement, 2: saltEnc, 3: saltAuth,
+    /// 4: pinUvAuthProtocol}` no GetAssertion. Interpretada por
+    /// [`crate::hmac_secret`].
+    #[serde(
+        rename = "hmac-secret",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hmac_secret: Option<Value>,
     #[serde(rename = "largeBlobKey", default)]
     pub large_blob_key: bool,
 }
@@ -127,17 +175,6 @@ impl Extensions {
             || self.hmac_secret.is_some()
             || self.large_blob_key
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-/// Input da extensão `hmac-secret` para derivação de segredo compartilhado.
-pub struct HmacSecretInput {
-    /// Salt cifrado com keyAgreement (ChaCha20-Poly1305).
-    #[serde(with = "serde_bytes", rename = "saltEnc")]
-    pub salt_enc: Vec<u8>,
-    /// Versão do protocolo PIN/UV auth utilizada.
-    #[serde(rename = "pinUvAuthProtocol")]
-    pub pin_uv_auth_protocol: Option<u8>,
 }
 
 /// Opções do comando MakeCredential (mapa `options` do CTAP2).
@@ -177,29 +214,31 @@ pub struct MakeCredentialResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtensionOutputs {
     /// Política de proteção da credencial (extensão `credProtect`).
-    #[serde(rename = "credProtect", skip_serializing_if = "Option::is_none")]
+    // Campos opcionais exigem `default` explícito quando usam helper serde:
+    // respostas podem carregar apenas um subconjunto das extensões.
+    #[serde(rename = "credProtect", default)]
     pub cred_protect: Option<u8>,
     /// Comprimento mínimo de PIN aceito (extensão `minPinLength`).
-    #[serde(rename = "minPinLength", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "minPinLength", default)]
     pub min_pin_length: Option<u32>,
     /// Blob customizado da credencial (extensão `credBlob`).
     #[serde(
         with = "serde_bytes",
         rename = "credBlob",
+        default,
         skip_serializing_if = "Option::is_none"
     )]
     pub cred_blob: Option<Vec<u8>>,
-    /// Segredo HMAC compartilhado (extensão `hmac-secret`).
-    #[serde(
-        with = "serde_bytes",
-        rename = "hmac-secret",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub hmac_secret: Option<Vec<u8>>,
+    /// Segredo HMAC compartilhado (extensão `hmac-secret`): saída booleana
+    /// no MakeCredential ou bytes cifrados sob o segredo compartilhado no
+    /// GetAssertion (CTAP 2.1 §12.5).
+    #[serde(rename = "hmac-secret", default)]
+    pub hmac_secret: Option<Value>,
     /// Chave simétrica associada à credencial (extensão `largeBlobKey`).
     #[serde(
         with = "serde_bytes",
         rename = "largeBlobKey",
+        default,
         skip_serializing_if = "Option::is_none"
     )]
     pub large_blob_key: Option<Vec<u8>>,
@@ -230,7 +269,7 @@ pub struct GetAssertionRequest {
     #[serde(rename = "rpId")]
     pub rp_id: String,
     /// Lista de credenciais permitidas (resident keys), no campo CTAP `allowList`.
-    #[serde(rename = "allowList")]
+    #[serde(rename = "allowList", default)]
     pub credentials: Vec<CredentialDescriptor>,
     /// Alias interno legado; não é serializado no wire format.
     #[serde(skip)]
@@ -240,7 +279,8 @@ pub struct GetAssertionRequest {
     pub client_data_hash: Vec<u8>,
     /// Extensões WebAuthn ativas.
     pub extensions: Option<Extensions>,
-    /// Opções do comando.
+    /// Opções do comando. Mapa ausente no request ⇒ default da spec.
+    #[serde(default)]
     pub options: GetAssertionOptions,
     /// MAC do `clientDataHash` produzido pelo `pinUvAuthToken`.
     #[serde(
@@ -258,12 +298,30 @@ pub struct GetAssertionRequest {
 }
 
 /// Opções do comando GetAssertion.
+///
+/// Campos ausentes no mapa `options` recebem os defaults da spec
+/// (CTAP 2.1 §6.8.3): `up=true`, `uv=false`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAssertionOptions {
-    /// User presence — exigir toque físico.
+    /// User presence — exigir toque físico. Ausente ⇒ verdadeiro.
+    #[serde(default = "default_true")]
     pub up: bool,
-    /// User verification — exigir PIN/biometria.
+    /// User verification — exigir PIN/biometria. Ausente ⇒ falso.
+    #[serde(default)]
     pub uv: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for GetAssertionOptions {
+    fn default() -> Self {
+        Self {
+            up: true,
+            uv: false,
+        }
+    }
 }
 
 /// Resposta do comando GetAssertion.
@@ -415,6 +473,8 @@ pub enum Ctap2Command {
     Selection = 0x0B,
     /// LargeBlobs (0x0C) — leitura e escrita de large blobs no autenticador.
     LargeBlobs = 0x0C,
+    /// AuthenticatorConfig (0x0D) — opções de configuração do autenticador.
+    AuthenticatorConfig = 0x0D,
     /// GetVersion (0x0F) — retorna versões de firmware/hardware.
     GetVersion = 0x0F,
     /// EnumerateRPsInitial (0x3B) — inicia enumeração de relying parties.
@@ -438,6 +498,7 @@ impl Ctap2Command {
             0x0A => Ctap2Command::CredentialManagement,
             0x0B => Ctap2Command::Selection,
             0x0C => Ctap2Command::LargeBlobs,
+            0x0D => Ctap2Command::AuthenticatorConfig,
             0x0F => Ctap2Command::GetVersion,
             0x3B => Ctap2Command::EnumerateRPsInitial,
             0x3C => Ctap2Command::EnumerateRPsNext,
@@ -461,14 +522,17 @@ pub enum Ctap2Error {
     InvalidParameter = 0x02,
     /// Comprimento do payload incorreto.
     InvalidLength = 0x03,
-    /// Dados malformados ou inválidos.
-    InvalidData = 0x04,
     /// Parâmetro obrigatório ausente.
     MissingParameter = 0x14,
     /// Payload CBOR malformado.
     InvalidCbor = 0x12,
-    /// Comando inválido no estado atual.
-    InvalidState = 0x05,
+    /// Comando inválido no estado atual (CTAP2_ERR_NOT_ALLOWED).
+    ///
+    /// 0x30 é o código da spec para operação não permitida no estado corrente
+    /// (ex.: GetNextAssertion sem GetAssertion prévio). NÃO usar 0x05: na
+    /// tabela CTAP esse valor significa CTAP1_ERR_TIMEOUT e hosts reais
+    /// (python-fido2, Chrome, libfido2) o interpretam como timeout.
+    InvalidState = 0x30,
     /// Opção não suportada.
     InvalidOption = 0x2C,
     /// Timeout na operação.
@@ -516,7 +580,12 @@ pub enum Ctap2Error {
     RequestTooLarge = 0x39,
     /// Array de large blobs está cheio ou excede o limite máximo.
     LargeBlobStorageFull = 0x18,
-    /// Erro não categorizado.
+    /// Erro interno não categorizado (CTAP2 "unspecified failure").
+    ///
+    /// 0x7F é o único código seguro para falhas internas (ex.: falha ao
+    /// codificar a resposta): hosts reais tratam como falha genérica. NÃO
+    /// usar 0x04, que na tabela CTAP significa CTAP1_ERR_INVALID_SEQ e é
+    /// interpretado como erro da camada de transporte.
     Unknown = 0x7F,
 }
 
@@ -532,7 +601,7 @@ impl core::fmt::Display for Ctap2Error {
     }
 }
 
-impl std::error::Error for Ctap2Error {}
+impl core::error::Error for Ctap2Error {}
 
 /// Credential protection policy (CTAP2 `credProtect` extension).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -561,16 +630,28 @@ impl From<CredProtectPolicy> for u8 {
 }
 
 /// Maps a boxed error back to a CTAP2 status code.
-fn ctap2_error(error: Box<dyn std::error::Error>) -> Ctap2Error {
+fn ctap2_error(error: Box<dyn core::error::Error>) -> Ctap2Error {
     error
         .downcast_ref::<Ctap2Error>()
         .copied()
-        .unwrap_or(Ctap2Error::InvalidData)
+        .unwrap_or(Ctap2Error::Unknown)
 }
 
 pub const AAGUID: [u8; 16] = [0u8; 16];
 
+/// Chave do contador global de assinaturas no key-value store.
+///
+/// Compartilhado por todas as credenciais: cada GetAssertion/GetNextAssertion
+/// o incrementa e persiste, para que asserções sucessivas nunca repitam valor
+/// (mecanismo WebAuthn contra clonagem do autenticador).
+const SIGN_COUNTER_STORAGE_KEY: &str = "global_sign_count";
+
 const FIRMWARE_VERSION_COMPONENT_BASE: u32 = 1_000;
+
+/// Política `credProtect` de nível 2 (CTAP 2.1 §12.2.2):
+/// descobrível sem UV somente quando nomeada na allowList da requisição.
+const CRED_PROTECT_ALLOWLIST_REQUIRED: u8 =
+    CredProtectPolicy::UserVerificationOptionalWithCredentialIDList as u8;
 
 /// Converte o núcleo numérico de uma versão semântica para `firmwareVersion`.
 ///
@@ -585,21 +666,21 @@ fn firmware_version_to_ctap_integer(version: &str) -> Result<u32, Ctap2Error> {
         component
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value < FIRMWARE_VERSION_COMPONENT_BASE)
-            .ok_or(Ctap2Error::InvalidData)
+            .ok_or(Ctap2Error::Unknown)
     };
 
     let major = parse_component(components.next())?;
     let minor = parse_component(components.next())?;
     let patch = parse_component(components.next())?;
     if components.next().is_some() {
-        return Err(Ctap2Error::InvalidData);
+        return Err(Ctap2Error::Unknown);
     }
 
     major
         .checked_mul(FIRMWARE_VERSION_COMPONENT_BASE.pow(2))
         .and_then(|value| value.checked_add(minor * FIRMWARE_VERSION_COMPONENT_BASE))
         .and_then(|value| value.checked_add(patch))
-        .ok_or(Ctap2Error::InvalidData)
+        .ok_or(Ctap2Error::Unknown)
 }
 
 fn hash_rp_id(rp_id: &str, crypto: &CryptoEngine) -> [u8; 32] {
@@ -983,18 +1064,21 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
 
 pub fn encode_cbor<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Ctap2Error> {
     let mut raw = Vec::new();
-    ciborium::ser::into_writer(value, &mut raw).map_err(|_| Ctap2Error::InvalidData)?;
-    let parsed: Value = from_reader(raw.as_slice()).map_err(|_| Ctap2Error::InvalidData)?;
+    ciborium::ser::into_writer(value, &mut raw).map_err(|_| Ctap2Error::Unknown)?;
+    let parsed: Value = from_reader(raw.as_slice()).map_err(|_| Ctap2Error::Unknown)?;
     let normalized = root_ctap_keys(parsed, true, core::any::type_name::<T>());
     let mut buf = alloc::vec![];
-    into_writer(&normalized, &mut buf).map_err(|_| Ctap2Error::InvalidData)?;
+    into_writer(&normalized, &mut buf).map_err(|_| Ctap2Error::Unknown)?;
     Ok(buf)
 }
 
 pub fn decode_cbor<T: DeserializeOwned>(data: &[u8]) -> Result<T, Ctap2Error> {
-    let mut reader = Cursor::new(data);
-    let parsed: Value = from_reader(&mut reader).map_err(|_| Ctap2Error::InvalidCbor)?;
-    if reader.position() != data.len() as u64 {
+    // A fatia é o próprio leitor (`ciborium_io::Read for &[u8]`, também via
+    // blanket em host); após decodificar, `restante` guarda os bytes não
+    // consumidos — equivalente ao `Cursor::position()` do modo host.
+    let mut restante = data;
+    let parsed: Value = from_reader(&mut restante).map_err(|_| Ctap2Error::InvalidCbor)?;
+    if !restante.is_empty() {
         return Err(Ctap2Error::InvalidCbor);
     }
     let normalized = root_ctap_keys(parsed, false, core::any::type_name::<T>());
@@ -1117,6 +1201,18 @@ pub struct Ctap2Authenticator {
     user_presence: Option<Box<dyn UserPresence>>,
     pin_uv_auth_token: Option<client_pin::PinUvAuthTokenState>,
     pin_agreement_key: Option<crypto::pin_protocol::PinAgreementKey>,
+    pin_shared_secret: Option<(crypto::pin_protocol::Zeroizing<Vec<u8>>, u8)>,
+    /// Sessão hmac-secret da transação corrente (ADR-0022): guarda o segredo
+    /// compartilhado e os salts decifrados da asserção inicial com a extensão,
+    /// para produzir a saída de cada asserção encadeada. Vive apenas em
+    /// memória, pela duração de uma transação de user presence; é descartada
+    /// por qualquer comando que não seja GetNextAssertion, ao fim da cadeia ou
+    /// no Reset (Zeroizing apaga o material no drop).
+    hmac_secret_session: Option<hmac_secret::HmacSecretSession>,
+    /// Falhas consecutivas de PIN na sessão atual, base do bloqueio volátil
+    /// `PIN_AUTH_BLOCKED`. Volátil por definição: nasce zerado em cada
+    /// instância (um power cycle encerra o bloqueio — CTAP 2.1 §6.5.5.6).
+    pin_failures_since_reset: u8,
 }
 
 #[derive(Debug)]
@@ -1143,15 +1239,22 @@ struct EnumerateCredentialsState {
 #[derive(Debug)]
 struct GetNextAssertionState {
     rp_id: String,
-    #[allow(dead_code)]
+    /// Hash do clientData assinado na asserção inicial; cada GetNextAssertion
+    /// assina `authData || clientDataHash` com o mesmo valor (CTAP2 §6.2).
     client_data_hash: Vec<u8>,
     allow_list: Vec<CredentialDescriptor>,
-    #[allow(dead_code)]
+    /// Flags UP/UV da asserção inicial, espelhados nas próximas respostas.
+    flags: u8,
+    /// Extensões da requisição inicial: a presença de `hmac-secret` define
+    /// se as asserções encadeadas recebem saída da extensão (ADR-0022).
     extensions: Option<Extensions>,
     #[allow(dead_code)]
     options: GetAssertionOptions,
     #[allow(dead_code)]
     pin_protocol: Option<u8>,
+    /// UV válido na asserção inicial — mantém o filtro `credProtect`
+    /// consistente nas asserções seguintes (CTAP 2.1 §6.8.2).
+    uv_satisfied: bool,
     current_index: usize,
 }
 
@@ -1160,7 +1263,7 @@ impl Ctap2Authenticator {
         aaguid: [u8; 16],
         crypto: CryptoEngine,
         storage: StorageEngine,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn core::error::Error>> {
         let capabilities = Ctap2Capabilities {
             aaguid,
             ..Default::default()
@@ -1180,6 +1283,9 @@ impl Ctap2Authenticator {
             user_presence: None,
             pin_uv_auth_token: None,
             pin_agreement_key: None,
+            pin_shared_secret: None,
+            hmac_secret_session: None,
+            pin_failures_since_reset: 0,
         })
     }
 
@@ -1234,7 +1340,7 @@ impl Ctap2Authenticator {
     pub fn make_credential(
         &mut self,
         request: MakeCredentialRequest,
-    ) -> Result<MakeCredentialResponse, Box<dyn std::error::Error>> {
+    ) -> Result<MakeCredentialResponse, Box<dyn core::error::Error>> {
         debug!("Processing MakeCredential request");
 
         let pin_authenticated = self
@@ -1245,8 +1351,12 @@ impl Ctap2Authenticator {
                 client_pin::PERMISSION_MC,
                 Some(&request.rp.id),
             )
-            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+            .map_err(|error| Box::new(error) as Box<dyn core::error::Error>)?;
         if request.options.uv && client_pin::is_pin_set(&self.storage) && !pin_authenticated {
+            return Err(Box::new(Ctap2Error::PinRequired));
+        }
+        if crate::authnr_config::is_always_uv(&self.storage) && !request.options.uv {
+            // alwaysUv exige uv em todo MakeCredential (CTAP 2.1 §6.11.2.3).
             return Err(Box::new(Ctap2Error::PinRequired));
         }
 
@@ -1270,7 +1380,12 @@ impl Ctap2Authenticator {
                     -7 => Some(-7),
                     -8 => Some(-8),
                     -35 => Some(-35),
+                    // Algoritmos RSA exigem geração de chave via a feature
+                    // `rs256` da crate crypto; sem ela, caem no `_` e o
+                    // MakeCredential responde UnsupportedAlgorithm.
+                    #[cfg(feature = "rs256")]
                     -37 => Some(-37),
+                    #[cfg(feature = "rs256")]
                     -257 => Some(-257),
                     _ => None,
                 })
@@ -1302,12 +1417,14 @@ impl Ctap2Authenticator {
             .extensions
             .as_ref()
             .and_then(|ext| ext.cred_protect)
+            .map(CredProtectPolicy::from)
             .unwrap_or_default();
 
         let credential_id = self.generate_credential_id();
         let (private_key, public_key) = match selected_alg {
             -7 => self.crypto.generate_p256_key_pair()?,
             -35 => self.crypto.generate_p384_key_pair()?,
+            #[cfg(feature = "rs256")]
             -37 | -257 => {
                 // RSA: keep the PKCS#1 DER public key so both the COSE key and
                 // signature verification can be derived from it.
@@ -1330,6 +1447,26 @@ impl Ctap2Authenticator {
             None
         };
 
+        // hmac-secret (CTAP 2.1 §12.5): entrada booleana no MakeCredential —
+        // gera e associa `CredRandomWithUV`/`CredRandomWithoutUV` à credencial.
+        let (cred_random_with_uv, cred_random_without_uv) = match request
+            .extensions
+            .as_ref()
+            .and_then(|e| e.hmac_secret.as_ref())
+        {
+            Some(raw) => {
+                if hmac_secret::parse_make_credential(raw)? {
+                    (
+                        Some(self.crypto.random_bytes(32)),
+                        Some(self.crypto.random_bytes(32)),
+                    )
+                } else {
+                    (None, None)
+                }
+            }
+            None => (None, None),
+        };
+
         let credential = Credential {
             credential_id: credential_id.clone(),
             public_key: public_key.clone(),
@@ -1344,6 +1481,11 @@ impl Ctap2Authenticator {
             large_blob_key: large_blob_key.clone(),
             user_name: request.user.name.clone(),
             user_display_name: request.user.display_name.clone(),
+            // Política `credProtect` persistida para ser aplicada em
+            // GetAssertion e exposta pelo Credential Management (CTAP 2.1 §6.8.2).
+            cred_protect: Some(cred_protect_policy.into()),
+            cred_random_with_uv,
+            cred_random_without_uv,
         };
 
         self.storage.store_credential(credential, &self.crypto)?;
@@ -1352,11 +1494,14 @@ impl Ctap2Authenticator {
         if request.options.up {
             flags |= 0x01;
         }
-        if request.options.uv || pin_authenticated {
-            flags |= 0x04;
-        }
-
-        if cred_protect_policy == CredProtectPolicy::UserVerificationRequired {
+        // O bit UV reflete verificação REALIZADA nesta operação (WebAuthn
+        // L3 §6.1: UVR=1 somente após verificação bem-sucedida). Pedir a
+        // opção `uv` sem pinUvAuthToken autenticado não verifica nada —
+        // alegar o bit deixaria o dispositivo mentir sobre seu estado e,
+        // em GetAssertion, faria `hmac-secret` entregar o segredo
+        // "com verificação" (CredRandomWithUV) a quem nunca se verificou.
+        // Havendo PIN configurado, o gate acima já nega com PIN_REQUIRED.
+        if pin_authenticated {
             flags |= 0x04;
         }
 
@@ -1378,7 +1523,10 @@ impl Ctap2Authenticator {
             .unwrap_or(false);
         if has_ext {
             if request.extensions.as_ref().unwrap().min_pin_length {
-                ext_outputs.min_pin_length = Some(self.capabilities.min_pin_length.unwrap_or(4));
+                ext_outputs.min_pin_length = Some(crate::authnr_config::get_min_pin_length(
+                    &self.storage,
+                    self.capabilities.min_pin_length.unwrap_or(4),
+                ));
             }
             if request.extensions.as_ref().unwrap().cred_protect.is_some() {
                 ext_outputs.cred_protect = Some(cred_protect_policy.into());
@@ -1386,18 +1534,30 @@ impl Ctap2Authenticator {
             if !cred_blob.is_empty() {
                 ext_outputs.cred_blob = Some(cred_blob);
             }
-            if request.extensions.as_ref().unwrap().hmac_secret.is_some() {
-                let salt = self.crypto.random_bytes(32);
-                let hmac_key = self.crypto.compute_hmac(&salt, &private_key)?;
-                let encrypted = self.crypto.encrypt(&hmac_key, &[0u8; 12])?;
-                ext_outputs.hmac_secret = Some(encrypted);
+            // §12.5: MakeCredential responde apenas a confirmação booleana —
+            // os CredRandom foram gerados e persistidos acima; a troca de
+            // segredos ocorre no GetAssertion.
+            if let Some(raw) = request.extensions.as_ref().unwrap().hmac_secret.as_ref() {
+                if hmac_secret::parse_make_credential(raw)? {
+                    ext_outputs.hmac_secret = Some(Value::Bool(true));
+                }
             }
             if request.extensions.as_ref().unwrap().large_blob_key {
                 ext_outputs.large_blob_key = large_blob_key.clone();
             }
         }
 
-        let (fmt, attestation_info) = match self.attestation_format {
+        // Enterprise attestation one-shot (CTAP 2.1 §6.11.1): flag `enableEnterpriseAttestation`
+        // is consumed at the next MakeCredential; if set, the authenticator
+        // returns `packed` attestation even when the default format is `none`.
+        let enterprise_pending = crate::authnr_config::consume_ep_pending(&mut self.storage);
+
+        let effective_format = if enterprise_pending {
+            AttestationFormat::Packed
+        } else {
+            self.attestation_format
+        };
+        let (fmt, attestation_info) = match effective_format {
             AttestationFormat::None => (
                 AttestationFormat::None.as_str().to_string(),
                 BTreeMap::new(),
@@ -1439,7 +1599,7 @@ impl Ctap2Authenticator {
     pub fn get_assertion(
         &mut self,
         request: GetAssertionRequest,
-    ) -> Result<GetAssertionResponse, Box<dyn std::error::Error>> {
+    ) -> Result<GetAssertionResponse, Box<dyn core::error::Error>> {
         debug!("Processing GetAssertion request");
 
         let pin_authenticated = self
@@ -1450,8 +1610,12 @@ impl Ctap2Authenticator {
                 client_pin::PERMISSION_GA,
                 Some(&request.rp_id),
             )
-            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)?;
+            .map_err(|error| Box::new(error) as Box<dyn core::error::Error>)?;
         if request.options.uv && client_pin::is_pin_set(&self.storage) && !pin_authenticated {
+            return Err(Box::new(Ctap2Error::PinRequired));
+        }
+        if crate::authnr_config::is_always_uv(&self.storage) && !request.options.uv {
+            // alwaysUv exige uv em todo GetAssertion (CTAP 2.1 §6.11.2.3).
             return Err(Box::new(Ctap2Error::PinRequired));
         }
 
@@ -1463,30 +1627,32 @@ impl Ctap2Authenticator {
             }
         }
 
+        // Credenciais `userVerificationRequired` só são elegíveis quando a
+        // requisição carrega UV válido (CTAP 2.1 §6.8.2/§12.2.2).
+        let uv_satisfied = self.cred_protect_uv_satisfied(pin_authenticated);
+
         let rp_id_hash = hash_rp_id(&request.rp_id, &self.crypto);
         let mut selected: Option<Credential> = None;
 
-        // allow_list takes priority, then the legacy `credentials` field,
-        // and finally a lookup by RP ID. Every candidate must belong to the
-        // requesting RP.
-        if let Some(allow) = request.allow_list.as_ref() {
-            if !allow.is_empty() {
-                for desc in allow {
-                    if let Some(credential) = self.storage.get_credential(&desc.id, &self.crypto)? {
-                        if credential.rp_id_hash == rp_id_hash.to_vec() {
-                            selected = Some(credential);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        // Lista efetiva de descritores nomeados: o alias interno
+        // `allow_list` ou o campo wire `allowList`. Ambos representam a
+        // allowList (CTAP 2.1 §6.8.3); vazios ⇒ descoberta por RP.
+        let named_credentials: Vec<CredentialDescriptor> = match request.allow_list.as_deref() {
+            Some(list) if !list.is_empty() => list.to_vec(),
+            _ => request.credentials.clone(),
+        };
 
-        if selected.is_none() {
-            if let Some(desc) = request.credentials.first() {
+        // Credenciais nomeadas são elegíveis por ID; cada candidata deve
+        // pertencer ao RP solicitado e passar no filtro `credProtect`
+        // (nomeada na lista ⇒ regra do nível 2 se aplica — §12.2.2).
+        if !named_credentials.is_empty() {
+            for desc in &named_credentials {
                 if let Some(credential) = self.storage.get_credential(&desc.id, &self.crypto)? {
-                    if credential.rp_id_hash == rp_id_hash.to_vec() {
+                    if credential.rp_id_hash == rp_id_hash.to_vec()
+                        && self.is_cred_protect_allowed(&credential, uv_satisfied, true)
+                    {
                         selected = Some(credential);
+                        break;
                     }
                 }
             }
@@ -1495,7 +1661,10 @@ impl Ctap2Authenticator {
         let credential = match selected {
             Some(c) => c,
             None => {
-                let rp_creds = self.storage.find_by_rp_id(&request.rp_id, &self.crypto);
+                // Descoberta por RP: credenciais de níveis 2 e 3 não são
+                // retornáveis sem UV (CTAP 2.1 §12.2.2).
+                let mut rp_creds = self.storage.find_by_rp_id(&request.rp_id, &self.crypto);
+                rp_creds.retain(|c| self.is_cred_protect_allowed(c, uv_satisfied, false));
                 if rp_creds.is_empty() {
                     return Err(Box::new(Ctap2Error::NoCredentials));
                 }
@@ -1507,10 +1676,13 @@ impl Ctap2Authenticator {
         if request.options.up {
             flags |= 0x01;
         }
-        if request.options.uv || pin_authenticated {
+        // Mesma regra do MakeCredential: bit UV somente com autenticação
+        // real desta operação (pinUvAuthToken com permissão `ga`) — nunca
+        // pela mera presença da opção `uv` no request.
+        if pin_authenticated {
             flags |= 0x04;
         }
-        let sign_count = credential.sign_count + 1;
+        let sign_count = self.next_sign_count()?;
 
         self.storage
             .update_sign_count(&credential.credential_id, sign_count)?;
@@ -1537,9 +1709,11 @@ impl Ctap2Authenticator {
             -35 => self
                 .crypto
                 .sign_p384(&credential.private_key, &data_to_sign)?,
+            #[cfg(feature = "rs256")]
             -37 => self
                 .crypto
                 .sign_rsa_pss(&credential.private_key, &data_to_sign)?,
+            #[cfg(feature = "rs256")]
             -257 => self
                 .crypto
                 .sign_rsa(&credential.private_key, &data_to_sign)?,
@@ -1553,18 +1727,40 @@ impl Ctap2Authenticator {
             .map(|e| e.has_any())
             .unwrap_or(false);
         if has_ext {
+            if let Some(raw_hmac) = request.extensions.as_ref().unwrap().hmac_secret.as_ref() {
+                // §12.5: a extensão no GetAssertion exige evidência de
+                // user presence ("up" falso → UNSUPPORTED_OPTION).
+                if !request.options.up {
+                    return Err(Box::new(Ctap2Error::UnsupportedOption));
+                }
+                let get_request = hmac_secret::parse_get_assertion(raw_hmac)?;
+                // §12.5: o CredRandom é escolhido pela verificação REAL da
+                // operação — pinUvAuthToken autenticado → WithUV; caso
+                // contrário WithoutUV. O bit uv da resposta espelha esse
+                // estado (flags acima); a mera opção `uv` pedida sem
+                // autenticação nunca seleciona o segredo "com verificação".
+                let cred_random = if pin_authenticated {
+                    credential.cred_random_with_uv.as_deref()
+                } else {
+                    credential.cred_random_without_uv.as_deref()
+                };
+                // §12.5: sem CredRandom associado (credencial criada antes da
+                // extensão ou com entrada falsa), a extensão é ignorada — a
+                // asserção prossegue sem saída para ela.
+                if let Some(cred_random) = cred_random {
+                    // ADR-0022: a sessão de transação retém o segredo
+                    // compartilhado e os salts decifrados para as asserções
+                    // encadeadas; o acordo P-256 em si permanece de uso único
+                    // (consumido dentro de `begin_session`).
+                    let session = hmac_secret::begin_session(self, &get_request)?;
+                    let encrypted =
+                        hmac_secret::session_output(self.get_crypto(), &session, cred_random)?;
+                    self.hmac_secret_session = Some(session);
+                    ext_outputs.hmac_secret = Some(Value::Bytes(encrypted));
+                }
+            }
             if !credential.cred_blob.is_empty() {
                 ext_outputs.cred_blob = Some(credential.cred_blob.clone());
-            }
-            if let Some(ref hmac_input) = request.extensions.as_ref().unwrap().hmac_secret {
-                let salt = if hmac_input.salt_enc.len() == 16 || hmac_input.salt_enc.len() == 32 {
-                    hmac_input.salt_enc.clone()
-                } else {
-                    self.crypto.decrypt(&hmac_input.salt_enc, &[0u8; 12])?
-                };
-                let hmac_key = self.crypto.compute_hmac(&salt, &credential.private_key)?;
-                let encrypted = self.crypto.encrypt(&hmac_key, &[0u8; 12])?;
-                ext_outputs.hmac_secret = Some(encrypted);
             }
             if request.extensions.as_ref().unwrap().large_blob_key {
                 if let Some(ref key) = credential.large_blob_key {
@@ -1573,10 +1769,8 @@ impl Ctap2Authenticator {
             }
         }
 
-        let matching = self.find_matching_credentials(
-            &request.rp_id,
-            request.allow_list.as_deref().unwrap_or(&[]),
-        );
+        let matching =
+            self.find_matching_credentials(&request.rp_id, &named_credentials, uv_satisfied);
         let total = matching.len();
         let current_index = matching
             .iter()
@@ -1587,12 +1781,20 @@ impl Ctap2Authenticator {
             self.get_next_assertion_state = Some(GetNextAssertionState {
                 rp_id: request.rp_id.clone(),
                 client_data_hash: request.client_data_hash.clone(),
-                allow_list: request.allow_list.clone().unwrap_or_default(),
+                allow_list: named_credentials.clone(),
+                flags,
                 extensions: request.extensions.clone(),
                 options: request.options.clone(),
                 pin_protocol: request.pin_protocol,
+                // O filtro de credProtect da asserção inicial vale para todas
+                // as próximas: GetNextAssertion não carrega autenticação própria.
+                uv_satisfied,
                 current_index,
             });
+        } else {
+            // Transação de asserção única: nada a encadear, a sessão
+            // hmac-secret termina aqui (ADR-0022).
+            self.hmac_secret_session = None;
         }
 
         Ok(GetAssertionResponse {
@@ -1619,7 +1821,7 @@ impl Ctap2Authenticator {
         })
     }
 
-    pub fn get_info(&self) -> Result<GetInfoResponse, Box<dyn std::error::Error>> {
+    pub fn get_info(&self) -> Result<GetInfoResponse, Box<dyn core::error::Error>> {
         debug!("Processing GetInfo request");
 
         let security = if self.capabilities.security.has_any_features() {
@@ -1642,6 +1844,37 @@ impl Ctap2Authenticator {
             }
         }
 
+        // Algoritmos anunciados no GetInfo: ES256, EdDSA e ES384 sempre; os
+        // algoritmos RSA (PS256/RS256) apenas com a feature `rs256`, pois sem
+        // ela não há geração de chaves RSA.
+        // `mut` só é usado quando a feature adiciona as entradas RSA abaixo.
+        #[cfg_attr(not(feature = "rs256"), allow(unused_mut))]
+        let mut algorithms = vec![
+            CoseAlgorithmEntry {
+                alg: -7,
+                key_type: "public-key".to_string(),
+            },
+            CoseAlgorithmEntry {
+                alg: -8,
+                key_type: "public-key".to_string(),
+            },
+            CoseAlgorithmEntry {
+                alg: -35,
+                key_type: "public-key".to_string(),
+            },
+        ];
+        #[cfg(feature = "rs256")]
+        algorithms.extend([
+            CoseAlgorithmEntry {
+                alg: -37,
+                key_type: "public-key".to_string(),
+            },
+            CoseAlgorithmEntry {
+                alg: -257,
+                key_type: "public-key".to_string(),
+            },
+        ]);
+
         Ok(GetInfoResponse {
             versions: self.capabilities.versions.clone(),
             extensions: self.capabilities.extensions.clone(),
@@ -1656,34 +1889,13 @@ impl Ctap2Authenticator {
             firmware_version: firmware_version_to_ctap_integer(
                 &self.capabilities.firmware_version,
             )?,
-            algorithms: vec![
-                CoseAlgorithmEntry {
-                    alg: -7,
-                    key_type: "public-key".to_string(),
-                },
-                CoseAlgorithmEntry {
-                    alg: -8,
-                    key_type: "public-key".to_string(),
-                },
-                CoseAlgorithmEntry {
-                    alg: -35,
-                    key_type: "public-key".to_string(),
-                },
-                CoseAlgorithmEntry {
-                    alg: -37,
-                    key_type: "public-key".to_string(),
-                },
-                CoseAlgorithmEntry {
-                    alg: -257,
-                    key_type: "public-key".to_string(),
-                },
-            ],
+            algorithms,
             security,
             max_large_blob_data_size: self.capabilities.max_large_blob_data_size,
         })
     }
 
-    pub fn get_version(&self) -> Result<GetVersionResponse, Box<dyn std::error::Error>> {
+    pub fn get_version(&self) -> Result<GetVersionResponse, Box<dyn core::error::Error>> {
         debug!("Processing GetVersion request");
 
         Ok(GetVersionResponse {
@@ -1696,22 +1908,29 @@ impl Ctap2Authenticator {
     pub fn process_command(&mut self, cmd: u8, data: Vec<u8>) -> Result<Vec<u8>, Ctap2Error> {
         let command = Ctap2Command::from_u8(cmd);
 
+        // ADR-0022: qualquer comando diferente de GetNextAssertion encerra a
+        // transação hmac-secret corrente — a sessão vive apenas dentro de uma
+        // transação de user presence (GetAssertion → cadeia de GetNextAssertion).
+        if !matches!(command, Ctap2Command::GetNextAssertion) {
+            self.hmac_secret_session = None;
+        }
+
         match command {
             Ctap2Command::MakeCredential => {
                 let request: MakeCredentialRequest = decode_cbor(&data)?;
                 let response = self.make_credential(request).map_err(ctap2_error)?;
-                let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+                let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
                 Ok(encoded)
             }
             Ctap2Command::GetAssertion => {
                 let request: GetAssertionRequest = decode_cbor(&data)?;
                 let response = self.get_assertion(request).map_err(ctap2_error)?;
-                let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+                let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
                 Ok(encoded)
             }
             Ctap2Command::GetInfo => {
-                let response = self.get_info().map_err(|_| Ctap2Error::InvalidData)?;
-                let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+                let response = self.get_info().map_err(|_| Ctap2Error::Unknown)?;
+                let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
                 Ok(encoded)
             }
             Ctap2Command::Selection => self.handle_selection(),
@@ -1722,6 +1941,9 @@ impl Ctap2Authenticator {
             Ctap2Command::BioEnroll => self.handle_bio_enroll(&data),
             Ctap2Command::CredentialManagement => self.handle_credential_management(&data),
             Ctap2Command::LargeBlobs => self.handle_large_blobs(&data),
+            Ctap2Command::AuthenticatorConfig => {
+                crate::authnr_config::handle_authnr_config(self, &data)
+            }
             Ctap2Command::EnumerateRPsInitial => self.handle_enumerate_rps_initial(),
             Ctap2Command::EnumerateRPsNext => self.handle_enumerate_rps_next(),
             Ctap2Command::Unknown(_) => Err(Ctap2Error::InvalidCommand),
@@ -1733,8 +1955,8 @@ impl Ctap2Authenticator {
     }
 
     fn handle_get_version(&self) -> Result<Vec<u8>, Ctap2Error> {
-        let response = self.get_version().map_err(|_| Ctap2Error::InvalidData)?;
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let response = self.get_version().map_err(|_| Ctap2Error::Unknown)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -1743,12 +1965,33 @@ impl Ctap2Authenticator {
     }
 
     fn handle_reset(&mut self) -> Result<Vec<u8>, Ctap2Error> {
+        // CTAP 2.1 §6.9: reset exige confirmação de presença física, no mesmo
+        // padrão de MakeCredential/GetAssertion — sem fonte de presença
+        // configurada (ex.: simulador), o default permanece "sempre presente".
+        if let Some(presence) = self.user_presence.as_mut() {
+            if !presence.is_present() {
+                return Err(Ctap2Error::OperationDenied);
+            }
+        }
+
         self.storage.clear();
         self.storage.clear_large_blobs();
         self.enumerate_rps_state = None;
         self.cred_mgmt_rps_state = None;
         self.cred_mgmt_creds_state = None;
         self.get_next_assertion_state = None;
+
+        // Reset invalida TODO o estado de sessão PIN/crypto (CTAP 2.1 §6.9.1):
+        // um pinUvAuthToken emitido antes do reset não pode mais autorizar
+        // operações no dispositivo limpo. A sessão hmac-secret (ADR-0022) é
+        // estado volátil de sessão e morre com o reset, junto com as
+        // credenciais que ela referencia.
+        self.pin_uv_auth_token = None;
+        self.pin_agreement_key = None;
+        self.pin_shared_secret = None; // Zeroizing: material sensível é apagado no drop
+        self.hmac_secret_session = None;
+        self.pin_failures_since_reset = 0;
+
         info!("Reset: all credentials and state cleared");
         Ok(Vec::new())
     }
@@ -1759,23 +2002,68 @@ impl Ctap2Authenticator {
             .take()
             .ok_or(Ctap2Error::InvalidState)?;
 
-        let matching = self.find_matching_credentials(&state.rp_id, &state.allow_list);
+        let matching =
+            self.find_matching_credentials(&state.rp_id, &state.allow_list, state.uv_satisfied);
 
         if matching.is_empty() {
+            // Sem credenciais a transação termina: a sessão hmac-secret é
+            // descartada (ADR-0022; Zeroizing apaga o material no drop).
+            self.hmac_secret_session = None;
             return Err(Ctap2Error::NoCredentials);
         }
 
         let next_index = state.current_index + 1;
         if next_index >= matching.len() {
+            // Cadeia esgotada: a última asserção já foi servida e a sessão
+            // hmac-secret termina junto com a transação (ADR-0022).
+            self.hmac_secret_session = None;
             return Err(Ctap2Error::NoCredentials);
         }
+        let has_more = next_index + 1 < matching.len();
 
         let credential_id = &matching[next_index];
         let credential = self
             .storage
             .get_credential(credential_id, &self.crypto)
-            .map_err(|_| Ctap2Error::InvalidData)?
+            .map_err(|_| Ctap2Error::Unknown)?
             .ok_or(Ctap2Error::NoCredentials)?;
+
+        // Extrai o contexto da asserção inicial antes de restaurar o estado,
+        // pois a reconstrução consome `state`.
+        let client_data_hash = state.client_data_hash.clone();
+        let flags = state.flags;
+
+        // Saída `hmac-secret` encadeada (CTAP 2.1 §12.5 + ADR-0022): presente
+        // apenas quando a requisição inicial pediu a extensão e a sessão
+        // sobreviveu aos limites da transação (nenhum outro comando no meio).
+        // O CredRandom segue a MESMA seleção UV da asserção inicial — cada
+        // saída usa o CredRandom da própria credencial assinalada.
+        let mut chained_hmac: Option<Value> = None;
+        let requested_hmac = state
+            .extensions
+            .as_ref()
+            .map(|e| e.hmac_secret.is_some())
+            .unwrap_or(false);
+        if requested_hmac {
+            let cred_random = if state.uv_satisfied {
+                credential.cred_random_with_uv.as_deref()
+            } else {
+                credential.cred_random_without_uv.as_deref()
+            };
+            if let (Some(cred_random), Some(session)) =
+                (cred_random, self.hmac_secret_session.as_ref())
+            {
+                let encrypted =
+                    hmac_secret::session_output(self.get_crypto(), session, cred_random)?;
+                chained_hmac = Some(Value::Bytes(encrypted));
+            }
+        }
+
+        if !has_more {
+            // Última asserção da cadeia: nada mais a produzir, a sessão
+            // encerra aqui (ADR-0022).
+            self.hmac_secret_session = None;
+        }
 
         self.get_next_assertion_state = Some(GetNextAssertionState {
             current_index: next_index,
@@ -1783,10 +2071,17 @@ impl Ctap2Authenticator {
         });
 
         let response = self
-            .build_get_assertion_response(&credential, matching.len(), next_index)
-            .map_err(|_| Ctap2Error::InvalidData)?;
+            .build_get_assertion_response(
+                &credential,
+                matching.len(),
+                next_index,
+                &client_data_hash,
+                flags,
+                chained_hmac,
+            )
+            .map_err(|_| Ctap2Error::Unknown)?;
 
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -1799,7 +2094,7 @@ impl Ctap2Authenticator {
                 fingerprint_kind: 1,
                 max_enrollments: 5,
             };
-            let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+            let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
             return Ok(encoded);
         }
 
@@ -1832,7 +2127,7 @@ impl Ctap2Authenticator {
             total_rps: total as u8,
         };
 
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -1860,7 +2155,7 @@ impl Ctap2Authenticator {
             total_rps: state.total as u8,
         };
 
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -1873,33 +2168,43 @@ impl Ctap2Authenticator {
         // Read operation: `set` is None, `get` is Some
         if request.set.is_none() {
             let count = request.get.unwrap_or(0) as usize;
-            let offset = request.offset as usize;
+            // `offset` é u64 no wire: em alvos 32 bits um cast truncaria e
+            // poderia apontar para dentro do array; rejeita sem truncar.
+            let offset =
+                usize::try_from(request.offset).map_err(|_| Ctap2Error::InvalidParameter)?;
             let fragment = self.storage.read_large_blobs(offset, count);
             let response = large_blobs::LargeBlobsResponse {
                 config: Some(fragment),
             };
-            let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+            let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
             return Ok(encoded);
         }
 
         // Write operation: `set` is Some
         let blob_data = request.set.unwrap();
         let expected_len = request.length.unwrap_or(0) as usize;
-        let offset = request.offset as usize;
+        let offset = usize::try_from(request.offset).map_err(|_| Ctap2Error::InvalidParameter)?;
 
-        // Validate against max supported size
-        if let Some(max_size) = self.capabilities.max_large_blob_data_size {
-            if expected_len > max_size as usize {
-                return Err(Ctap2Error::LargeBlobStorageFull);
-            }
+        // CTAP 2.1 §6.10: valida offset e length contra a capacidade máxima
+        // ANTES de qualquer redimensionamento/alocação — um único comando não
+        // autenticado não pode inflar o buffer em memória (DoS).
+        let max_size = self
+            .capabilities
+            .max_large_blob_data_size
+            .unwrap_or(MAX_LARGE_BLOBS_SIZE as u32) as usize;
+        let write_end = offset
+            .checked_add(blob_data.len())
+            .ok_or(Ctap2Error::InvalidParameter)?;
+        if expected_len > max_size || write_end > max_size {
+            return Err(Ctap2Error::InvalidParameter);
         }
 
         self.storage
             .write_large_blobs(offset, &blob_data, expected_len)
-            .map_err(|_| Ctap2Error::InvalidData)?;
+            .map_err(|_| Ctap2Error::Unknown)?;
 
         let response = large_blobs::LargeBlobsResponse { config: None };
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -1917,7 +2222,11 @@ impl Ctap2Authenticator {
             client_pin::PERMISSION_CM,
             None,
         )?;
-        if client_pin::is_pin_set(&self.storage) && !pin_authenticated {
+        if !pin_authenticated {
+            // CTAP 2.1 §6.12: todo subcomando de Credential Management exige um
+            // pinUvAuthToken com permissão `cm` — inclusive quando nenhum PIN
+            // está configurado, pois as respostas expõem user handles/nomes e
+            // permitem exclusão de credenciais residentes.
             return Err(Ctap2Error::PinRequired);
         }
 
@@ -1965,7 +2274,7 @@ impl Ctap2Authenticator {
             existing_resident_credentials_count: count,
             max_possible_remaining_resident_credentials_count: remaining,
         };
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -1994,7 +2303,7 @@ impl Ctap2Authenticator {
             rp_id_hash: first_rp_hash,
             total_rps: total as u32,
         };
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -2020,7 +2329,7 @@ impl Ctap2Authenticator {
             rp_id_hash: rp_hash.clone(),
             total_rps: state.total as u32,
         };
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -2045,7 +2354,7 @@ impl Ctap2Authenticator {
             current_index: 0,
         });
 
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -2064,7 +2373,7 @@ impl Ctap2Authenticator {
         let cred = &state.creds[state.current_index].clone();
         let total = state.total as u32;
         let response = self.build_enumerate_cred_entry(cred, total);
-        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::InvalidData)?;
+        let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
         Ok(encoded)
     }
 
@@ -2086,7 +2395,7 @@ impl Ctap2Authenticator {
         let updated = self
             .storage
             .update_user_info(credential_id, user.name.clone(), user.display_name.clone())
-            .map_err(|_| Ctap2Error::InvalidData)?;
+            .map_err(|_| Ctap2Error::Unknown)?;
         if !updated {
             return Err(Ctap2Error::NoCredentials);
         }
@@ -2112,8 +2421,41 @@ impl Ctap2Authenticator {
             },
             public_key: credential.public_key.clone(),
             total_credentials: total,
-            cred_protect: None,
+            // Política real da credencial; a enumeração exige token `cm`
+            // autenticado, então expô-la aqui é seguro (CTAP 2.1 §6.12.2).
+            cred_protect: credential.cred_protect,
             large_blob_key: credential.large_blob_key.clone(),
+        }
+    }
+
+    /// Indica se a operação atual satisfaz user verification para o filtro
+    /// `credProtect` (CTAP 2.1 §6.8.2): um pinUvAuthToken autenticado com a
+    /// permissão necessária, ou a configuração `alwaysUv`, que torna UV
+    /// obrigatório em toda operação.
+    fn cred_protect_uv_satisfied(&self, pin_authenticated: bool) -> bool {
+        pin_authenticated || crate::authnr_config::is_always_uv(&self.storage)
+    }
+
+    /// Filtro `credProtect` da descoberta de credenciais (CTAP 2.1 §12.2.2):
+    ///
+    /// - nível 1 (default): sempre elegível;
+    /// - nível 2 (`userVerificationOptionalWithCredentialIDList`): exige UV
+    ///   válida OU ter sido nomeada explicitamente na allowList — a
+    ///   descoberta por RP (listas vazias) não a revela;
+    /// - nível 3: somente com UV válida.
+    fn is_cred_protect_allowed(
+        &self,
+        credential: &Credential,
+        uv_satisfied: bool,
+        named_in_allow_list: bool,
+    ) -> bool {
+        if uv_satisfied {
+            return true;
+        }
+        match credential.cred_protect {
+            Some(CRED_PROTECT_UV_REQUIRED) => false,
+            Some(CRED_PROTECT_ALLOWLIST_REQUIRED) => named_in_allow_list,
+            _ => true,
         }
     }
 
@@ -2121,16 +2463,21 @@ impl Ctap2Authenticator {
         &self,
         rp_id: &str,
         allow_list: &[CredentialDescriptor],
+        uv_satisfied: bool,
     ) -> Vec<Vec<u8>> {
         if allow_list.is_empty() {
+            // Descoberta por RP: níveis 2 e 3 ficam ocultos sem UV.
             return self
                 .storage
                 .find_by_rp_id(rp_id, &self.crypto)
                 .into_iter()
+                .filter(|c| self.is_cred_protect_allowed(c, uv_satisfied, false))
                 .map(|c| c.credential_id.clone())
                 .collect();
         }
 
+        // AllowList presente: cada entrada é uma nomeação explícita, o que
+        // habilita credenciais de nível 2 mesmo sem UV (§12.2.2).
         allow_list
             .iter()
             .filter_map(|desc| {
@@ -2139,24 +2486,41 @@ impl Ctap2Authenticator {
                     .ok()
                     .flatten()
                     .filter(|c| c.rp_id == rp_id)
+                    .filter(|c| self.is_cred_protect_allowed(c, uv_satisfied, true))
                     .map(|c| c.credential_id.clone())
             })
             .collect()
     }
 
+    /// Monta a resposta de um GetNextAssertion.
+    ///
+    /// Assina `authData || clientDataHash` com o mesmo clientDataHash da
+    /// asserção inicial (armazenado no estado), espelha as flags UP/UV e
+    /// incrementa o contador global de assinaturas, persistindo-o — mesmo
+    /// mecanismo do [`Ctap2Authenticator::get_assertion`] (CTAP 2.1 §6.2.1).
+    ///
+    /// `chained_hmac` carrega a saída `hmac-secret` já cifrada para esta
+    /// credencial da cadeia (ADR-0022), com a mesma forma do mapa de extensões
+    /// da asserção inicial.
+    #[allow(clippy::too_many_arguments)]
     fn build_get_assertion_response(
-        &self,
+        &mut self,
         credential: &Credential,
         total: usize,
         current_index: usize,
-    ) -> Result<GetAssertionResponse, Box<dyn std::error::Error>> {
-        let sign_count = credential.sign_count;
+        client_data_hash: &[u8],
+        flags: u8,
+        chained_hmac: Option<Value>,
+    ) -> Result<GetAssertionResponse, Box<dyn core::error::Error>> {
+        let sign_count = self.next_sign_count()?;
+        self.storage
+            .update_sign_count(&credential.credential_id, sign_count)?;
+
         let rp_id_hash_vec = self.crypto.sha256(credential.rp_id.as_bytes());
         let rp_id_hash: [u8; 32] = rp_id_hash_vec
             .try_into()
             .map_err(|_| "rp_id_hash must be 32 bytes")?;
 
-        let flags: u8 = 0x01;
         let auth_data = self.build_auth_data(&AuthDataParams {
             rp_id_hash,
             flags,
@@ -2170,6 +2534,7 @@ impl Ctap2Authenticator {
         let mut data_to_sign = alloc::vec![];
         data_to_sign.extend_from_slice(&auth_data[..32]);
         data_to_sign.extend_from_slice(&auth_data[32..37]);
+        data_to_sign.extend_from_slice(client_data_hash);
 
         let signature = match credential.algorithm {
             -7 => self
@@ -2178,9 +2543,11 @@ impl Ctap2Authenticator {
             -35 => self
                 .crypto
                 .sign_p384(&credential.private_key, &data_to_sign)?,
+            #[cfg(feature = "rs256")]
             -37 => self
                 .crypto
                 .sign_rsa_pss(&credential.private_key, &data_to_sign)?,
+            #[cfg(feature = "rs256")]
             -257 => self
                 .crypto
                 .sign_rsa(&credential.private_key, &data_to_sign)?,
@@ -2200,7 +2567,10 @@ impl Ctap2Authenticator {
             user: None,
             number_of_credentials: Some(total as u16),
             next: Some(has_more),
-            extensions: None,
+            extensions: chained_hmac.map(|output| ExtensionOutputs {
+                hmac_secret: Some(output),
+                ..Default::default()
+            }),
         })
     }
 
@@ -2211,7 +2581,7 @@ impl Ctap2Authenticator {
     fn build_auth_data(
         &self,
         params: &AuthDataParams,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<u8>, Box<dyn core::error::Error>> {
         let mut auth_data = alloc::vec![];
         auth_data.extend_from_slice(&params.rp_id_hash);
         auth_data.push(params.flags);
@@ -2244,11 +2614,13 @@ impl Ctap2Authenticator {
                         return Err("invalid P-384 public key length".into());
                     }
                 }
+                #[cfg(feature = "rs256")]
                 -37 => {
                     let (n, e) = CryptoEngine::rsa_public_key_parts(params.public_key)?;
                     build_cose_key_rsa_pss(&n, &e)
                         .map_err(|_| "failed to build RSA-PSS COSE key".to_string())?
                 }
+                #[cfg(feature = "rs256")]
                 -257 => {
                     let (n, e) = CryptoEngine::rsa_public_key_parts(params.public_key)?;
                     build_cose_key_rsa(&n, &e)
@@ -2283,7 +2655,7 @@ impl client_pin::ClientPin for Ctap2Authenticator {
         let stored_hash = full_hash[..16].to_vec();
         self.storage
             .store(client_pin::PIN_STORAGE_KEY, stored_hash)
-            .map_err(|_| Ctap2Error::InvalidData)?;
+            .map_err(|_| Ctap2Error::Unknown)?;
 
         self.reset_pin_retries();
         self.pin_uv_auth_token = None;
@@ -2305,7 +2677,7 @@ impl client_pin::ClientPin for Ctap2Authenticator {
         let old_full_hash = self.crypto.sha256(old_pin);
         if !crypto::constant_time_eq(&old_full_hash[..16], &stored_hash) {
             self.decrement_pin_retries();
-            return Err(Ctap2Error::PinInvalid);
+            return Err(self.register_pin_failure());
         }
 
         self.reset_pin_retries();
@@ -2313,7 +2685,7 @@ impl client_pin::ClientPin for Ctap2Authenticator {
         let new_full_hash = self.crypto.sha256(new_pin);
         self.storage
             .store(client_pin::PIN_STORAGE_KEY, new_full_hash[..16].to_vec())
-            .map_err(|_| Ctap2Error::InvalidData)?;
+            .map_err(|_| Ctap2Error::Unknown)?;
 
         self.pin_uv_auth_token = None;
 
@@ -2321,6 +2693,9 @@ impl client_pin::ClientPin for Ctap2Authenticator {
     }
 
     fn reset_pin_retries(&mut self) {
+        // Sucesso (ou novo PIN) encerra o bloqueio volátil da sessão junto com
+        // a restauração do contador persistente.
+        self.pin_failures_since_reset = 0;
         let _ = self.storage.store(
             client_pin::PIN_RETRIES_KEY,
             client_pin::PIN_MAX_RETRIES.to_string().into_bytes(),
@@ -2339,7 +2714,7 @@ impl client_pin::ClientPin for Ctap2Authenticator {
         if !client_pin::is_pin_set(self.get_storage()) {
             return Err(Ctap2Error::PinNotSet);
         }
-        if client_pin::is_pin_blocked(self.get_storage()) {
+        if client_pin::is_pin_blocked(self) {
             return Err(Ctap2Error::PinBlocked);
         }
         let stored_hash = self
@@ -2349,7 +2724,7 @@ impl client_pin::ClientPin for Ctap2Authenticator {
         let submitted_full_hash = self.crypto.sha256(pin);
         if !crypto::constant_time_eq(&submitted_full_hash[..16], &stored_hash) {
             self.decrement_pin_retries();
-            return Err(Ctap2Error::PinInvalid);
+            return Err(self.register_pin_failure());
         }
         self.reset_pin_retries();
         Ok(())
@@ -2357,6 +2732,53 @@ impl client_pin::ClientPin for Ctap2Authenticator {
 }
 
 impl Ctap2Authenticator {
+    /// Obtém o próximo valor do contador global de assinaturas, persistindo-o.
+    ///
+    /// O contador é compartilhado por todas as credenciais: cada asserção o
+    /// incrementa em uma unidade e grava no storage, garantindo valores
+    /// estritamente crescentes entre asserções sucessivas — sinal de
+    /// autenticador autêntico para os relying parties (WebAuthn L3 §6.1.1;
+    /// CTAP 2.1 §6.2.1).
+    fn next_sign_count(&mut self) -> Result<u32, Box<dyn core::error::Error>> {
+        let current = self
+            .storage
+            .retrieve(SIGN_COUNTER_STORAGE_KEY)
+            .ok()
+            .and_then(|data| String::from_utf8(data).ok())
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        let next = current
+            .checked_add(1)
+            .ok_or("signature counter exhausted")?;
+        self.storage
+            .store(SIGN_COUNTER_STORAGE_KEY, next.to_string().into_bytes())?;
+        Ok(next)
+    }
+
+    /// Indica o bloqueio volátil de PIN (`PIN_AUTH_BLOCKED`) da sessão atual.
+    ///
+    /// O bloqueio nasce limpo em cada instância do autenticador — um power
+    /// cycle o encerra, enquanto o contador persistente de tentativas
+    /// permanece (CTAP 2.1 §6.5.5.6).
+    pub(crate) fn is_pin_auth_blocked(&self) -> bool {
+        self.pin_failures_since_reset >= client_pin::PIN_BLOCK_THRESHOLD
+    }
+
+    /// Registra uma falha consecutiva de PIN e devolve o erro correspondente.
+    ///
+    /// O chamador já consumiu a tentativa persistente (`decrement_pin_retries`);
+    /// aqui apenas avança o estado volátil que materializa o bloqueio.
+    pub(crate) fn register_pin_failure(&mut self) -> Ctap2Error {
+        self.pin_failures_since_reset = self.pin_failures_since_reset.saturating_add(1);
+        if client_pin::read_retries(&self.storage) == 0 {
+            return Ctap2Error::PinBlocked;
+        }
+        if self.is_pin_auth_blocked() {
+            return Ctap2Error::PinAuthBlocked;
+        }
+        Ctap2Error::PinInvalid
+    }
+
     /// Armazena o pinUvAuthToken da sessão atual (CTAP 2.1 §6.5.2.1).
     pub(crate) fn set_pin_uv_auth_token(
         &mut self,
@@ -2376,6 +2798,21 @@ impl Ctap2Authenticator {
     /// Invalida o pinUvAuthToken da sessão (resetPinUvAuthToken).
     pub(crate) fn invalidate_pin_uv_auth_token(&mut self) {
         self.pin_uv_auth_token = None;
+    }
+
+    /// Armazena o segredo compartilhado usado na emissão do pinUvAuthToken.
+    ///
+    /// Usado pelo `setMinPINLength` para decifrar o `currentPIN` (ADR-0021).
+    /// Material sensível: zeroizado no drop.
+    pub(crate) fn set_pin_shared_secret(&mut self, secret: Vec<u8>, protocol: u8) {
+        self.pin_shared_secret = Some((crypto::pin_protocol::Zeroizing::new(secret), protocol));
+    }
+
+    /// Consome o segredo compartilhado da sessão (uso único por transação).
+    pub(crate) fn take_pin_shared_secret(
+        &mut self,
+    ) -> Option<(crypto::pin_protocol::Zeroizing<Vec<u8>>, u8)> {
+        self.pin_shared_secret.take()
     }
 
     /// Registra a chave de acordo P-256 anunciada em getKeyAgreement.
@@ -2432,7 +2869,7 @@ impl Ctap2Authenticator {
     }
 
     /// Verifica um `pinUvAuthParam` e as permissões/RP associados ao token.
-    fn verify_pin_uv_auth_for_operation(
+    pub(crate) fn verify_pin_uv_auth_for_operation(
         &self,
         pin_protocol: Option<u8>,
         pin_uv_auth_param: Option<&[u8]>,
@@ -2471,9 +2908,9 @@ impl Ctap2Authenticator {
 /// mapa de parâmetros exatamente como chegaram no request. Isso evita alterar
 /// a codificação de descritores ou entidades de usuário durante a verificação.
 fn credential_management_auth_message(data: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
-    let mut reader = Cursor::new(data);
-    let value: Value = from_reader(&mut reader).map_err(|_| Ctap2Error::InvalidCbor)?;
-    if reader.position() != data.len() as u64 {
+    let mut restante = data;
+    let value: Value = from_reader(&mut restante).map_err(|_| Ctap2Error::InvalidCbor)?;
+    if !restante.is_empty() {
         return Err(Ctap2Error::InvalidCbor);
     }
 
@@ -2532,6 +2969,7 @@ fn build_cose_key_p256(x: &[u8], y: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
 
 /// Builds a COSE_Key CBOR map for an RS256 (RSA, alg -257) public key.
 /// Labels: kty(1)=RSA(3), alg(3)=RS256(-257), n(-1)=modulus, e(-2)=exponent.
+#[cfg(feature = "rs256")]
 fn build_cose_key_rsa(n: &[u8], e: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
     let mut key_map: BTreeMap<i64, Value> = BTreeMap::new();
     key_map.insert(1, Value::Integer(Integer::from(3)));
@@ -2555,6 +2993,7 @@ fn build_cose_key_p384(x: &[u8], y: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
 
 /// Builds a COSE_Key CBOR map for a PS256 (RSA-PSS, alg -37) public key.
 /// Labels: kty(1)=RSA(3), alg(3)=PS256(-37), n(-1)=modulus, e(-2)=exponent.
+#[cfg(feature = "rs256")]
 fn build_cose_key_rsa_pss(n: &[u8], e: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
     let mut key_map: BTreeMap<i64, Value> = BTreeMap::new();
     key_map.insert(1, Value::Integer(Integer::from(3)));
@@ -2797,6 +3236,80 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_denied_without_user_presence() {
+        // CTAP 2.1 §6.9: sem presença física o reset é negado e as
+        // credenciais permanecem intactas.
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        authenticator.set_user_presence(Some(Box::new(TestUserPresence { present: false })));
+
+        // Credencial criada sem exigir up — só o Reset é que exige presença aqui.
+        assert!(authenticator
+            .make_credential(make_credential_request(false))
+            .is_ok());
+        assert_eq!(authenticator.get_storage().list_credentials().len(), 1);
+
+        let error = authenticator.process_command(0x07, vec![]).unwrap_err();
+        assert_eq!(error, Ctap2Error::OperationDenied);
+        assert_eq!(authenticator.get_storage().list_credentials().len(), 1);
+    }
+
+    #[test]
+    fn test_reset_with_presence_invalidates_issued_pin_token() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        authenticator.set_user_presence(Some(Box::new(TestUserPresence { present: true })));
+        client_pin::ClientPin::set_pin(&mut authenticator, b"1234").unwrap();
+
+        // Token emitido antes do reset autoriza MakeCredential.
+        let token = vec![0xA5; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_MC, None, 2);
+        let mut make_request = make_credential_request(false);
+        make_request.pin_protocol = Some(2);
+        make_request.pin_uv_auth_param =
+            Some(pin_uv_auth_param(&token, 2, &make_request.client_data_hash));
+        assert!(authenticator.make_credential(make_request.clone()).is_ok());
+
+        // Reset com presença: apaga credenciais e invalida a sessão PIN.
+        let result = authenticator.process_command(0x07, vec![]).unwrap();
+        assert!(result.is_empty());
+        assert!(authenticator.get_storage().list_credentials().is_empty());
+
+        // O mesmo request autenticado pelo token antigo não passa mais.
+        let error = authenticator
+            .make_credential(make_request)
+            .expect_err("stale pinUvAuthToken must not survive Reset");
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::PinAuthInvalid)
+        );
+    }
+
+    #[test]
+    fn test_reset_clears_session_pin_state() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        authenticator.set_user_presence(Some(Box::new(TestUserPresence { present: true })));
+
+        client_pin::ClientPin::set_pin(&mut authenticator, b"1234").unwrap();
+        authenticator.set_pin_uv_auth_token(vec![0x77; 32], client_pin::PERMISSION_MC_GA, None, 2);
+        authenticator
+            .set_pin_agreement_key(crypto::pin_protocol::PinAgreementKey::generate().unwrap());
+        authenticator.set_pin_shared_secret(vec![0x88u8; 32], 2);
+        let _ = authenticator.register_pin_failure();
+
+        authenticator.process_command(0x07, vec![]).unwrap();
+
+        assert!(authenticator.pin_uv_auth_token.is_none());
+        assert!(authenticator.pin_agreement_key.is_none());
+        assert!(authenticator.pin_shared_secret.is_none());
+        assert_eq!(authenticator.pin_failures_since_reset, 0);
+    }
+
+    #[test]
     fn test_cred_protect() {
         let crypto = CryptoEngine::new().unwrap();
         let storage = StorageEngine::new().unwrap();
@@ -2821,7 +3334,7 @@ mod tests {
             }],
             exclude_list: vec![],
             extensions: Some(Extensions {
-                cred_protect: Some(CredProtectPolicy::UserVerificationRequired),
+                cred_protect: Some(CredProtectPolicy::UserVerificationRequired.into()),
                 ..Default::default()
             }),
             options: MakeCredentialOptions {
@@ -2838,6 +3351,257 @@ mod tests {
         let response = authenticator.make_credential(request).unwrap();
         let ext = response.extensions.unwrap();
         assert_eq!(ext.cred_protect, Some(0x03));
+    }
+
+    /// Extrai o credential ID do attestedCredentialData no authData:
+    /// rpHash(32) || flags(1) || signCount(4) || aaguid(16) || len(2) || credId.
+    fn credential_id_from_auth_data(auth_data: &[u8]) -> Vec<u8> {
+        auth_data[55..71].to_vec()
+    }
+
+    fn get_assertion_request(rp_id: &str, client_data_hash: Vec<u8>) -> GetAssertionRequest {
+        GetAssertionRequest {
+            rp_id: rp_id.to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash,
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: false,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            uv: None,
+        }
+    }
+
+    /// Credencial com credProtect=3 não pode ser asserada sem UV (silêncio →
+    /// NO_CREDENTIALS); com pinUvAuthToken autenticado (permissão ga), é
+    /// retornada normalmente (CTAP 2.1 §6.8.2/§12.2.2).
+    #[test]
+    fn test_cred_protect_uv_required_blocks_plain_get_assertion() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let mut request = make_credential_request(false);
+        request.extensions = Some(Extensions {
+            cred_protect: Some(CredProtectPolicy::UserVerificationRequired.into()),
+            ..Default::default()
+        });
+        authenticator.make_credential(request).unwrap();
+
+        // Sem token: a credencial é silenciosamente ignorada.
+        let plain = get_assertion_request("example.com", b"challenge".to_vec());
+        let error = authenticator.get_assertion(plain).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::NoCredentials)
+        );
+
+        // Com token autenticado (permissão ga): a credencial é retornada.
+        let token = vec![0xC3; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_GA, None, 2);
+        let mut authenticated = get_assertion_request("example.com", vec![0x42; 32]);
+        authenticated.pin_protocol = Some(2);
+        authenticated.pin_uv_auth_param = Some(pin_uv_auth_param(
+            &token,
+            2,
+            &authenticated.client_data_hash,
+        ));
+        let response = authenticator.get_assertion(authenticated).unwrap();
+        assert!(response.credential.is_some());
+    }
+
+    /// RP com credenciais de políticas mistas: sem UV apenas a de nível
+    /// padrão aparece; com UV válido ambas são retornadas.
+    #[test]
+    fn test_cred_protect_mixed_policies_filter_plain_and_authenticated() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let mut default_request = make_credential_request(false);
+        default_request.user.id = b"user-l1".to_vec();
+        let default_response = authenticator.make_credential(default_request).unwrap();
+        let l1_id = credential_id_from_auth_data(&default_response.auth_data);
+
+        let mut uv_request = make_credential_request(false);
+        uv_request.user.id = b"user-l3".to_vec();
+        uv_request.extensions = Some(Extensions {
+            cred_protect: Some(CredProtectPolicy::UserVerificationRequired.into()),
+            ..Default::default()
+        });
+        let uv_response = authenticator.make_credential(uv_request).unwrap();
+        let l3_id = credential_id_from_auth_data(&uv_response.auth_data);
+
+        // Sem UV: só a credencial de nível padrão é elegível — a UV-required
+        // não é retornada e não entra na contagem de multi-assertion.
+        let plain = get_assertion_request("example.com", b"challenge".to_vec());
+        let response = authenticator.get_assertion(plain).unwrap();
+        assert_eq!(response.credential.unwrap().id, l1_id);
+        // Estado de multi-assertion nem chega a ser criado (total == 1).
+        let next = authenticator.process_command(0x08, vec![]);
+        assert!(matches!(next, Err(Ctap2Error::InvalidState)));
+
+        // Com UV válido: ambas aparecem.
+        let token = vec![0xC4; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_GA, None, 2);
+        let mut authenticated = get_assertion_request("example.com", vec![0x43; 32]);
+        authenticated.pin_protocol = Some(2);
+        authenticated.pin_uv_auth_param = Some(pin_uv_auth_param(
+            &token,
+            2,
+            &authenticated.client_data_hash,
+        ));
+        let response = authenticator.get_assertion(authenticated).unwrap();
+        assert_eq!(response.number_of_credentials, Some(2));
+        assert!(matches!(&response.credential.unwrap().id, id if id == &l1_id || id == &l3_id));
+    }
+
+    /// Regra de descoberta do nível 2 (CTAP 2.1 §12.2.2): sem UV a
+    /// credencial só é retornável quando nomeada na allowList da requisição;
+    /// a descoberta por RP (listas vazias) deve ocultá-la.
+    #[test]
+    fn test_cred_protect_level2_discovery_rules() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        // Credencial de nível 2 criada pelo wire format (`credProtect` como
+        // inteiro CBOR).
+        let raw_level2 = mc_wire_request_bytes(Value::Map(vec![(
+            Value::Text("credProtect".into()),
+            Value::Integer(2.into()),
+        )]));
+        let encoded = authenticator.process_command(0x01, raw_level2).unwrap();
+        let response: Value = decode_cbor(&encoded).unwrap();
+        let auth_data = cbor_bytes_field(&response, "2");
+        let l2_id = credential_id_from_auth_data(&auth_data);
+
+        // 1. Descoberta por RP (sem allowList) sem UV: silêncio total —
+        //    NO_CREDENTIALS mesmo sendo a única credencial do RP.
+        let plain = get_assertion_request("example.com", b"challenge-l2".to_vec());
+        let error = authenticator.get_assertion(plain).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::NoCredentials)
+        );
+
+        // 2. AllowList nomeando a credencial de nível 2, sem UV: sucesso.
+        let mut named = get_assertion_request("example.com", vec![0x51; 32]);
+        named.allow_list = Some(vec![CredentialDescriptor {
+            r#type: "public-key".to_string(),
+            id: l2_id.clone(),
+            transports: None,
+        }]);
+        let response = authenticator.get_assertion(named).unwrap();
+        assert_eq!(response.credential.unwrap().id, l2_id);
+
+        // 3. Descoberta por RP com UV válida: sucesso.
+        let token = vec![0xD9; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_GA, None, 2);
+        let mut with_uv = get_assertion_request("example.com", vec![0x52; 32]);
+        with_uv.pin_protocol = Some(2);
+        with_uv.pin_uv_auth_param = Some(pin_uv_auth_param(&token, 2, &with_uv.client_data_hash));
+        let response = authenticator.get_assertion(with_uv).unwrap();
+        assert_eq!(response.credential.unwrap().id, l2_id);
+    }
+
+    /// GetNextAssertion aplica o mesmo filtro `credProtect` da asserção
+    /// inicial: a credencial UV-required nunca entra na rotação sem UV.
+    #[test]
+    fn test_cred_protect_get_next_assertion_respects_filter() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        // Duas credenciais de nível padrão e uma UV-required no mesmo RP.
+        for i in 0..2u8 {
+            let mut request = make_credential_request(false);
+            request.user.id = vec![i; 8];
+            authenticator.make_credential(request).unwrap();
+        }
+        let mut uv_request = make_credential_request(false);
+        uv_request.user.id = b"user-l3".to_vec();
+        uv_request.extensions = Some(Extensions {
+            cred_protect: Some(CredProtectPolicy::UserVerificationRequired.into()),
+            ..Default::default()
+        });
+        authenticator.make_credential(uv_request).unwrap();
+
+        // Sem UV: apenas as duas de nível padrão participam da multi-assertion.
+        let plain = get_assertion_request("example.com", b"challenge".to_vec());
+        let response = authenticator.get_assertion(plain).unwrap();
+        assert_eq!(response.number_of_credentials, Some(2));
+
+        let next = authenticator.process_command(0x08, vec![]).unwrap();
+        let next_response: GetAssertionResponse = decode_cbor(&next).unwrap();
+        assert_eq!(next_response.number_of_credentials, Some(2));
+
+        // Terceira asserção não existe sem UV — a UV-required fica oculta.
+        let exhausted = authenticator.process_command(0x08, vec![]);
+        assert!(matches!(exhausted, Err(Ctap2Error::NoCredentials)));
+
+        // Com UV válido: as três credenciais entram na rotação.
+        let token = vec![0xC5; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_GA, None, 2);
+        let mut authenticated = get_assertion_request("example.com", vec![0x44; 32]);
+        authenticated.pin_protocol = Some(2);
+        authenticated.pin_uv_auth_param = Some(pin_uv_auth_param(
+            &token,
+            2,
+            &authenticated.client_data_hash,
+        ));
+        let response = authenticator.get_assertion(authenticated).unwrap();
+        assert_eq!(response.number_of_credentials, Some(3));
+
+        assert!(authenticator.process_command(0x08, vec![]).is_ok());
+        assert!(authenticator.process_command(0x08, vec![]).is_ok());
+        let exhausted = authenticator.process_command(0x08, vec![]);
+        assert!(matches!(exhausted, Err(Ctap2Error::NoCredentials)));
+    }
+
+    /// Credential Management deve reportar a política real por credencial em
+    /// vez de omiti-la (CTAP 2.1 §6.12.2).
+    #[test]
+    fn test_credential_management_enumerate_reports_cred_protect() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let mut request = make_credential_request(false);
+        request.options.rk = true;
+        request.extensions = Some(Extensions {
+            cred_protect: Some(CredProtectPolicy::UserVerificationRequired.into()),
+            ..Default::default()
+        });
+        authenticator.make_credential(request).unwrap();
+
+        let cm_token = vec![0xC9; 32];
+        authenticator.set_pin_uv_auth_token(cm_token.clone(), client_pin::PERMISSION_CM, None, 2);
+
+        let rp_hash = authenticator.get_crypto().sha256(b"example.com");
+        let enum_req = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::ENUMERATE_CREDENTIALS_BEGIN,
+            sub_command_params: Some(cred_mgmt::CredMgmtParams {
+                rp_id_hash: Some(rp_hash),
+                credential_id: None,
+                user: None,
+            }),
+            pin_uv_auth_protocol: None,
+            pin_uv_auth_param: None,
+        };
+        let encoded = authenticator
+            .process_command(0x0A, signed_cred_mgmt_request(enum_req, &cm_token, 2))
+            .unwrap();
+        // Decodifica como Value genérico: o wire format CTAP omite campos
+        // opcionais (skip_serializing_if), e o roundtrip tipado com
+        // serde_bytes não é obrigatório para validar o conteúdo.
+        let value: Value = ciborium::de::from_reader(encoded.as_slice()).unwrap();
+        let cred_protect = cbor_field(&value, "4"); // chave CTAP de credProtect
+        assert_eq!(cred_protect, Some(&Value::Integer(3.into())));
     }
 
     #[test]
@@ -2863,7 +3627,7 @@ mod tests {
         );
         assert_eq!(
             firmware_version_to_ctap_integer("1000.0.0"),
-            Err(Ctap2Error::InvalidData)
+            Err(Ctap2Error::Unknown)
         );
     }
 
@@ -3079,23 +3843,207 @@ mod tests {
         assert_eq!(ext.min_pin_length, Some(4));
     }
 
+    // ── hmac-secret (CTAP 2.1 §12.5) ─────────────────────────────────────
+
+    /// Request MakeCredential no formato de wire da spec (chaves inteiras na
+    /// raiz, extensões aninhadas com `"hmac-secret": true`) decodifica sem
+    /// exigir campos de outras extensões.
     #[test]
-    fn test_hmac_secret_creation() {
+    fn test_mc_wire_request_with_hmac_secret_decodes() {
+        let root = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Bytes(b"test".to_vec())),
+            (
+                Value::Integer(2.into()),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Text("example.com".into()),
+                )]),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(b"user123".to_vec()),
+                )]),
+            ),
+            (
+                Value::Integer(4.into()),
+                Value::Array(vec![Value::Map(vec![
+                    (Value::Text("type".into()), Value::Text("public-key".into())),
+                    (Value::Text("alg".into()), Value::Integer((-7).into())),
+                ])]),
+            ),
+            (Value::Integer(5.into()), Value::Array(vec![])),
+            (
+                Value::Integer(6.into()),
+                Value::Map(vec![(Value::Text("hmac-secret".into()), Value::Bool(true))]),
+            ),
+            (
+                Value::Integer(7.into()),
+                Value::Map(vec![
+                    (Value::Text("rk".into()), Value::Bool(false)),
+                    (Value::Text("uv".into()), Value::Bool(false)),
+                    (Value::Text("up".into()), Value::Bool(true)),
+                ]),
+            ),
+        ]);
+        let mut raw = Vec::new();
+        into_writer(&root, &mut raw).unwrap();
+        match decode_cbor::<MakeCredentialRequest>(&raw) {
+            Ok(request) => assert_eq!(
+                request.extensions.unwrap().hmac_secret,
+                Some(Value::Bool(true))
+            ),
+            Err(error) => panic!("decode falhou: {error:?}"),
+        }
+    }
+
+    use crate::client_pin::{self, ClientPinRequest, ClientPinSubCommand};
+    use crypto::pin_protocol::{PinAgreementKey, PinUvProtocol, Zeroizing};
+
+    /// Request MakeCredential canônico (chaves inteiras na raiz) com o mapa
+    /// de extensões fornecido — formato real enviado pelas plataformas.
+    fn mc_wire_request_bytes(extensions: Value) -> Vec<u8> {
+        let root = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Bytes(b"test".to_vec())),
+            (
+                Value::Integer(2.into()),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Text("example.com".into()),
+                )]),
+            ),
+            (
+                Value::Integer(3.into()),
+                Value::Map(vec![(
+                    Value::Text("id".into()),
+                    Value::Bytes(b"user123".to_vec()),
+                )]),
+            ),
+            (
+                Value::Integer(4.into()),
+                Value::Array(vec![Value::Map(vec![
+                    (Value::Text("type".into()), Value::Text("public-key".into())),
+                    (Value::Text("alg".into()), Value::Integer((-7).into())),
+                ])]),
+            ),
+            (Value::Integer(5.into()), Value::Array(vec![])),
+            (Value::Integer(6.into()), extensions),
+            (
+                Value::Integer(7.into()),
+                Value::Map(vec![
+                    (Value::Text("rk".into()), Value::Bool(false)),
+                    (Value::Text("uv".into()), Value::Bool(false)),
+                    (Value::Text("up".into()), Value::Bool(true)),
+                ]),
+            ),
+        ]);
+        let mut raw = Vec::new();
+        into_writer(&root, &mut raw).unwrap();
+        raw
+    }
+
+    #[test]
+    fn test_extensions_wire_cred_protect_decodes_from_integer() {
+        // CTAP 2.1 §12.2.2: `"credProtect"` chega como inteiro CBOR no mapa
+        // de extensões; todos os níveis da spec devem decodificar para o
+        // nível correspondente.
+        let expected = [
+            (1u64, CredProtectPolicy::UserVerificationOptional),
+            (
+                2,
+                CredProtectPolicy::UserVerificationOptionalWithCredentialIDList,
+            ),
+            (3, CredProtectPolicy::UserVerificationRequired),
+        ];
+        for (level, policy) in expected {
+            let extensions = Value::Map(vec![(
+                Value::Text("credProtect".into()),
+                Value::Integer(level.into()),
+            )]);
+            let raw = mc_wire_request_bytes(extensions);
+            let request: MakeCredentialRequest = decode_cbor(&raw)
+                .unwrap_or_else(|error| panic!("decode falhou para nível {level}: {error:?}"));
+            let ext = request.extensions.expect("extensões perdidas no decode");
+            assert_eq!(
+                ext.cred_protect,
+                Some(level as u8),
+                "nível {level} não decodificado"
+            );
+            assert_eq!(CredProtectPolicy::from(ext.cred_protect.unwrap()), policy);
+        }
+    }
+
+    #[test]
+    fn test_extensions_wire_cred_blob_decodes_alone_and_combined() {
+        // `"credBlob"` é byte string CBOR; deve decodificar sozinha e em um
+        // mapa combinado com as demais extensões anunciadas pelo GetInfo.
+        let blob = b"blob-bytes".to_vec();
+
+        let alone = Value::Map(vec![(
+            Value::Text("credBlob".into()),
+            Value::Bytes(blob.clone()),
+        )]);
+        let raw = mc_wire_request_bytes(alone);
+        let request: MakeCredentialRequest =
+            decode_cbor(&raw).expect("`credBlob` isolado deve decodificar");
+        let ext = request.extensions.expect("extensões ausentes");
+        assert_eq!(ext.cred_blob.as_deref(), Some(blob.as_slice()));
+
+        let combined = Value::Map(vec![
+            (Value::Text("credProtect".into()), Value::Integer(3.into())),
+            (Value::Text("credBlob".into()), Value::Bytes(blob.clone())),
+            (Value::Text("minPinLength".into()), Value::Bool(true)),
+            (Value::Text("largeBlobKey".into()), Value::Bool(true)),
+        ]);
+        let raw = mc_wire_request_bytes(combined);
+        let request: MakeCredentialRequest =
+            decode_cbor(&raw).expect("mapa combinado de extensões deve decodificar");
+        let ext = request.extensions.expect("extensões ausentes");
+        assert_eq!(ext.cred_protect, Some(3));
+        assert_eq!(ext.cred_blob.as_deref(), Some(blob.as_slice()));
+        assert!(ext.min_pin_length);
+        assert!(ext.large_blob_key);
+    }
+
+    /// GetAssertion mínimo da spec (`{1: rpId, 2: clientDataHash}`, sem
+    /// allowList nem options) deve decodificar e seguir o fluxo normal até
+    /// NO_CREDENTIALS em vez de falhar com InvalidCbor (CTAP 2.1 §6.8.3).
+    #[test]
+    fn test_get_assertion_minimal_spec_request_decodes() {
         let crypto = CryptoEngine::new().unwrap();
         let storage = StorageEngine::new().unwrap();
         let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
 
-        let request = MakeCredentialRequest {
+        let root = Value::Map(vec![
+            (Value::Integer(1.into()), Value::Text("example.com".into())),
+            (
+                Value::Integer(2.into()),
+                Value::Bytes(b"challenge".to_vec()),
+            ),
+        ]);
+        let mut raw = Vec::new();
+        into_writer(&root, &mut raw).unwrap();
+
+        match authenticator.process_command(0x02, raw) {
+            Err(Ctap2Error::NoCredentials) => {}
+            Err(error) => panic!("erro errado para request mínimo: {error:?}"),
+            Ok(_) => panic!("request mínimo não deveria ter credenciais"),
+        }
+    }
+
+    fn mc_request_with(extensions: Option<Extensions>) -> MakeCredentialRequest {
+        MakeCredentialRequest {
             client_data_hash: b"test".to_vec(),
             rp: RelyingParty {
                 id: "example.com".to_string(),
-                name: Some("Example".to_string()),
+                name: None,
                 icon: None,
             },
             user: User {
                 id: b"user123".to_vec(),
-                name: Some("testuser".to_string()),
-                display_name: Some("Test User".to_string()),
+                name: None,
+                display_name: None,
                 icon_url: None,
             },
             pub_key_cred_params: vec![PublicKeyCredParams {
@@ -3103,100 +4051,900 @@ mod tests {
                 algorithms: -7,
             }],
             exclude_list: vec![],
-            extensions: Some(Extensions {
-                hmac_secret: Some(HmacSecretInput {
-                    salt_enc: vec![0u8; 16],
-                    pin_uv_auth_protocol: None,
-                }),
-                ..Default::default()
-            }),
+            extensions,
             options: MakeCredentialOptions {
                 rk: false,
-                uv: true,
+                uv: false,
                 up: true,
                 extended: false,
             },
             pin_uv_auth_param: None,
             pin_protocol: None,
             enterprise_protections: None,
-        };
+        }
+    }
 
-        let response = authenticator.make_credential(request).unwrap();
-        let ext = response.extensions.unwrap();
-        assert!(ext.hmac_secret.is_some());
-        assert_eq!(ext.hmac_secret.unwrap().len(), 48);
+    /// Lado plataforma da extensão: chave pública COSE, protocolo e segredo
+    /// compartilhado derivado do getKeyAgreement do autenticador.
+    struct PlatformSide {
+        protocol: PinUvProtocol,
+        secret: Zeroizing<Vec<u8>>,
+        public_cose: client_pin::CoseEc2Key,
+    }
+
+    impl PlatformSide {
+        /// Executa getKeyAgreement (0x02) e deriva o segredo compartilhado,
+        /// espelhando `fido2.ctap2.pin.ClientPin._get_shared_secret`.
+        fn start(authenticator: &mut Ctap2Authenticator, version: u8) -> Self {
+            let request = ClientPinRequest {
+                pin_protocol: Some(version),
+                sub_command: ClientPinSubCommand::GetKeyAgreement as u8,
+                ..Default::default()
+            };
+            let encoded = client_pin::encode_client_pin_request_array(&request).unwrap();
+            let response_bytes = client_pin::handle_client_pin(authenticator, &encoded).unwrap();
+            let response = client_pin::decode_client_pin_response(&response_bytes).unwrap();
+            let cose_bytes = response.key_agreement.expect("keyAgreement ausente");
+            let auth_cose_value: Value = from_reader(cose_bytes.as_slice()).unwrap();
+            let auth_cose = client_pin::CoseEc2Key::from_cose_value(&auth_cose_value).unwrap();
+
+            let platform_key = PinAgreementKey::generate().unwrap();
+            let public = platform_key.public_key_bytes().unwrap();
+            let public_cose = client_pin::CoseEc2Key {
+                x: public[1..33].to_vec(),
+                y: public[33..65].to_vec(),
+            };
+            let z = Zeroizing::new(
+                platform_key
+                    .agree(&auth_cose.to_uncompressed().unwrap())
+                    .unwrap(),
+            );
+            let protocol = PinUvProtocol::new(version).unwrap();
+            let secret = Zeroizing::new(protocol.kdf(&z).unwrap());
+            Self {
+                protocol,
+                secret,
+                public_cose,
+            }
+        }
+
+        /// Acordo "órfão": a plataforma deriva um segredo sem getKeyAgreement
+        /// prévio — o autenticador não possui a chave efêmera correspondente.
+        fn orphan(version: u8) -> Self {
+            let protocol = PinUvProtocol::new(version).unwrap();
+            let key = PinAgreementKey::generate().unwrap();
+            let public = key.public_key_bytes().unwrap();
+            let public_cose = client_pin::CoseEc2Key {
+                x: public[1..33].to_vec(),
+                y: public[33..65].to_vec(),
+            };
+            let z = Zeroizing::new(key.agree(&public).unwrap());
+            let secret = Zeroizing::new(protocol.kdf(&z).unwrap());
+            Self {
+                protocol,
+                secret,
+                public_cose,
+            }
+        }
+
+        /// Monta o mapa de entrada da extensão para os salts dados.
+        fn extension(&self, salts: &[u8]) -> Extensions {
+            let salt_enc = self.protocol.encrypt(&self.secret, salts).unwrap();
+            let salt_auth = self.protocol.authenticate(&self.secret, &salt_enc).unwrap();
+            let version = self.protocol.version();
+            Extensions {
+                hmac_secret: Some(Value::Map(vec![
+                    (Value::Integer(1.into()), self.public_cose.to_cose_value()),
+                    (Value::Integer(2.into()), Value::Bytes(salt_enc)),
+                    (Value::Integer(3.into()), Value::Bytes(salt_auth)),
+                    // §12.5: plataformas CTAP 2.1 incluem pinUvAuthProtocol
+                    // sempre que o valor não é 1.
+                    (
+                        Value::Integer(4.into()),
+                        Value::Integer((version as i64).into()),
+                    ),
+                ])),
+                ..Default::default()
+            }
+        }
+
+        fn ga_request(
+            &self,
+            credential_id: Vec<u8>,
+            crypto: &CryptoEngine,
+            uv: bool,
+        ) -> GetAssertionRequest {
+            GetAssertionRequest {
+                rp_id: "example.com".to_string(),
+                credentials: vec![CredentialDescriptor {
+                    r#type: "public-key".to_string(),
+                    id: credential_id,
+                    transports: None,
+                }],
+                allow_list: None,
+                client_data_hash: crypto.sha256(b"client data hash"),
+                extensions: None,
+                options: GetAssertionOptions { up: true, uv },
+                pin_uv_auth_param: None,
+                pin_protocol: None,
+                uv: Some(uv),
+            }
+        }
+
+        fn decrypt_output(&self, value: Option<Value>) -> Vec<u8> {
+            match value.expect("saída hmac-secret ausente") {
+                Value::Bytes(bytes) => self.protocol.decrypt(&self.secret, &bytes).unwrap(),
+                other => panic!("saída inesperada da extensão: {:?}", other),
+            }
+        }
+    }
+
+    fn expected_outputs(crypto: &CryptoEngine, cred_random: &[u8], salts: &[u8]) -> Vec<u8> {
+        let mut outputs = Vec::new();
+        for salt in salts.chunks(32) {
+            outputs.extend_from_slice(&crypto.compute_hmac(salt, cred_random).unwrap());
+        }
+        outputs
     }
 
     #[test]
-    fn test_hmac_secret_get() {
+    fn test_hmac_secret_mc_returns_true_and_persists_cred_random() {
         let crypto = CryptoEngine::new().unwrap();
         let storage = StorageEngine::new().unwrap();
         let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
 
-        let request = MakeCredentialRequest {
-            client_data_hash: b"test".to_vec(),
-            rp: RelyingParty {
-                id: "example.com".to_string(),
-                name: Some("Example".to_string()),
-                icon: None,
-            },
-            user: User {
-                id: b"user123".to_vec(),
-                name: Some("testuser".to_string()),
-                display_name: Some("Test User".to_string()),
-                icon_url: None,
-            },
-            pub_key_cred_params: vec![PublicKeyCredParams {
-                r#type: "public-key".to_string(),
-                algorithms: -7,
-            }],
-            exclude_list: vec![],
-            extensions: None,
-            options: MakeCredentialOptions {
-                rk: false,
-                uv: true,
-                up: true,
-                extended: false,
-            },
-            pin_uv_auth_param: None,
-            pin_protocol: None,
-            enterprise_protections: None,
-        };
+        let request = mc_request_with(Some(Extensions {
+            hmac_secret: Some(Value::Bool(true)),
+            ..Default::default()
+        }));
+        let response = authenticator.make_credential(request).unwrap();
 
-        authenticator.make_credential(request).unwrap();
-        let cred_id = authenticator.get_storage().list_credentials()[0]
-            .credential_id
+        // §12.5: MakeCredential responde apenas a confirmação booleana.
+        assert_eq!(
+            response.extensions.unwrap().hmac_secret,
+            Some(Value::Bool(true))
+        );
+
+        let stored = authenticator.get_storage().list_credentials();
+        let with_uv = stored[0].cred_random_with_uv.as_ref().unwrap();
+        let without_uv = stored[0].cred_random_without_uv.as_ref().unwrap();
+        assert_eq!(with_uv.len(), 32);
+        assert_eq!(without_uv.len(), 32);
+        assert_ne!(with_uv, without_uv);
+        assert!(with_uv.iter().any(|b| *b != 0));
+        assert!(without_uv.iter().any(|b| *b != 0));
+
+        // Sem a extensão, nenhum CredRandom é gerado.
+        authenticator
+            .make_credential(mc_request_with(None))
+            .unwrap();
+        let stored = authenticator.get_storage().list_credentials();
+        let second = stored
+            .iter()
+            .find(|c| c.cred_random_with_uv.is_none())
+            .expect("segunda credencial sem hmac-secret");
+        assert!(second.cred_random_without_uv.is_none());
+    }
+
+    #[test]
+    fn test_hmac_secret_mc_false_generates_nothing() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let request = mc_request_with(Some(Extensions {
+            hmac_secret: Some(Value::Bool(false)),
+            ..Default::default()
+        }));
+        let response = authenticator.make_credential(request).unwrap();
+        assert_eq!(response.extensions.unwrap().hmac_secret, None);
+
+        let stored = authenticator.get_storage().list_credentials();
+        assert!(stored[0].cred_random_with_uv.is_none());
+        assert!(stored[0].cred_random_without_uv.is_none());
+    }
+
+    fn full_get_assertion_roundtrip(version: u8) {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+        let with_uv = credential.cred_random_with_uv.clone().unwrap();
+
+        // Bit UV verdadeiro: selecionar CredRandomWithUV exige autenticação
+        // real — cada GetAssertion abaixo carrega pinUvAuthToken(ga).
+        let token = vec![0xD1u8; 32];
+        authenticator.set_pin_uv_auth_token(
+            token.clone(),
+            client_pin::PERMISSION_GA,
+            None,
+            version,
+        );
+
+        let salt1 = [0x11u8; 32];
+        let salt2 = [0x22u8; 32];
+        for salts in [
+            salt1.to_vec(),
+            [salt1.as_slice(), salt2.as_slice()].concat(),
+        ] {
+            // Cada GetAssertion usa um getKeyAgreement fresco, como faz o
+            // python-fido2 (`_get_shared_secret` antes de cada operação).
+            let platform = PlatformSide::start(&mut authenticator, version);
+            let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+            request.pin_protocol = Some(version);
+            request.pin_uv_auth_param = Some(pin_uv_auth_param(
+                &token,
+                version,
+                &request.client_data_hash,
+            ));
+            request.extensions = Some(platform.extension(&salts));
+            let assertion = authenticator.get_assertion(request).unwrap();
+
+            let decrypted = platform.decrypt_output(assertion.extensions.unwrap().hmac_secret);
+            assert_eq!(decrypted, expected_outputs(&crypto, &with_uv, &salts));
+            assert_eq!(decrypted.len(), if salts.len() == 32 { 32 } else { 64 });
+        }
+    }
+
+    #[test]
+    fn test_hmac_secret_roundtrip_protocol_1() {
+        full_get_assertion_roundtrip(1);
+    }
+
+    #[test]
+    fn test_hmac_secret_roundtrip_protocol_2() {
+        full_get_assertion_roundtrip(2);
+    }
+
+    /// §12.5 com bit UV verdadeiro: a saída usa CredRandomWithUV somente
+    /// quando a operação foi autenticada (pinUvAuthToken); sem autenticação,
+    /// mesmo com `uv` pedido, deriva de CredRandomWithoutUV.
+    #[test]
+    fn test_hmac_secret_selects_cred_random_by_uv_bit() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+        let with_uv = credential.cred_random_with_uv.clone().unwrap();
+        let without_uv = credential.cred_random_without_uv.clone().unwrap();
+
+        let salts = [0x33u8; 32];
+
+        // Sem autenticação real, mesmo pedindo uv=1 a resposta não pode
+        // alegar verificação — saída deriva de CredRandomWithoutUV.
+        let platform = PlatformSide::start(&mut authenticator, 2);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.extensions = Some(platform.extension(&salts));
+        let assertion = authenticator.get_assertion(request).unwrap();
+        let out_without_uv = platform.decrypt_output(assertion.extensions.unwrap().hmac_secret);
+        assert_eq!(
+            out_without_uv,
+            expected_outputs(&crypto, &without_uv, &salts)
+        );
+
+        // Com pinUvAuthToken(ga) autenticado para esta operação:
+        // verificação satisfeita → CredRandomWithUV.
+        let token = vec![0xC6; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_GA, None, 2);
+        let platform = PlatformSide::start(&mut authenticator, 2);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.pin_protocol = Some(2);
+        request.pin_uv_auth_param = Some(pin_uv_auth_param(&token, 2, &request.client_data_hash));
+        request.extensions = Some(platform.extension(&salts));
+        let assertion = authenticator.get_assertion(request).unwrap();
+        let out_with_uv = platform.decrypt_output(assertion.extensions.unwrap().hmac_secret);
+        assert_eq!(out_with_uv, expected_outputs(&crypto, &with_uv, &salts));
+
+        assert_ne!(out_with_uv, out_without_uv);
+    }
+
+    /// O bit UV do authData reflete apenas verificação REALIZADA (WebAuthn
+    /// L3 §6.1): pedir `options.uv = true` sem PIN configurado e sem
+    /// pinUvAuthToken não verifica usuário algum — a operação prossegue SEM
+    /// alegar UV; com token autenticado para a operação, o bit é setado.
+    #[test]
+    fn test_uv_flag_requires_actual_verification() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        // MakeCredential pedindo uv sem nenhum verificador disponível.
+        let mut make_request = make_credential_request(true);
+        make_request.options.uv = true;
+        let response = authenticator.make_credential(make_request).unwrap();
+        assert_eq!(
+            response.auth_data[32] & 0x04,
+            0,
+            "bit UV não pode ser alegado sem verificação"
+        );
+        assert_ne!(response.auth_data[32] & 0x01, 0);
+
+        // GetAssertion na mesma situação.
+        let mut plain = get_assertion_request("example.com", b"challenge".to_vec());
+        plain.options.uv = true;
+        let response = authenticator.get_assertion(plain).unwrap();
+        assert_eq!(response.auth_data[32] & 0x04, 0);
+
+        // Com pinUvAuthToken(ga) autenticando esta operação: bit UV setado.
+        let token = vec![0xD7; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_GA, None, 2);
+        let mut verified = get_assertion_request("example.com", vec![0x71; 32]);
+        verified.pin_protocol = Some(2);
+        verified.pin_uv_auth_param = Some(pin_uv_auth_param(&token, 2, &verified.client_data_hash));
+        let response = authenticator.get_assertion(verified).unwrap();
+        assert_ne!(response.auth_data[32] & 0x04, 0);
+    }
+
+    /// Com PIN configurado existe verificador disponível: pedir `uv` sem
+    /// autenticação continua negando com PIN_REQUIRED (gate existente).
+    #[test]
+    fn test_uv_requested_with_pin_set_still_requires_authentication() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        // Credencial pré-existente criada antes do PIN.
+        let mut seed = make_credential_request(false);
+        seed.options.uv = false;
+        authenticator.make_credential(seed).unwrap();
+        client_pin::ClientPin::set_pin(&mut authenticator, b"1234").unwrap();
+
+        let mut make_request = make_credential_request(true);
+        make_request.options.uv = true;
+        let error = authenticator.make_credential(make_request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::PinRequired)
+        );
+
+        let plain = get_assertion_request("example.com", b"challenge".to_vec());
+        let mut plain = plain;
+        plain.options.uv = true;
+        let error = authenticator.get_assertion(plain).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::PinRequired)
+        );
+    }
+
+    /// §12.5 com bit UV verdadeiro: sem verificação real (nem token), mesmo
+    /// pedindo `uv`, a saída deriva de CredRandomWithoutUV; com
+    /// pinUvAuthToken(ga) autenticado, deriva de CredRandomWithUV.
+    #[test]
+    fn test_hmac_secret_withuv_output_requires_authentication() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+        let with_uv = credential.cred_random_with_uv.clone().unwrap();
+        let without_uv = credential.cred_random_without_uv.clone().unwrap();
+        let salts = [0x3Bu8; 32];
+
+        // Sem token (uv pedido e não atendido): WithoutUV.
+        let platform = PlatformSide::start(&mut authenticator, 2);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.extensions = Some(platform.extension(&salts));
+        let assertion = authenticator.get_assertion(request).unwrap();
+        let out_without_uv = platform.decrypt_output(assertion.extensions.unwrap().hmac_secret);
+        assert_eq!(
+            out_without_uv,
+            expected_outputs(&crypto, &without_uv, &salts)
+        );
+
+        // Token ga autenticado: WithUV.
+        let token = vec![0xD8; 32];
+        authenticator.set_pin_uv_auth_token(token.clone(), client_pin::PERMISSION_GA, None, 2);
+        let platform = PlatformSide::start(&mut authenticator, 2);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.pin_protocol = Some(2);
+        request.pin_uv_auth_param = Some(pin_uv_auth_param(&token, 2, &request.client_data_hash));
+        request.extensions = Some(platform.extension(&salts));
+        let assertion = authenticator.get_assertion(request).unwrap();
+        let out_with_uv = platform.decrypt_output(assertion.extensions.unwrap().hmac_secret);
+        assert_eq!(out_with_uv, expected_outputs(&crypto, &with_uv, &salts));
+
+        assert_ne!(out_with_uv, out_without_uv);
+    }
+
+    #[test]
+    fn test_hmac_secret_saltauth_mismatch_fails() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
             .clone();
 
-        let salt = b"1234567890123456".to_vec();
-        let encrypted_salt = crypto.encrypt(&salt, &[0u8; 12]).unwrap();
+        // §12.5: verify(shared secret, saltEnc, saltAuth) falho → PIN_AUTH_INVALID.
+        let platform = PlatformSide::start(&mut authenticator, 1);
+        let mut extensions = platform.extension(&[0x44u8; 32]);
+        if let Some(Value::Map(entries)) = extensions.hmac_secret.as_mut() {
+            for (key, value) in entries.iter_mut() {
+                if *key == Value::Integer(3.into()) {
+                    if let Value::Bytes(tag) = value {
+                        tag[0] ^= 0xFF;
+                    }
+                }
+            }
+        }
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.extensions = Some(extensions);
 
-        let assert_request = GetAssertionRequest {
-            rp_id: "example.com".to_string(),
-            credentials: vec![CredentialDescriptor {
-                r#type: "public-key".to_string(),
-                id: cred_id.clone(),
-                transports: None,
-            }],
-            allow_list: None,
-            client_data_hash: authenticator.get_crypto().sha256(b"client data hash"),
-            extensions: Some(Extensions {
-                hmac_secret: Some(HmacSecretInput {
-                    salt_enc: encrypted_salt,
-                    pin_uv_auth_protocol: None,
-                }),
+        let error = authenticator.get_assertion(request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>().unwrap(),
+            &Ctap2Error::PinAuthInvalid
+        );
+    }
+
+    #[test]
+    fn test_hmac_secret_invalid_salt_length_fails() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
                 ..Default::default()
-            }),
-            options: GetAssertionOptions { up: true, uv: true },
-            pin_uv_auth_param: None,
-            pin_protocol: None,
-            uv: Some(true),
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+
+        // §12.5: plaintext não 32/64 bytes → CTAP1_ERR_INVALID_PARAMETER.
+        let platform = PlatformSide::start(&mut authenticator, 2);
+        let extensions = platform.extension(&[0x55u8; 48]);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.extensions = Some(extensions);
+
+        let error = authenticator.get_assertion(request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>().unwrap(),
+            &Ctap2Error::InvalidParameter
+        );
+    }
+
+    #[test]
+    fn test_hmac_secret_without_cred_random_is_ignored() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        // Credencial criada sem a extensão: nenhum CredRandom persistido.
+        authenticator
+            .make_credential(mc_request_with(None))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(credential.cred_random_with_uv.is_none());
+
+        // §12.5: sem CredRandom associado a extensão é ignorada — a asserção
+        // prossegue sem saída para ela.
+        let platform = PlatformSide::start(&mut authenticator, 1);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.extensions = Some(platform.extension(&[0x66u8; 32]));
+        let assertion = authenticator.get_assertion(request).unwrap();
+        assert_eq!(assertion.extensions.unwrap().hmac_secret, None);
+    }
+
+    #[test]
+    fn test_hmac_secret_requires_up_option() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+
+        // §12.5: "up" falso no GetAssertion → UNSUPPORTED_OPTION.
+        let platform = PlatformSide::start(&mut authenticator, 1);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.options.up = false;
+        request.extensions = Some(platform.extension(&[0x77u8; 32]));
+        let error = authenticator.get_assertion(request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>().unwrap(),
+            &Ctap2Error::UnsupportedOption
+        );
+    }
+
+    #[test]
+    fn test_hmac_secret_orphan_agreement_fails() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+
+        // Sem getKeyAgreement prévio o autenticador não tem a chave efêmera
+        // desta transação: o processamento falha com PIN_AUTH_INVALID.
+        let platform = PlatformSide::orphan(2);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, true);
+        request.extensions = Some(platform.extension(&[0x88u8; 32]));
+        let error = authenticator.get_assertion(request).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>().unwrap(),
+            &Ctap2Error::PinAuthInvalid
+        );
+    }
+
+    #[test]
+    fn test_hmac_secret_fresh_nonce_per_request() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+
+        // Duas requisições idênticas: ciphertexts diferentes (IV fresco via
+        // SystemRandom no protocolo 2), plaintexts iguais.
+        let salts = [0x99u8; 32];
+        let first_side = PlatformSide::start(&mut authenticator, 2);
+        let mut first = first_side.ga_request(credential.credential_id.clone(), &crypto, true);
+        first.extensions = Some(first_side.extension(&salts));
+        let out_first = authenticator.get_assertion(first).unwrap();
+        let enc_first = match out_first.extensions.unwrap().hmac_secret.unwrap() {
+            Value::Bytes(v) => v,
+            other => panic!("saída inesperada: {:?}", other),
         };
 
-        let assert_response = authenticator.get_assertion(assert_request).unwrap();
-        let ext = assert_response.extensions.unwrap();
-        assert!(ext.hmac_secret.is_some());
-        assert_eq!(ext.hmac_secret.unwrap().len(), 48);
+        let second_side = PlatformSide::start(&mut authenticator, 2);
+        let mut second = second_side.ga_request(credential.credential_id.clone(), &crypto, true);
+        second.extensions = Some(second_side.extension(&salts));
+        let out_second = authenticator.get_assertion(second).unwrap();
+        let enc_second = match out_second.extensions.unwrap().hmac_secret.unwrap() {
+            Value::Bytes(v) => v,
+            other => panic!("saída inesperada: {:?}", other),
+        };
+
+        assert_ne!(enc_first, enc_second);
+        assert_eq!(
+            first_side
+                .protocol
+                .decrypt(&first_side.secret, &enc_first)
+                .unwrap(),
+            second_side
+                .protocol
+                .decrypt(&second_side.secret, &enc_second)
+                .unwrap()
+        );
+    }
+
+    /// GetAssertion de descoberta por RP (listas vazias) com a extensão —
+    /// forma necessária para encadear (matching contém todas as credenciais
+    /// do RP), distinta do request nomeado de [`PlatformSide::ga_request`].
+    fn ga_discovery_request(
+        platform: &PlatformSide,
+        crypto: &CryptoEngine,
+        salts: &[u8],
+    ) -> GetAssertionRequest {
+        GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: crypto.sha256(b"client data hash"),
+            extensions: Some(platform.extension(salts)),
+            options: GetAssertionOptions {
+                up: true,
+                uv: false,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            uv: Some(false),
+        }
+    }
+
+    fn raw_hmac_bytes(value: Option<Value>) -> Vec<u8> {
+        match value.expect("saída hmac-secret ausente") {
+            Value::Bytes(bytes) => bytes,
+            other => panic!("saída inesperada da extensão: {:?}", other),
+        }
+    }
+
+    /// Asserções encadeadas com hmac-secret (CTAP 2.1 §12.5 + ADR-0022): a
+    /// saída do GetNextAssertion é `HMAC(CredRandom_da_segunda_credencial,
+    /// salt)` cifrada sob o MESMO segredo compartilhado da asserção inicial
+    /// (a plataforma não repete o getKeyAgreement no meio da transação).
+    /// Sem autenticação, ambas derivam de CredRandomWithoutUV.
+    fn chained_get_next_assertion_roundtrip(version: u8) {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        // Duas credenciais residentes, mesmo RP, usuários distintos.
+        for user_id in [b"user-one".as_slice(), b"user-two".as_slice()] {
+            let mut request = mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            }));
+            request.user.id = user_id.to_vec();
+            authenticator.make_credential(request).unwrap();
+        }
+        let stored = authenticator.get_storage().list_credentials();
+        assert_eq!(stored.len(), 2);
+        let cred_randoms: Vec<(Vec<u8>, Vec<u8>)> = stored
+            .iter()
+            .map(|c| {
+                (
+                    c.credential_id.clone(),
+                    c.cred_random_without_uv.clone().unwrap(),
+                )
+            })
+            .collect();
+
+        let salts = [0x5Au8; 32];
+        let platform = PlatformSide::start(&mut authenticator, version);
+        let assertion = authenticator
+            .get_assertion(ga_discovery_request(&platform, &crypto, &salts))
+            .unwrap();
+        assert_eq!(assertion.number_of_credentials, Some(2));
+        let first_id = assertion.credential.as_ref().unwrap().id.clone();
+        let first_enc = raw_hmac_bytes(
+            assertion
+                .extensions
+                .as_ref()
+                .and_then(|e| e.hmac_secret.clone()),
+        );
+
+        // Identifica os CredRandoms de cada posição da cadeia.
+        let first_entry = cred_randoms
+            .iter()
+            .find(|(id, _)| *id == first_id)
+            .expect("asserção inicial deve usar uma das credenciais");
+        let second_entry = cred_randoms
+            .iter()
+            .find(|(id, _)| *id != first_id)
+            .expect("exatamente uma outra credencial na cadeia");
+        let first_random = &first_entry.1;
+        let second_random = &second_entry.1;
+        let second_id = &second_entry.0;
+
+        let decrypted_first = platform.decrypt_output(Some(Value::Bytes(first_enc.clone())));
+        assert_eq!(
+            decrypted_first,
+            expected_outputs(&crypto, first_random, &salts)
+        );
+
+        // GetNextAssertion: a cadeia produz saída para a segunda credencial.
+        let encoded = authenticator.process_command(0x08, vec![]).unwrap();
+        let chained: GetAssertionResponse = decode_cbor(&encoded).unwrap();
+        assert_eq!(&chained.credential.as_ref().unwrap().id, second_id);
+        assert_eq!(chained.number_of_credentials, Some(2));
+        let chained_enc = raw_hmac_bytes(
+            chained
+                .extensions
+                .as_ref()
+                .and_then(|e| e.hmac_secret.clone()),
+        );
+
+        // IV fresco por resposta: ciphertexts diferem embora os tamanhos
+        // coincidam (32B); decifram sob o MESMO segredo compartilhado.
+        assert_ne!(first_enc, chained_enc);
+        assert_eq!(
+            platform
+                .protocol
+                .decrypt(&platform.secret, &chained_enc)
+                .unwrap(),
+            expected_outputs(&crypto, second_random, &salts)
+        );
+        // Determinismo da derivação: plaintexts distintos entre credenciais.
+        assert_ne!(
+            expected_outputs(&crypto, first_random, &salts),
+            expected_outputs(&crypto, second_random, &salts)
+        );
+
+        // Cadeia esgotada: erro e sessão descartada.
+        let exhausted = authenticator.process_command(0x08, vec![]);
+        assert!(matches!(exhausted, Err(Ctap2Error::NoCredentials)));
+        assert!(authenticator.hmac_secret_session.is_none());
+        // Estado consumido na exaustão: nova tentativa não tem transação.
+        assert!(matches!(
+            authenticator.process_command(0x08, vec![]),
+            Err(Ctap2Error::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn test_hmac_secret_chained_get_next_assertion_protocol_1() {
+        chained_get_next_assertion_roundtrip(1);
+    }
+
+    #[test]
+    fn test_hmac_secret_chained_get_next_assertion_protocol_2() {
+        chained_get_next_assertion_roundtrip(2);
+    }
+
+    /// Qualquer comando que não seja GetNextAssertion encerra a sessão
+    /// hmac-secret (ADR-0022). O encadeamento em si permanece intacto — a
+    /// asserção seguinte sai SEM a extensão, como antes da sessão existir.
+    #[test]
+    fn test_hmac_secret_chain_cleared_by_other_command() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        for user_id in [b"user-a".as_slice(), b"user-b".as_slice()] {
+            let mut request = mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            }));
+            request.user.id = user_id.to_vec();
+            authenticator.make_credential(request).unwrap();
+        }
+
+        let platform = PlatformSide::start(&mut authenticator, 2);
+        let assertion = authenticator
+            .get_assertion(ga_discovery_request(&platform, &crypto, &[0x71u8; 32]))
+            .unwrap();
+        assert!(assertion.extensions.unwrap().hmac_secret.is_some());
+        assert!(authenticator.hmac_secret_session.is_some());
+
+        // Comando intermediário (GetInfo) quebra a sessão hmac-secret…
+        assert!(authenticator.process_command(0x04, vec![]).is_ok());
+        assert!(authenticator.hmac_secret_session.is_none());
+
+        // …sem alterar a semântica preexistente do encadeamento.
+        let encoded = authenticator.process_command(0x08, vec![]).unwrap();
+        let chained: GetAssertionResponse = decode_cbor(&encoded).unwrap();
+        assert!(matches!(
+            authenticator.process_command(0x08, vec![]),
+            Err(Ctap2Error::NoCredentials)
+        ));
+        assert!(chained.extensions.is_none());
+    }
+
+    /// Reset limpa a sessão hmac-secret junto com as credenciais (ADR-0022).
+    #[test]
+    fn test_hmac_secret_session_cleared_on_reset() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        for user_id in [b"user-a".as_slice(), b"user-b".as_slice()] {
+            let mut request = mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            }));
+            request.user.id = user_id.to_vec();
+            authenticator.make_credential(request).unwrap();
+        }
+
+        let platform = PlatformSide::start(&mut authenticator, 1);
+        let assertion = authenticator
+            .get_assertion(ga_discovery_request(&platform, &crypto, &[0x82u8; 64]))
+            .unwrap();
+        assert!(assertion.extensions.is_some());
+        assert!(authenticator.hmac_secret_session.is_some());
+
+        assert!(authenticator.process_command(0x07, vec![]).is_ok());
+        assert!(authenticator.hmac_secret_session.is_none());
+    }
+
+    /// Transação de asserção única: a sessão não sobrevive ao fim do próprio
+    /// GetAssertion — só existe enquanto houver cadeia (ADR-0022).
+    #[test]
+    fn test_hmac_secret_single_assertion_keeps_no_session() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        authenticator
+            .make_credential(mc_request_with(Some(Extensions {
+                hmac_secret: Some(Value::Bool(true)),
+                ..Default::default()
+            })))
+            .unwrap();
+        let credential = authenticator
+            .get_storage()
+            .list_credentials()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+
+        let platform = PlatformSide::start(&mut authenticator, 2);
+        let mut request = platform.ga_request(credential.credential_id.clone(), &crypto, false);
+        request.options.up = true;
+        request.extensions = Some(platform.extension(&[0x9Bu8; 32]));
+        let assertion = authenticator.get_assertion(request).unwrap();
+        assert!(assertion.extensions.unwrap().hmac_secret.is_some());
+        assert!(authenticator.hmac_secret_session.is_none());
     }
 
     #[test]
@@ -3285,7 +5033,10 @@ mod tests {
         }
     }
 
+    // A negociação abaixo seleciona RS256, que só existe com a feature
+    // `rs256` (geração de chave RSA indisponível sem ela).
     #[test]
+    #[cfg(all(test, feature = "rs256"))]
     fn test_algorithm_negotiation_prefers_first_supported() {
         let crypto = CryptoEngine::new().unwrap();
         let storage = StorageEngine::new().unwrap();
@@ -3381,6 +5132,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(test, feature = "rs256"))]
     fn test_get_info_includes_algorithms() {
         let crypto = CryptoEngine::new().unwrap();
         let storage = StorageEngine::new().unwrap();
@@ -3401,6 +5153,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(test, feature = "rs256"))]
     fn test_cose_key_rsa() {
         let n = vec![0xABu8; 256];
         let e = vec![0x01u8, 0x00, 0x01];
@@ -3420,6 +5173,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(test, feature = "rs256"))]
     fn test_rs256_roundtrip() {
         let crypto = CryptoEngine::new().unwrap();
         let storage = StorageEngine::new().unwrap();
@@ -3750,6 +5504,147 @@ mod tests {
         assert!(matches!(result, Err(Ctap2Error::NoCredentials)));
     }
 
+    /// Localiza um campo em um mapa CBOR decodificado. No wire format, as
+    /// chaves do mapa de topo viram inteiros CTAP (`root_ctap_keys`) e os
+    /// mapas aninhados preservam os nomes de texto dos campos serde.
+    fn cbor_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+        let entries = match value {
+            Value::Map(entries) => entries,
+            _ => return None,
+        };
+        entries.iter().find_map(|(k, v)| match k {
+            Value::Text(t) if t == key => Some(v),
+            Value::Integer(n) if i64::try_from(*n).map(|i| i.to_string()).as_deref() == Ok(key) => {
+                Some(v)
+            }
+            _ => None,
+        })
+    }
+
+    fn cbor_bytes_field(value: &Value, key: &str) -> Vec<u8> {
+        match cbor_field(value, key) {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            other => panic!("campo '{}' ausente ou não é bytes: {:?}", key, other),
+        }
+    }
+
+    /// Contador de assinaturas codificado no authData (bytes 33..37, big-endian).
+    fn auth_data_sign_count(auth_data: &[u8]) -> u32 {
+        u32::from_be_bytes(auth_data[33..37].try_into().unwrap())
+    }
+
+    /// GetNextAssertion deve assinar `authData || clientDataHash` com o mesmo
+    /// clientDataHash da asserção inicial (CTAP2 §6.2), incrementar o contador
+    /// a cada resposta persistindo-o e espelhar as flags UP/UV. Exaurida a
+    /// lista, GetNextAssertion retorna NO_CREDENTIALS.
+    #[test]
+    fn test_get_next_assertion_signature_counters_and_flags() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        for i in 0..2u8 {
+            authenticator
+                .make_credential(MakeCredentialRequest {
+                    client_data_hash: vec![i; 32],
+                    rp: RelyingParty {
+                        id: "example.com".to_string(),
+                        name: None,
+                        icon: None,
+                    },
+                    user: User {
+                        id: vec![i; 8],
+                        name: None,
+                        display_name: None,
+                        icon_url: None,
+                    },
+                    pub_key_cred_params: vec![PublicKeyCredParams {
+                        r#type: "public-key".to_string(),
+                        algorithms: -7, // ES256 — assinaturas verificáveis via verify_p256
+                    }],
+                    exclude_list: vec![],
+                    extensions: None,
+                    options: MakeCredentialOptions {
+                        rk: true,
+                        uv: true,
+                        up: true,
+                        extended: false,
+                    },
+                    pin_uv_auth_param: None,
+                    pin_protocol: None,
+                    enterprise_protections: None,
+                })
+                .unwrap();
+        }
+
+        let client_data_hash = b"client data hash".to_vec();
+        let get_assertion_req = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: client_data_hash.clone(),
+            extensions: None,
+            options: GetAssertionOptions { up: true, uv: true },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            uv: None,
+        };
+
+        let encoded = encode_cbor(&get_assertion_req).unwrap();
+        let first_raw = authenticator.process_command(0x02, encoded).unwrap();
+        let second_raw = authenticator.process_command(0x08, vec![]).unwrap();
+
+        // Exauridas as credenciais, GetNextAssertion falha.
+        assert!(matches!(
+            authenticator.process_command(0x08, vec![]),
+            Err(Ctap2Error::NoCredentials)
+        ));
+
+        // Cada resposta: assinatura válida sobre authData || clientDataHash,
+        // contador estritamente crescente e flags espelhadas da inicial.
+        let mut previous_count: Option<u32> = None;
+        for raw in [&first_raw, &second_raw] {
+            let value: Value = decode_cbor(raw).unwrap();
+            let auth_data = cbor_bytes_field(&value, "2");
+            let signature = cbor_bytes_field(&value, "3");
+            let credential_id = cbor_bytes_field(cbor_field(&value, "1").unwrap(), "id");
+
+            // Flags espelhadas da asserção inicial: up=1; o bit UV não é
+            // alegado sem autenticação real (uv=true foi apenas pedido).
+            assert_eq!(auth_data[32], 0x01);
+
+            let credential = authenticator
+                .get_storage()
+                .get_credential(&credential_id, authenticator.get_crypto())
+                .unwrap()
+                .expect("credencial deve existir");
+
+            let mut data_to_sign = Vec::new();
+            data_to_sign.extend_from_slice(&auth_data[..37]);
+            data_to_sign.extend_from_slice(&client_data_hash);
+            authenticator
+                .get_crypto()
+                .verify_p256(&credential.public_key, &data_to_sign, &signature)
+                .expect("assinatura deve validar sobre authData || clientDataHash");
+
+            let sign_count = auth_data_sign_count(&auth_data);
+            if let Some(previous) = previous_count {
+                assert!(sign_count > previous, "contador não é crescente");
+            }
+            previous_count = Some(sign_count);
+        }
+
+        // O último contador foi persistido no storage.
+        let last_value: Value = decode_cbor(&second_raw).unwrap();
+        let last_id = cbor_bytes_field(cbor_field(&last_value, "1").unwrap(), "id");
+        let persisted = authenticator
+            .get_storage()
+            .get_credential(&last_id, authenticator.get_crypto())
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.sign_count, previous_count.unwrap());
+    }
+
     #[test]
     fn test_get_next_assertion_without_state() {
         let crypto = CryptoEngine::new().unwrap();
@@ -3938,6 +5833,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(test, feature = "rs256"))]
     fn test_cose_key_rsa_pss() {
         let n = vec![0xCCu8; 256];
         let e = vec![0x01u8, 0x00, 0x01];
@@ -4007,6 +5903,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(test, feature = "rs256"))]
     fn test_ps256_make_and_get_assertion_roundtrip() {
         let crypto = CryptoEngine::new().unwrap();
         let storage = StorageEngine::new().unwrap();
@@ -4069,6 +5966,20 @@ mod tests {
             .unwrap()
             .authenticate(token, message)
             .unwrap()
+    }
+
+    /// Codifica um request de Credential Management autenticado por um
+    /// pinUvAuthToken (MAC sobre `subCommand || subCommandParams`).
+    fn signed_cred_mgmt_request(
+        mut request: cred_mgmt::CredentialManagementRequest,
+        token: &[u8],
+        protocol: u8,
+    ) -> Vec<u8> {
+        request.pin_uv_auth_protocol = Some(protocol);
+        let unsigned_bytes = encode_cbor(&request).unwrap();
+        let auth_message = credential_management_auth_message(&unsigned_bytes).unwrap();
+        request.pin_uv_auth_param = Some(pin_uv_auth_param(token, protocol, &auth_message));
+        encode_cbor(&request).unwrap()
     }
 
     #[test]
@@ -4287,10 +6198,136 @@ mod tests {
     }
 
     #[test]
+    fn test_large_blobs_write_rejects_offset_beyond_max() {
+        // CTAP 2.1 §6.10: offset além da capacidade máxima é rejeitado antes
+        // de qualquer alocação — um único comando não pode inflar o buffer.
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        // Estado prévio conhecido: 16 bytes escritos em offset 0.
+        let seed = large_blobs::LargeBlobsRequest {
+            offset: 0,
+            get: None,
+            set: Some(vec![0x41u8; 16]),
+            length: Some(16),
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        authenticator
+            .process_command(0x0C, encode_cbor(&seed).unwrap())
+            .unwrap();
+
+        let write_req = large_blobs::LargeBlobsRequest {
+            offset: 4097, // além do maxLargeBlobDataSize (4096)
+            get: None,
+            set: Some(vec![0x42u8; 16]),
+            length: None,
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        let error = authenticator
+            .process_command(0x0C, encode_cbor(&write_req).unwrap())
+            .unwrap_err();
+        assert_eq!(error, Ctap2Error::InvalidParameter);
+        assert_eq!(authenticator.get_storage().get_large_blobs_len(), 16);
+        assert_eq!(
+            authenticator.get_storage().read_large_blobs(0, 16),
+            vec![0x41u8; 16]
+        );
+    }
+
+    #[test]
+    fn test_large_blobs_write_boundary_at_max_succeeds() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        // Escrita terminando exatamente no limite (4096) é permitida.
+        let write_req = large_blobs::LargeBlobsRequest {
+            offset: (4096 - 64) as u64,
+            get: None,
+            set: Some(vec![0x42u8; 64]),
+            length: Some(4096),
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        authenticator
+            .process_command(0x0C, encode_cbor(&write_req).unwrap())
+            .unwrap();
+        assert_eq!(authenticator.get_storage().get_large_blobs_len(), 4096,);
+
+        // Um byte a mais já estoura a capacidade.
+        let overflow_req = large_blobs::LargeBlobsRequest {
+            offset: (4096 - 63) as u64,
+            get: None,
+            set: Some(vec![0x43u8; 64]),
+            length: None,
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        let error = authenticator
+            .process_command(0x0C, encode_cbor(&overflow_req).unwrap())
+            .unwrap_err();
+        assert_eq!(error, Ctap2Error::InvalidParameter);
+        assert_eq!(authenticator.get_storage().get_large_blobs_len(), 4096,);
+
+        // Offset u64 enorme não pode causar overflow/truncamento.
+        let huge_offset_req = large_blobs::LargeBlobsRequest {
+            offset: u64::MAX,
+            get: None,
+            set: Some(vec![0x44u8; 8]),
+            length: None,
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        let error = authenticator
+            .process_command(0x0C, encode_cbor(&huge_offset_req).unwrap())
+            .unwrap_err();
+        assert_eq!(error, Ctap2Error::InvalidParameter);
+    }
+
+    #[test]
+    fn test_credential_management_requires_authenticated_token_without_pin() {
+        // CTAP 2.1 §6.12: mesmo sem PIN configurado, os subcomandos de
+        // Credential Management exigem pinUvAuthToken com permissão `cm` —
+        // as respostas expõem user handles/nomes e permitem exclusão.
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        // Uma credencial residente existe no dispositivo.
+        let mut rk_request = make_credential_request(false);
+        rk_request.options.rk = true;
+        assert!(authenticator.make_credential(rk_request).is_ok());
+        assert_eq!(authenticator.get_storage().get_credentials_count(), 1);
+
+        let request = cred_mgmt::CredentialManagementRequest {
+            sub_command: cred_mgmt::sub_commands::GET_CREDS_METADATA,
+            sub_command_params: None,
+            pin_uv_auth_protocol: None,
+            pin_uv_auth_param: None,
+        };
+        let error = authenticator
+            .process_command(0x0A, encode_cbor(&request).unwrap())
+            .unwrap_err();
+        assert_eq!(error, Ctap2Error::PinRequired);
+        assert_eq!(error.as_u8(), 0x36);
+        // Nada vazou nem foi apagado.
+        assert_eq!(authenticator.get_storage().get_credentials_count(), 1);
+    }
+
+    #[test]
     fn test_credential_management_full_flow() {
         let crypto = CryptoEngine::new().unwrap();
         let storage = StorageEngine::new().unwrap();
         let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        // Fluxo correto segundo a especificação: PIN configurado e token com
+        // permissão `cm` autenticando cada subcomando.
+        client_pin::ClientPin::set_pin(&mut authenticator, b"1234").unwrap();
+        let cm_token = vec![0xC9; 32];
+        authenticator.set_pin_uv_auth_token(cm_token.clone(), client_pin::PERMISSION_CM, None, 2);
 
         // Create 2 credentials
         let make_req1 = MakeCredentialRequest {
@@ -4336,8 +6373,9 @@ mod tests {
             pin_uv_auth_protocol: None,
             pin_uv_auth_param: None,
         };
-        let meta_bytes = encode_cbor(&meta_req).unwrap();
-        let meta_res = authenticator.process_command(0x0A, meta_bytes).unwrap();
+        let meta_res = authenticator
+            .process_command(0x0A, signed_cred_mgmt_request(meta_req, &cm_token, 2))
+            .unwrap();
         let meta_resp: cred_mgmt::CredsMetadataResponse = decode_cbor(&meta_res).unwrap();
         assert_eq!(meta_resp.existing_resident_credentials_count, 1);
 
@@ -4348,8 +6386,9 @@ mod tests {
             pin_uv_auth_protocol: None,
             pin_uv_auth_param: None,
         };
-        let enum_rp_bytes = encode_cbor(&enum_rp_req).unwrap();
-        let enum_rp_res = authenticator.process_command(0x0A, enum_rp_bytes).unwrap();
+        let enum_rp_res = authenticator
+            .process_command(0x0A, signed_cred_mgmt_request(enum_rp_req, &cm_token, 2))
+            .unwrap();
         let enum_rp_resp: cred_mgmt::EnumerateRpsEntryResponse = decode_cbor(&enum_rp_res).unwrap();
         assert_eq!(enum_rp_resp.total_rps, 1);
         assert_eq!(enum_rp_resp.rp.id, "rp1.com");
@@ -4365,9 +6404,8 @@ mod tests {
             pin_uv_auth_protocol: None,
             pin_uv_auth_param: None,
         };
-        let enum_cred_bytes = encode_cbor(&enum_cred_req).unwrap();
         let enum_cred_res = authenticator
-            .process_command(0x0A, enum_cred_bytes)
+            .process_command(0x0A, signed_cred_mgmt_request(enum_cred_req, &cm_token, 2))
             .unwrap();
         let enum_cred_resp: cred_mgmt::EnumerateCredentialsEntryResponse =
             decode_cbor(&enum_cred_res).unwrap();
@@ -4391,8 +6429,9 @@ mod tests {
             pin_uv_auth_protocol: None,
             pin_uv_auth_param: None,
         };
-        let update_bytes = encode_cbor(&update_req).unwrap();
-        let update_res = authenticator.process_command(0x0A, update_bytes).unwrap();
+        let update_res = authenticator
+            .process_command(0x0A, signed_cred_mgmt_request(update_req, &cm_token, 2))
+            .unwrap();
         assert!(update_res.is_empty());
 
         // 5. Delete credential
@@ -4406,9 +6445,125 @@ mod tests {
             pin_uv_auth_protocol: None,
             pin_uv_auth_param: None,
         };
-        let del_bytes = encode_cbor(&del_req).unwrap();
-        let del_res = authenticator.process_command(0x0A, del_bytes).unwrap();
+        let del_res = authenticator
+            .process_command(0x0A, signed_cred_mgmt_request(del_req, &cm_token, 2))
+            .unwrap();
         assert!(del_res.is_empty());
         assert_eq!(authenticator.get_storage().get_credentials_count(), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Configuração SEM a feature `rs256`: algoritmos RSA devem ser tratados
+    // como não suportados na negociação e ausentes do GetInfo (CTAP 2.1 §6.4.1
+    // — o autenticador anuncia apenas o que consegue gerar).
+    //
+    // Rodar com: cargo test -p ctap2 --no-default-features
+    // -------------------------------------------------------------------------
+
+    /// Request mínimo de MakeCredential com a lista de algoritmos dada.
+    #[cfg(all(test, not(feature = "rs256")))]
+    fn mc_request_for_algs(algs: &[i32]) -> MakeCredentialRequest {
+        MakeCredentialRequest {
+            client_data_hash: b"test".to_vec(),
+            rp: RelyingParty {
+                id: "example.com".to_string(),
+                name: None,
+                icon: None,
+            },
+            user: User {
+                id: b"user123".to_vec(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            },
+            pub_key_cred_params: algs
+                .iter()
+                .map(|alg| PublicKeyCredParams {
+                    r#type: "public-key".to_string(),
+                    algorithms: *alg,
+                })
+                .collect(),
+            exclude_list: vec![],
+            extensions: None,
+            options: MakeCredentialOptions {
+                rk: false,
+                uv: false,
+                up: true,
+                extended: false,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            enterprise_protections: None,
+        }
+    }
+
+    #[test]
+    #[cfg(all(test, not(feature = "rs256")))]
+    fn test_get_info_without_rs256_omits_rsa_algorithms() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let info = authenticator.get_info().unwrap();
+        let algs: Vec<i32> = info.algorithms.iter().map(|e| e.alg).collect();
+        assert_eq!(
+            algs,
+            vec![-7, -8, -35],
+            "sem rs256 apenas ES256, EdDSA e ES384 podem ser anunciados"
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, not(feature = "rs256")))]
+    fn test_rs256_negotiation_unsupported_without_feature() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let result = authenticator.make_credential(mc_request_for_algs(&[-257]));
+        assert_eq!(
+            *result
+                .err()
+                .expect("RS256 deve ser rejeitado sem a feature")
+                .downcast_ref::<Ctap2Error>()
+                .unwrap(),
+            Ctap2Error::UnsupportedAlgorithm
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, not(feature = "rs256")))]
+    fn test_ps256_negotiation_unsupported_without_feature() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        let result = authenticator.make_credential(mc_request_for_algs(&[-37]));
+        assert_eq!(
+            *result
+                .err()
+                .expect("PS256 deve ser rejeitado sem a feature")
+                .downcast_ref::<Ctap2Error>()
+                .unwrap(),
+            Ctap2Error::UnsupportedAlgorithm
+        );
+    }
+
+    #[test]
+    #[cfg(all(test, not(feature = "rs256")))]
+    fn test_negotiation_skips_rsa_and_falls_back_to_es256_without_feature() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        // RS256 listado primeiro deve ser pulado; ES256 é selecionado em vez
+        // de abortar com UnsupportedAlgorithm.
+        let response = authenticator
+            .make_credential(mc_request_for_algs(&[-257, -7]))
+            .expect("fallback para ES256 deve funcionar sem rs256");
+
+        let stored = authenticator.get_storage().list_credentials();
+        assert_eq!(stored[0].algorithm, -7);
+        let _ = response;
     }
 }

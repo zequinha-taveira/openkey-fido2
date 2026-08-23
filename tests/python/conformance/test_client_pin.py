@@ -156,6 +156,37 @@ def test_get_pin_token_with_permissions_protocol_2():
         assert len(token) == 32
 
 
+def test_get_pin_token_with_mc_ga_requires_rpid():
+    """Subcomando 0x09 com permissões mc|ga e sem rpId: MISSING_PARAMETER.
+
+    Sem rpId o token autorizaria MakeCredential/GetAssertion para qualquer RP;
+    o CTAP 2.1 §6.5.5.7 exige o parâmetro quando essas permissões estão
+    presentes (comportamento do dispositivo virtual do Chromium).
+    """
+    from hashlib import sha256
+
+    pin, client = make_client_pin(protocol=PinProtocolV2())
+    with client:
+        pin.set_pin("1234")
+
+        key_agreement, shared_secret = pin._get_shared_secret()
+        pin_hash_enc = pin.protocol.encrypt(shared_secret, sha256(b"1234").digest()[:16])
+        permissions = ClientPin.PERMISSION.MAKE_CREDENTIAL | ClientPin.PERMISSION.GET_ASSERTION
+        status, _ = client.send_cbor(
+            CtapCmd.CLIENT_PIN,
+            # Array posicional: [protocolo, subcomando, keyAgreement,
+            # pinHashEnc, permissions] — rpId omitido.
+            [
+                2,
+                ClientPin.CMD.GET_TOKEN_USING_PIN,
+                key_agreement,
+                pin_hash_enc,
+                permissions,
+            ],
+        )
+        assert status == CtapError.ERR.MISSING_PARAMETER
+
+
 def test_wrong_pin_errors_and_blocking():
     pin, client = make_client_pin(protocol=PinProtocolV2())
     with client:

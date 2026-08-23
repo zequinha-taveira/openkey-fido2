@@ -3,8 +3,19 @@
 version = 4
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
 name = "authenticator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "board-generic",
  "crypto",
@@ -55,8 +66,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8894febbff9f758034a5b8e12d87918f56dfc64a8e1fe757d65e29041538d93"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "board-generic"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -64,6 +84,15 @@ dependencies = [
  "log",
  "nb 1.1.0",
  "panic-halt",
+]
+
+[[package]]
+name = "cbc"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -107,6 +136,16 @@ checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
 dependencies = [
  "ciborium-io",
  "half",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
 ]
 
 [[package]]
@@ -184,8 +223,10 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "aes",
+ "cbc",
  "log",
  "num-bigint-dig",
  "rand",
@@ -207,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "ctap2"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ciborium",
  "crypto",
@@ -215,7 +256,9 @@ dependencies = [
  "ring",
  "serde",
  "serde_bytes",
+ "serde_json",
  "storage",
+ "zeroize",
 ]
 
 [[package]]
@@ -257,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "device-profile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "board-generic",
  "ctap2",
@@ -355,6 +398,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "block-padding",
+ "generic-array",
 ]
 
 [[package]]
@@ -474,7 +527,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "openkey-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "authenticator",
  "board-generic",
@@ -828,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crypto",
  "hex",
@@ -895,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "thiserror",
@@ -960,7 +1013,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "webauthn"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crypto",
  "ctap2",

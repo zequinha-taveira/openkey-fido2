@@ -101,6 +101,31 @@ impl<'a, B: UsbBus> CtapHidClass<'a, B> {
         self.out_len = 0;
         Some(m)
     }
+
+    /// Modo composto: consome o pacote OUT recebido do host, se houver.
+    ///
+    /// Espelha [`UsbHidBackend::recv_packet`] sem possuir o [`UsbDevice`] —
+    /// para quando esta classe é montada em conjunto com outras (ex.: HID +
+    /// CCID) sobre um único dispositivo USB; o polling do stack fica sob
+    /// responsabilidade do montador.
+    pub fn recv_report(&mut self, buf: &mut [u8]) -> Option<usize> {
+        self.take_data(buf)
+    }
+
+    /// Modo composto: envia um pacote IN ao host.
+    ///
+    /// Retorna `Err(BufferTooSmall)` acima de 64 bytes e `Err(SendFailed)`
+    /// quando o endpoint ainda não está pronto (`WouldBlock`) — reenviar no
+    /// próximo ciclo de polling.
+    pub fn send_report(&mut self, buf: &[u8]) -> Result<(), EmbeddedTransportError> {
+        if buf.len() > PACKET_SIZE {
+            return Err(EmbeddedTransportError::BufferTooSmall);
+        }
+        self.ep_in
+            .write(buf)
+            .map(|_| ())
+            .map_err(|_| EmbeddedTransportError::SendFailed)
+    }
 }
 
 impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {

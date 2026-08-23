@@ -2,13 +2,20 @@
 name = "webauthn"
 version = "0.1.1"
 edition = "2021"
-description = "WebAuthn implementation for FIDO2 authenticators"
+description = "WebAuthn implementation for FIDO2 authenticator"
 license = "MIT"
 
 [dependencies]
-ctap2 = { path = "../../protocol/ctap2" }
-crypto = { path = "../../protocol/crypto" }
-storage = { path = "../../firmware/storage" }
+ctap2 = { path = "../../protocol/ctap2", default-features = false }
+crypto = { path = "../../protocol/crypto", default-features = false }
+storage = { path = "../../firmware/storage", default-features = false }
 log = "0.4"
-thiserror = "2.0"
-serde = { version = "1.0", features = ["derive"] }
+thiserror = { version = "2.0", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+
+[features]
+default = ["rs256", "std"]
+rs256 = ["ctap2/rs256", "crypto/rs256"]
+# Propaga o modo host (`std`) das dependências internas; alvos bare-metal
+# compilam com `--no-default-features` (`no_std` + `alloc`).
+std = ["ctap2/std", "crypto/std", "storage/std"]

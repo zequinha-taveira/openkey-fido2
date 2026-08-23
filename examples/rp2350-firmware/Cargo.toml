@@ -14,8 +14,35 @@ publish = false
 # funcionando normalmente.
 [workspace]
 
+# Ring vendido com patch APENAS de seleção de fontes (exclui asm armv4/armv7
+# que não monta em Thumb-2/Cortex-M33; fallbacks C do próprio ring entram).
+# Nenhum código criptográfico modificado — ver vendor/ring/build.rs.
+[patch.crates-io]
+ring = { path = "vendor/ring" }
+
+# Identidade USB opcional para reconhecimento automático por ferramentas
+# da Yubico (ykman / Yubico Authenticator), que casam por VID/PID.
+#
+# ATENÇÃO: usa o VID/PID da Yubico — uso restrito a testes privados;
+# NÃO PARA DISTRIBUIÇÃO. Builds publicados devem usar a identidade
+# pid.codes padrão do projeto.
+[features]
+yubikey5-identity = []
+
 [dependencies]
+board-generic = { path = "../../firmware/board-generic" }
+# Stack do autenticador: applets Yubico (OATH/Management) para o roteador
+# CCID. Sem `rs256` (RSA exige rand/std) e sem `std` — alvo bare-metal.
+authenticator = { path = "../../firmware/authenticator", default-features = false }
+crypto = { path = "../../protocol/crypto", default-features = false }
+storage = { path = "../../firmware/storage", default-features = false }
 cortex-m = "0.7"
+# EXPERIMENTO de desbloqueio bare-metal: getrandom com feature "custom"
+# (sem defaults = sem std). A unificação de features habilita "custom"
+# TAMBÉM para a cópia usada pelo ring, contornando o compile_error do alvo.
+# O registro da implementação custom fica em src/main.rs.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+ring = { version = "0.17", default-features = false }
 cortex-m-rt = "0.7"
 panic-halt = "0.2"
 embedded-alloc = "0.7"

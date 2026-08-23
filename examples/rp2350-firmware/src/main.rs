@@ -5,8 +5,14 @@
 //! instala um heap alocador (`embedded-alloc`) e executa um loop de despacho
 //! CTAPHID sobre as primitivas de framing/assembly do crate `transport`.
 //!
-//! O periférico USB real é integrado via `usb-device` (backend
-//! [`transport::UsbHidBackend`] sobre `hal::usb::UsbBus` do RP2350).
+//! O periférico USB real é integrado via `usb-device`: um dispositivo
+//! composto (módulo [`composite`]) expõe CTAPHID em HID e o slot CCID T=0
+//! sobre `hal::usb::UsbBus` do RP2350, com a mesma identidade VID/PID.
+//!
+//! Compatibilidade: Waveshare **RP2350-Zero** usa o mesmo cristal de 12 MHz,
+//! presença via BOOTSEL e USB Type-C (porta única); o LED de status é um
+//! WS2812B em GPIO16 via PIO (pendente de driver — o binário atual referencia
+//! apenas o GPIO25 do Pico 2).
 
 #![no_std]
 #![no_main]
@@ -23,12 +29,24 @@ use embedded_hal::digital::OutputPin;
 
 use usb_device::bus::UsbBusAllocator;
 
+use board_generic::profiles::RP2350_ZERO;
+
+// Stack do autenticador: applets Yubico compartilham um único StorageEngine
+// (mesmo kv ⇒ mesma identidade) e um CryptoEngine com a MESMA chave-mestra.
+use authenticator::{register_yubico_applets, ManagementApplet, OathApplet};
+use crypto::CryptoEngine;
+use storage::StorageEngine;
+use transport::iso7816::CardRouter;
+
 use transport::ctaphid::{
     ctaphid_capabilities, ChannelManager, CtaphidAssembler, CtaphidCommand, CtaphidErrorCode,
     CtaphidFragmenter, CtaphidMessage, CTAPHID_PACKET_SIZE,
 };
-use transport::embedded::UsbHidBackend;
-use transport::embedded::UsbHidDevice;
+use transport::embedded::usb_ccid_backend::MAX_PAYLOAD_LEN;
+
+mod composite;
+
+use composite::CompositeUsbDevice;
 
 /// Tamanho do heap em bytes (para `Vec` e estruturas alocadas do CTAPHID).
 const HEAP_SIZE: usize = 8192;
@@ -41,18 +59,125 @@ const FW_MAJOR: u8 = 0;
 const FW_MINOR: u8 = 1;
 const FW_BUILD: u8 = 0;
 
-/// VID/PID USB do dispositivo (placeholder — substituir pelo VID oficial).
-const USB_VID: u16 = 0x1209; // pid.codes (VID temporário)
+/// Identidade USB do dispositivo.
+///
+/// Padrão: pid.codes do openkey-fido2 (0x1209:0x0001) — identidade própria
+/// do projeto, usada em todos os builds publicados.
+///
+/// Build opt-in `--features yubikey5-identity`: reivindica a identidade
+/// YubiKey 5 da Yubico (0x1050:0x0407), que faz ykman e Yubico Authenticator
+/// reconhecerem o dispositivo automaticamente (casamento por VID/PID).
+///
+/// **NÃO PARA DISTRIBUIÇÃO:** VID/PID de terceiro é válido apenas para
+/// testes privados; builds distribuídos devem manter a identidade padrão.
+#[cfg(not(feature = "yubikey5-identity"))]
+const USB_VID: u16 = 0x1209; // pid.codes — openkey-fido2
+#[cfg(not(feature = "yubikey5-identity"))]
 const USB_PID: u16 = 0x0001;
+
+#[cfg(feature = "yubikey5-identity")]
+const USB_VID: u16 = 0x1050; // Yubico — NÃO PARA DISTRIBUIÇÃO
+#[cfg(feature = "yubikey5-identity")]
+const USB_PID: u16 = 0x0407; // YubiKey 5 (OTP+FIDO+CCID) — NÃO PARA DISTRIBUIÇÃO
 
 /// Alocador global de heap (linked-list first-fit via `embedded-alloc`).
 #[global_allocator]
 static ALLOCATOR: LlffHeap = LlffHeap::empty();
 
+// === Entropia bare-metal para o getrandom "custom" ===
+//
+// O ring 0.17 depende de getrandom incondicionalmente, e o getrandom 0.2
+// emite compile_error para alvos bare-metal. Com a feature "custom"
+// habilitada (Cargo.toml), TODAS as chamadas — inclusive as do ring via
+// SystemRandom — caem na função registrada abaixo.
+//
+// Semente: BootRandom de 128 bits gerado pelo ROM do RP2350 na inicialização
+// (fonte TRNG), misturado com jitter do contador de ciclos. Saída: splitmix64.
+//
+// **ATENÇÃO (dev-only):** um PRNG semeado uma vez por boot NÃO substitui um
+// stream TRNG contínuo — nonces ECDSA dependem disto. Produção exige wiring
+// direto do periférico TRNG via PAC (registrado no TODO como follow-up).
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Estado do PRNG (splitmix64, 64 bits em dois atomics de 32 — o alvo não
+/// tem AtomicU64). 0 = ainda não semeado.
+static RNG_STATE_LO: AtomicU32 = AtomicU32::new(0);
+static RNG_STATE_HI: AtomicU32 = AtomicU32::new(0);
+
+fn rng_state_load() -> u64 {
+    let lo = RNG_STATE_LO.load(Ordering::Relaxed) as u64;
+    let hi = RNG_STATE_HI.load(Ordering::Relaxed) as u64;
+    (hi << 32) | lo
+}
+
+fn rng_state_store(v: u64) {
+    RNG_STATE_LO.store(v as u32, Ordering::Relaxed);
+    RNG_STATE_HI.store((v >> 32) as u32, Ordering::Relaxed);
+}
+
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Semeia o PRNG com BootRandom do ROM (TRNG por boot) + jitter de ciclos.
+/// Chamar cedo no boot. Falha do ROM → semente só de jitter (degradado).
+/// Retorna true se a semente veio do TRNG.
+fn entropy_seed() -> bool {
+    // BootRandom: 128 bits do TRNG gerados pelo ROM na inicialização.
+    let boot = hal::rom_data::sys_info_api::boot_random()
+        .ok()
+        .flatten()
+        .map(|r| r.0);
+    let mut seed = match boot {
+        Some(b) => (b as u64) ^ ((b >> 64) as u64),
+        None => 0,
+    };
+    // Jitter adicional: contadores que variam entre boots/tempo real.
+    let cycles = cortex_m::peripheral::DWT::cycle_count() as u64;
+    seed ^= splitmix64(&mut (cycles | 1));
+    rng_state_store(seed | 1);
+    boot.is_some()
+}
+
+/// Implementação custom exigida pela feature "custom" do getrandom 0.2.
+fn entropy_fill(buf: &mut [u8]) -> Result<(), getrandom::Error> {
+    let mut state = rng_state_load();
+    if state == 0 {
+        return Err(getrandom::Error::UNSUPPORTED);
+    }
+    for chunk in buf.chunks_mut(8) {
+        let word = splitmix64(&mut state);
+        chunk.copy_from_slice(&word.to_le_bytes()[..chunk.len()]);
+    }
+    rng_state_store(state);
+    Ok(())
+}
+
+getrandom::register_custom_getrandom!(entropy_fill);
+
+/// Prova de uso do ring no alvo: SystemRandom deve compilar e consumir a
+/// implementação custom acima (exercitado no boot; falha = pânico visível).
+fn ring_smoke() -> bool {
+    use ring::rand::SecureRandom;
+    let rng = ring::rand::SystemRandom::new();
+    let mut out = [0u8; 16];
+    rng.fill(&mut out).is_ok()
+}
+
 /// Bloco de início exigido pela Boot ROM do RP2350.
 #[link_section = ".start_block"]
 #[used]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
+
+// Este binário é direcionado à Waveshare RP2350-Zero (perfil `RP2350_ZERO`):
+// o pino de status abaixo DEVE ser o registrado no perfil (WS2812B em GPIO16).
+// Se o perfil mudar, esta asserção de compilação falha e força a revisão.
+const _: () = assert!(RP2350_ZERO.led_pin == 16);
 
 /// Metadados para `picotool info`.
 #[link_section = ".bi_entries"]
@@ -72,6 +197,23 @@ fn main() -> ! {
     unsafe {
         embedded_alloc::init!(ALLOCATOR, HEAP_SIZE);
     }
+
+    // 1b. Semeia a entropia bare-metal (antes de qualquer uso do ring).
+    entropy_seed();
+    let _ring_ok = ring_smoke();
+
+    // 1c. Applets Yubico (ISO 7816-4) sobre um único storage compartilhado:
+    //     serial do Management e estado OATH vivem no mesmo kv, então a
+    //     identidade é única e, ao plugar um backend de flash no lugar de
+    //     `StorageEngine::new()`, ambos persistem juntos. A chave-mestra é
+    //     gerada via SystemRandom — que já consome o getrandom custom
+    //     semeado em 1b. Falhas aqui são fatais: sem applets não há CCID.
+    let storage = core::cell::RefCell::new(StorageEngine::new().expect("storage engine"));
+    let crypto = CryptoEngine::new().expect("crypto engine");
+    let mut oath = OathApplet::new(&storage, crypto.clone()).expect("applet OATH");
+    let mut management = ManagementApplet::new(&storage, crypto).expect("applet Management");
+    let mut router = CardRouter::new();
+    register_yubico_applets(&mut router, &mut management, &mut oath);
 
     // 2. Periféricos singleton.
     let mut pac = hal::pac::Peripherals::take().unwrap();
@@ -94,7 +236,9 @@ fn main() -> ! {
     // 5. Timer (usado no WINK/keepalive).
     let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
 
-    // 6. GPIO: LED de status (GPIO25 no Pico 2).
+    // 6. GPIO: LED de status. Na RP2350-Zero o pino 16 alimenta a WS2812B —
+    //    o protocolo WS2812 (PIO) ainda não está implementado; o toggle
+    //    simples abaixo é um placeholder do sinal de status no pino correto.
     let sio = hal::Sio::new(pac.SIO);
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
@@ -102,9 +246,11 @@ fn main() -> ! {
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
-    let mut led = pins.gpio25.into_push_pull_output();
+    let mut led = pins.gpio16.into_push_pull_output();
 
-    // 7. Transporte USB-HID real (usb-device sobre o periférico USB do RP2350).
+    // 7. Dispositivo USB composto real (usb-device sobre o periférico USB do
+    //    RP2350): interface 0 = CTAPHID (HID), interface 1 = CCID (T=0) —
+    //    mesma identidade VID/PID para ambas, como num YubiKey composto.
     let usb_bus = UsbBusAllocator::new(hal::usb::UsbBus::new(
         pac.USB,
         pac.USB_DPRAM,
@@ -112,24 +258,41 @@ fn main() -> ! {
         true,
         &mut pac.RESETS,
     ));
-    let mut hid = UsbHidBackend::new(&usb_bus, USB_VID, USB_PID);
-    hid.init().ok();
+    let mut device = CompositeUsbDevice::new(&usb_bus, USB_VID, USB_PID);
 
     // 8. Estado do protocolo CTAPHID.
     let mut channels = ChannelManager::new();
     let mut assembler = CtaphidAssembler::new();
 
-    // 9. Loop de despacho CTAPHID.
+    // 9. Loop de despacho CTAPHID + CCID (não bloqueante).
     loop {
+        // Um único ciclo de polling alimenta as duas classes do dispositivo.
+        device.poll();
+
+        // CCID: APDUs brutos vão para o roteador ISO 7816-4. O SELECT pelo
+        // AID escolhe o applet (A000000527471117 ⇒ Management; A0000005272101
+        // ⇒ OATH) e os demais comandos são despachados ao applet selecionado.
+        // Respostas saem como `DATA || SW` no XfrBlock. O caminho CTAPHID
+        // abaixo permanece intocado.
+        if device.ccid.is_pending() {
+            let mut apdu_scratch = [0u8; MAX_PAYLOAD_LEN];
+            if let Some(len) = device.ccid.take_pending_request(&mut apdu_scratch) {
+                let response = router.process(&apdu_scratch[..len]);
+                let _ = device.ccid.send_response(&response.to_bytes());
+            }
+        }
+
+        // CTAPHID: consome o pacote recebido, se houver.
         let mut buf = [0u8; CTAPHID_PACKET_SIZE];
-        match hid.recv_packet(&mut buf) {
-            Ok(_) => match assembler.process_packet(&buf) {
+        match device.hid.recv_report(&mut buf) {
+            Some(_) => match assembler.process_packet(&buf) {
                 Ok(Some(msg)) => {
                     let cmd = msg.cmd;
                     let (cid, resp_cmd, payload) = dispatch(&mut channels, msg);
 
                     if cmd == CtaphidCommand::Wink {
-                        // Sinal visual de presença (LED GPIO25).
+                        // Sinal visual de presença (WS2812B em GPIO16 na
+                        // RP2350-Zero — placeholder até o driver PIO).
                         let _ = led.set_low();
                         timer.delay_ms(40);
                         let _ = led.set_high();
@@ -137,7 +300,7 @@ fn main() -> ! {
 
                     if let Ok(packets) = CtaphidFragmenter::fragment(cid, resp_cmd, &payload) {
                         for packet in packets {
-                            let _ = hid.send_packet(&packet);
+                            let _ = device.hid.send_report(&packet);
                         }
                     }
                 }
@@ -150,13 +313,14 @@ fn main() -> ! {
                         CtaphidFragmenter::fragment(cid, CtaphidCommand::Error, &payload)
                     {
                         for packet in packets {
-                            let _ = hid.send_packet(&packet);
+                            let _ = device.hid.send_report(&packet);
                         }
                     }
                 }
             },
-            Err(_) => {
-                // Sem pacote no endpoint (placeholder/timeout) — continua o polling.
+            None => {
+                // Sem pacote no endpoint (placeholder/timeout) — continua o
+                // polling.
             }
         }
     }

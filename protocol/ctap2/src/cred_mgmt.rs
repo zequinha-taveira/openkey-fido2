@@ -1,5 +1,8 @@
 //! Estruturas de requisição e resposta do comando Credential Management (CTAP 2.1 §6.8, Opcode 0x0A).
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 /// Subcomandos do Credential Management (CTAP 2.1 §6.8).

@@ -6,7 +6,8 @@
 //! HAL pin assignments. Profiles can be passed directly to
 //! `DeviceProfileBuilder::from_board` or `EmbeddedAuthenticator::new_with_board`.
 //!
-//! Available profiles: `NRF52840`, `STM32L4`, `ESP32C3`, `RP2350` and `GENERIC`.
+//! Available profiles: `NRF52840`, `STM32L4`, `ESP32C3`, `RP2350`,
+//! `RP2350_ZERO` and `GENERIC`.
 
 use crate::board_generic::{BoardDefinition, SecurityFeatures, UserPresenceSource};
 
@@ -174,6 +175,49 @@ pub struct Rp2350Pins {
     pub button: u8,
 }
 
+/// Waveshare RP2350-Zero — perfil do board comercial.
+///
+/// Diferenças em relação ao [`RP2350`] genérico (dev board):
+/// - WS2812B no GPIO16 (via PIO, não GPIO comum);
+/// - sem botão de usuário GPIO (BOOT entra em modo download; RUN só reseta);
+/// - cristal de 12 MHz igual ao Pico 2;
+/// - USB Type-C, porta única USB 1.1 device;
+/// - sem sensor biométrico — UV permanece via PIN/pinUvAuthToken
+///   (`GetInfo` continua omitindo a opção `uv`).
+pub const RP2350_ZERO: BoardDefinition = BoardDefinition::new(
+    "rp2350-zero",
+    [
+        0x52, 0x50, 0x32, 0x33, 0x35, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x06,
+    ],
+)
+.usb_hid()
+// CCID mantido por paridade com o perfil RP2350 (mesma porta única USB,
+// interface dual consistente com a descoberta de capacidades do RP2350).
+.usb_ccid()
+.secure_storage(true)
+.crypto_accelerator(true)
+.security_features(SecurityFeatures::rp2350())
+// User presence reaproveita o BOOTSEL (linha CS da flash QSPI), como no RP2350.
+.presence_source(UserPresenceSource::Bootsel)
+// Pinos espelhados nos defaults do RP2350 (GP4/GP5 I2C0, GP6-GP9 SPI) — todos
+// livres no header de borda do RP2350-Zero (GP0-GP22, GP26-GP29) e sem colisão
+// com o GPIO16 do LED.
+.i2c_sda(4)
+.i2c_scl(5)
+.spi_mosi(6)
+.spi_miso(7)
+.spi_clk(8)
+.cs(9)
+.reset(10)
+.irq(11)
+// WS2812B em GPIO16 via PIO (driver PIO pendente — pino registrado para referência).
+.led(16)
+// Sem botão GPIO dedicado: BOOT é a linha CS da flash QSPI (modo download) e
+// RUN só reseta. Sentinela `u8::MAX` marca "não conectado" (fora da faixa de
+// GPIOs do bank0); a presença vem de `UserPresenceSource::Bootsel`.
+.button(u8::MAX);
+
 /// Generic board profile with USB-CCID transport only.
 pub const GENERIC: BoardDefinition = BoardDefinition::new(
     "generic-fido",
@@ -201,6 +245,33 @@ mod tests {
     #[test]
     fn test_rp2350_uses_bootsel_for_presence() {
         assert_eq!(RP2350.presence_source, UserPresenceSource::Bootsel);
+    }
+
+    #[test]
+    fn test_rp2350_zero_uses_bootsel_for_presence() {
+        assert_eq!(RP2350_ZERO.presence_source, UserPresenceSource::Bootsel);
+    }
+
+    #[test]
+    fn test_rp2350_zero_identity_is_unique() {
+        assert_eq!(RP2350_ZERO.name, "rp2350-zero");
+        // Mesmo prefixo ASCII "RP2350" da família, sufixo sequencial próprio.
+        assert_eq!(RP2350_ZERO.aaguid[..6], RP2350.aaguid[..6]);
+        assert_eq!(RP2350_ZERO.aaguid[15], 0x06);
+        for other in [
+            NRF52840.aaguid,
+            STM32L4.aaguid,
+            ESP32C3.aaguid,
+            RP2350.aaguid,
+        ] {
+            assert_ne!(RP2350_ZERO.aaguid, other);
+        }
+        assert_ne!(RP2350_ZERO.name, RP2350.name);
+    }
+
+    #[test]
+    fn test_rp2350_zero_led_is_ws2812_gpio16() {
+        assert_eq!(RP2350_ZERO.led_pin, 16);
     }
 
     #[test]

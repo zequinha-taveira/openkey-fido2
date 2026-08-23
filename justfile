@@ -30,6 +30,16 @@ test-conformance: build-simulator
 test-python:
     python -m pytest tests/python -v
 
+# Fluxo real de diagnostico: executa o catalogo de falhas, captura excecoes,
+# atribui a camada responsavel e aponta o escopo da correcao
+diagnose: build-simulator
+    cd tests/python && python -m diagnostics.runner
+
+# Travrar o comportamento atual no fio como novo golden master
+# (apenas apos mudanca intencional, junto com a correcao revisada)
+diagnose-lock:
+    cd tests/python && python -m diagnostics.runner --lock
+
 # Verificar formatacao
 fmt-check:
     cargo fmt --all -- --check

@@ -421,6 +421,9 @@ fn test_storage_credential_persistence() {
         large_blob_key: None,
         user_name: None,
         user_display_name: None,
+        cred_protect: None,
+        cred_random_with_uv: None,
+        cred_random_without_uv: None,
     };
 
     storage
@@ -764,6 +767,20 @@ fn test_board_profiles_derive_correct_product_name_and_transports() {
     assert!(rp2350.security.hardware_rng);
     assert!(rp2350.security.otp_memory);
 
+    let rp2350_zero = DeviceProfileBuilder::from_board(&RP2350_ZERO).build();
+    assert_eq!(rp2350_zero.product_name, "rp2350-zero");
+    assert_eq!(rp2350_zero.aaguid, RP2350_ZERO.aaguid);
+    assert!(rp2350_zero.storage_encrypted);
+    assert!(rp2350_zero.crypto_accelerator);
+    assert!(rp2350_zero.transports.contains(&Transport::UsbHid));
+    assert!(rp2350_zero.transports.contains(&Transport::UsbCcid));
+    assert!(!rp2350_zero.transports.contains(&Transport::Nfc));
+    // Mesmos recursos de segurança do SoC RP2350A (TrustZone, TRNG, OTP).
+    assert!(rp2350_zero.security.secure_boot);
+    assert!(rp2350_zero.security.trust_zone);
+    assert!(rp2350_zero.security.hardware_rng);
+    assert!(rp2350_zero.security.otp_memory);
+
     let generic = DeviceProfileBuilder::from_board(&GENERIC).build();
     assert_eq!(generic.product_name, "generic-fido");
     assert!(!generic.storage_encrypted);
@@ -789,6 +806,16 @@ fn test_embedded_authenticator_with_nrf52840_profile() {
 }
 
 #[test]
+fn test_embedded_authenticator_with_rp2350_zero_profile() {
+    use authenticator::EmbeddedAuthenticator;
+    use board_generic::profiles::RP2350_ZERO;
+
+    let authenticator = EmbeddedAuthenticator::new_with_board(&RP2350_ZERO).unwrap();
+    let info = authenticator.get_info().unwrap();
+    assert_eq!(info.aaguid, RP2350_ZERO.aaguid.to_vec());
+}
+
+#[test]
 fn test_board_profiles_have_unique_aaguids() {
     use board_generic::profiles::*;
 
@@ -797,6 +824,7 @@ fn test_board_profiles_have_unique_aaguids() {
         STM32L4.aaguid,
         ESP32C3.aaguid,
         RP2350.aaguid,
+        RP2350_ZERO.aaguid,
         GENERIC.aaguid,
     ];
     for i in 0..aaguids.len() {
@@ -827,6 +855,9 @@ fn test_storage_private_key_not_stored_in_plaintext() {
         large_blob_key: None,
         user_name: None,
         user_display_name: None,
+        cred_protect: None,
+        cred_random_with_uv: None,
+        cred_random_without_uv: None,
     };
 
     storage
@@ -1056,6 +1087,9 @@ fn test_credential_pruning() {
             large_blob_key: None,
             user_name: None,
             user_display_name: None,
+            cred_protect: None,
+            cred_random_with_uv: None,
+            cred_random_without_uv: None,
         };
         storage.store_credential(credential, &crypto).unwrap();
     }

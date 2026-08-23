@@ -67,15 +67,19 @@ inferiores, nunca o contrário.
 - **Entrada**: `Credential` (plaintext), chave
 - **Saída**: `StoredCredential` (chave cifrada)
 - **Contrato**: encryption at rest via ChaCha20-Poly1305. `StorageBackend`
-  é injetável (file vs flash). Wear leveling protege flash.
+  é injetável (file vs flash). Wear leveling protege flash. Estado
+  persistido inclui credenciais, signCount, PIN e large blobs; Reset
+  apaga o backend.
 
 ### `transport` → Comunicação
 
 - **Entrada**: frames do host
 - **Saída**: frames de resposta
 - **Contrato**: trait `Transport` é object-safe (`Box<dyn Transport>`).
-  Cada transporte implementa `init/send/recv/close`. Stubs retornam
-  `Unimplemented`; implementações reais usam `embedded-hal`.
+  Cada transporte implementa `init/send/recv/close`. Adaptadores
+  (`FramedUsbHidTransport`, `FramedCcidTransport`) conectam dispositivos
+  `embedded-hal` à trait; `CtapHidClass`/`UsbHidBackend` implementam USB-HID
+  sobre `usb-device`; NFC e BLE permanecem stubs que retornam `Unimplemented`.
 
 ### `board-generic` → HAL
 

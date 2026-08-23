@@ -2,6 +2,12 @@
 //!
 //! Encapsula `ring` (ADR-0001) atrás de uma API estável, de forma que trocar o
 //! provedor criptográfico não exija mudanças nas camadas CTAP2/storage.
+//!
+//! Compila tanto em host (`std`, padrão) quanto em alvos bare-metal
+//! (`no_std` + `alloc`) via a feature `std`; o alvo embarcado usa
+//! `--no-default-features`.
+
+#![cfg_attr(not(feature = "std"), no_std)]
 
 /// Motor criptográfico principal (Ed25519, P-256, RSA, HMAC, ChaCha20-Poly1305).
 pub mod crypto;

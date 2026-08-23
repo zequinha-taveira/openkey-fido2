@@ -12,5 +12,12 @@ rustflags = [
     "-C", "link-arg=-Tlink.x",
     "-C", "target-cpu=cortex-m33",
 ]
+runner = "probe-rs run --chip RP235x"
 
-runner = "probe-rs run --chip RP2350"
+# Toolchain C exigida pelo build.rs do ring (fontes/asm em C).
+# cc respeita <TARGET>_CC / <TARGET>_AR com o target em snake_case.
+# (seção [env] plana: cargo estável não aplica [env] condicional a target)
+[env]
+CC_thumbv8m_main_none_eabihf = "C:/Program Files/Raspberry Pi/Pico SDK v1.5.1/gcc-arm-none-eabi/bin/arm-none-eabi-gcc.exe"
+AR_thumbv8m_main_none_eabihf = "C:/Program Files/Raspberry Pi/Pico SDK v1.5.1/gcc-arm-none-eabi/bin/arm-none-eabi-ar.exe"
+CXX_thumbv8m_main_none_eabihf = "C:/Program Files/Raspberry Pi/Pico SDK v1.5.1/gcc-arm-none-eabi/bin/arm-none-eabi-g++.exe"

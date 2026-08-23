@@ -1,4 +1,5 @@
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 use ciborium::value::Integer;
 use ciborium::Value;
@@ -97,7 +98,7 @@ impl<'a> PackedAttestation<'a> {
                 }
             }
         }
-        .map_err(|_| Ctap2Error::InvalidData)?;
+        .map_err(|_| Ctap2Error::Unknown)?;
 
         let mut att_stmt: BTreeMap<i64, Value> = BTreeMap::new();
         att_stmt.insert(3, Value::Integer(Integer::from(self.algorithm)));
@@ -133,7 +134,7 @@ impl SelfAttestation {
         } else {
             crypto.sign(data_to_sign, credential_key)
         }
-        .map_err(|_| Ctap2Error::InvalidData)?;
+        .map_err(|_| Ctap2Error::Unknown)?;
 
         let mut att_stmt: BTreeMap<i64, Value> = BTreeMap::new();
         att_stmt.insert(3, Value::Integer(Integer::from(algorithm)));

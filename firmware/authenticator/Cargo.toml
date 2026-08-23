@@ -9,13 +9,29 @@ authors = ["openkey-fido2 contributors"]
 build = "build.rs"
 
 [dependencies]
-ctap2 = { path = "../../protocol/ctap2" }
-webauthn = { path = "../../protocol/webauthn" }
-crypto = { path = "../../protocol/crypto" }
-storage = { path = "../../firmware/storage" }
+ctap2 = { path = "../../protocol/ctap2", default-features = false }
+webauthn = { path = "../../protocol/webauthn", default-features = false }
+crypto = { path = "../../protocol/crypto", default-features = false }
+storage = { path = "../../firmware/storage", default-features = false }
 board-generic = { path = "../../firmware/board-generic" }
-device-profile = { path = "../../firmware/device-profile" }
-transport = { path = "../../firmware/transport" }
+device-profile = { path = "../../firmware/device-profile", default-features = false }
+transport = { path = "../../firmware/transport", default-features = false }
 log = "0.4"
-thiserror = "2.0"
 ring = "0.17"
+zeroize = { workspace = true }
+
+[features]
+default = ["rs256", "std"]
+# Propaga o suporte a RS256 (-257)/PS256 (-37) até a crate `crypto`.
+rs256 = ["ctap2/rs256", "webauthn/rs256", "crypto/rs256", "device-profile/rs256"]
+# Modo host (`std`): habilita o backend de arquivos e os construtores de
+# storage inseguro para simulador/testes. Alvos bare-metal (RP2350) compilam
+# com `--no-default-features`, usando apenas `StorageEngine::new()` em RAM.
+std = [
+    "ctap2/std",
+    "webauthn/std",
+    "crypto/std",
+    "storage/std",
+    "device-profile/std",
+    "transport/std",
+]

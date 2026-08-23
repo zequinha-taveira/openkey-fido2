@@ -21,3 +21,9 @@ check-stm32l4 = "check -p transport --target thumbv7em-none-eabihf --features em
 build-rp2350 = "build -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features"
 build-nrf52840 = "build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features"
 build-stm32l4 = "build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features"
+
+# Toolchain C do ring para checks cross (mesma config do crate standalone).
+[env]
+CC_thumbv8m_main_none_eabihf = "C:/Program Files/Raspberry Pi/Pico SDK v1.5.1/gcc-arm-none-eabi/bin/arm-none-eabi-gcc.exe"
+AR_thumbv8m_main_none_eabihf = "C:/Program Files/Raspberry Pi/Pico SDK v1.5.1/gcc-arm-none-eabi/bin/arm-none-eabi-ar.exe"
+CXX_thumbv8m_main_none_eabihf = "C:/Program Files/Raspberry Pi/Pico SDK v1.5.1/gcc-arm-none-eabi/bin/arm-none-eabi-g++.exe"

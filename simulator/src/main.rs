@@ -2,14 +2,14 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process;
 
-use authenticator::EmbeddedAuthenticator;
+use authenticator::{EmbeddedAuthenticator, InsecureHostStorage};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ciborium::Value as CborValue;
 use ctap2::{
     AttestationCertificate, AttestationFormat, CredentialDescriptor, Ctap2Error, Extensions,
-    GetAssertionOptions, GetAssertionRequest, HmacSecretInput, MakeCredentialOptions,
-    MakeCredentialRequest, PublicKeyCredParams, RelyingParty, User,
+    GetAssertionOptions, GetAssertionRequest, MakeCredentialOptions, MakeCredentialRequest,
+    PublicKeyCredParams, RelyingParty, User,
 };
 use device_profile::{DeviceProfile, DeviceProfileBuilder, PinPolicy};
 use serde_json::{json, Value};
@@ -55,7 +55,8 @@ fn error_value(error: Box<dyn std::error::Error>) -> Value {
     if let Some(code) = error.downcast_ref::<Ctap2Error>() {
         json!({"ok": false, "code": code.as_u8(), "message": error.to_string()})
     } else {
-        json!({"ok": false, "code": 0x05, "message": error.to_string()})
+        // 0x7F (unspecified failure): 0x05 seria lido como TIMEOUT por hosts.
+        json!({"ok": false, "code": Ctap2Error::Unknown.as_u8(), "message": error.to_string()})
     }
 }
 
@@ -91,7 +92,7 @@ fn build_extensions(ext_val: Option<&Value>) -> Option<Extensions> {
     let cred_protect = ext_val
         .get("credProtect")
         .and_then(Value::as_u64)
-        .map(|v| ctap2::CredProtectPolicy::from(v as u8));
+        .map(|v| u8::try_from(v).unwrap_or(1));
     let cred_blob = ext_val
         .get("credBlob")
         .map(b64_decode)
@@ -100,12 +101,54 @@ fn build_extensions(ext_val: Option<&Value>) -> Option<Extensions> {
         .get("minPinLength")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let hmac_secret = ext_val.get("hmacSecret").map(|v| HmacSecretInput {
-        salt_enc: b64_decode(v.get("saltEnc").unwrap_or(&Value::Null)),
-        pin_uv_auth_protocol: v
-            .get("pinUvAuthProtocol")
-            .and_then(Value::as_u64)
-            .map(|p| p as u8),
+    // `hmac-secret` (CTAP 2.1 §12.5): booleano no MakeCredential ou mapa
+    // `{1: keyAgreement, 2: saltEnc, 3: saltAuth, 4: pinUvAuthProtocol}` no
+    // GetAssertion. O mapa JSON é convertido para as chaves inteiras da spec.
+    let hmac_secret = ext_val.get("hmacSecret").map(|v| {
+        if v.is_boolean() {
+            CborValue::Bool(v.as_bool().unwrap())
+        } else {
+            let key_agreement = v.get("keyAgreement").map(|key| {
+                let x = b64_decode(key.get("x").unwrap_or(&Value::Null));
+                let y = b64_decode(key.get("y").unwrap_or(&Value::Null));
+                CborValue::Map(vec![
+                    (CborValue::Integer(1.into()), CborValue::Integer(2.into())),
+                    (
+                        CborValue::Integer(3.into()),
+                        CborValue::Integer((-25).into()),
+                    ),
+                    (
+                        CborValue::Integer((-1).into()),
+                        CborValue::Integer(1.into()),
+                    ),
+                    (CborValue::Integer((-2).into()), CborValue::Bytes(x)),
+                    (CborValue::Integer((-3).into()), CborValue::Bytes(y)),
+                ])
+            });
+            let mut entries = Vec::with_capacity(4);
+            if let Some(key) = key_agreement {
+                entries.push((CborValue::Integer(1.into()), key));
+            }
+            if let Some(salt) = v.get("saltEnc") {
+                entries.push((
+                    CborValue::Integer(2.into()),
+                    CborValue::Bytes(b64_decode(salt)),
+                ));
+            }
+            if let Some(auth) = v.get("saltAuth") {
+                entries.push((
+                    CborValue::Integer(3.into()),
+                    CborValue::Bytes(b64_decode(auth)),
+                ));
+            }
+            if let Some(protocol) = v.get("pinUvAuthProtocol").and_then(Value::as_u64) {
+                entries.push((
+                    CborValue::Integer(4.into()),
+                    CborValue::Integer((protocol as i64).into()),
+                ));
+            }
+            CborValue::Map(entries)
+        }
     });
 
     Some(Extensions {
@@ -127,14 +170,20 @@ impl Simulator {
 
     fn with_storage_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            auth: EmbeddedAuthenticator::new_with_storage_path(path.clone(), simulator_profile())?,
+            auth: EmbeddedAuthenticator::new_with_insecure_host_storage(
+                InsecureHostStorage::new(path.clone()),
+                simulator_profile(),
+            )?,
             storage_path: Some(path),
         })
     }
 
     fn reset(&mut self) -> Value {
         let result = if let Some(path) = &self.storage_path {
-            EmbeddedAuthenticator::new_with_storage_path(path.clone(), simulator_profile())
+            EmbeddedAuthenticator::new_with_insecure_host_storage(
+                InsecureHostStorage::new(path.clone()),
+                simulator_profile(),
+            )
         } else {
             EmbeddedAuthenticator::new_with_profile(simulator_profile())
         };
@@ -292,8 +341,15 @@ impl Simulator {
                     if let Some(policy) = ext.cred_protect {
                         ext_obj.insert("credProtect".to_string(), json!(policy));
                     }
-                    if let Some(secret) = ext.hmac_secret {
-                        ext_obj.insert("hmac-secret".to_string(), json!(b64_encode(&secret)));
+                    // §12.5: `true` no MakeCredential; bytes cifrados no GetAssertion.
+                    match ext.hmac_secret {
+                        Some(CborValue::Bool(enabled)) => {
+                            ext_obj.insert("hmac-secret".to_string(), json!(enabled));
+                        }
+                        Some(CborValue::Bytes(secret)) => {
+                            ext_obj.insert("hmac-secret".to_string(), json!(b64_encode(&secret)));
+                        }
+                        _ => {}
                     }
                     if let Some(obj) = result.as_object_mut() {
                         for (k, v) in ext_obj {
@@ -339,11 +395,19 @@ impl Simulator {
 
         let request = GetAssertionRequest {
             rp_id,
-            credentials: vec![CredentialDescriptor {
-                r#type: "public-key".to_string(),
-                id: credential_id,
-                transports: None,
-            }],
+            // Campo wire `allowList`: só nomeia uma credencial quando o
+            // chamador fornece um ID; com ID vazio a descoberta é por RP
+            // (um descritor vazio aqui esconderia todas as credenciais na
+            // contagem de multi-assertion).
+            credentials: if credential_id.is_empty() {
+                Vec::new()
+            } else {
+                vec![CredentialDescriptor {
+                    r#type: "public-key".to_string(),
+                    id: credential_id,
+                    transports: None,
+                }]
+            },
             allow_list: if allow_list.is_empty() {
                 None
             } else {
@@ -387,7 +451,8 @@ impl Simulator {
                     if let Some(policy) = ext.cred_protect {
                         ext_obj.insert("credProtect".to_string(), json!(policy));
                     }
-                    if let Some(secret) = ext.hmac_secret {
+                    // §12.5: bytes cifrados sob o segredo compartilhado.
+                    if let Some(CborValue::Bytes(secret)) = ext.hmac_secret {
                         ext_obj.insert("hmac-secret".to_string(), json!(b64_encode(&secret)));
                     }
                     if let Some(obj) = result.as_object_mut() {
@@ -487,7 +552,7 @@ impl Simulator {
         match sub_command {
             ClientPinSubCommand::GetPINRetries => {
                 let retries = ctap.get_pin_retries();
-                let blocked = client_pin::is_pin_blocked(ctap.get_storage());
+                let blocked = client_pin::is_pin_blocked(ctap);
                 json!({"ok": true, "retries": retries, "power_cycle_state": blocked})
             }
             ClientPinSubCommand::SetPIN => match ctap.set_pin(&pin) {
@@ -560,7 +625,9 @@ impl Simulator {
                     "rp_hash": b64_encode(&rps.rp_hash),
                     "total_rps": rps.total_rps,
                 }),
-                Err(error) => json!({"ok": false, "code": 0x04, "message": error.to_string()}),
+                Err(error) => {
+                    json!({"ok": false, "code": Ctap2Error::InvalidCbor.as_u8(), "message": error.to_string()})
+                }
             },
             Err(error) => json!({"ok": false, "code": error.as_u8(), "message": error.to_string()}),
         }
@@ -580,7 +647,9 @@ impl Simulator {
                     "rp_hash": b64_encode(&rps.rp_hash),
                     "total_rps": rps.total_rps,
                 }),
-                Err(error) => json!({"ok": false, "code": 0x04, "message": error.to_string()}),
+                Err(error) => {
+                    json!({"ok": false, "code": Ctap2Error::InvalidCbor.as_u8(), "message": error.to_string()})
+                }
             },
             Err(error) => json!({"ok": false, "code": error.as_u8(), "message": error.to_string()}),
         }

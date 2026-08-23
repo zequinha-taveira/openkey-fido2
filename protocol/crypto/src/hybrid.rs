@@ -8,6 +8,8 @@
 //! chaves estáticas persistíveis (`[u8; 32]` via `x25519_dalek`), permitindo
 //! decifrar dados armazenados em flash mesmo após reinicializações.
 
+use alloc::boxed::Box;
+use alloc::format;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{compiler_fence, Ordering};
@@ -34,7 +36,7 @@ pub const ECIES_OVERHEAD: usize = X25519_KEY_LEN + NONCE_LEN + TAG_LEN;
 /// Rótulo de domínio do KDF. Alterá-lo quebra compatibilidade.
 const HKDF_INFO: &[u8] = b"openkey-ecies-v1";
 
-type Error = Box<dyn std::error::Error>;
+type Error = Box<dyn core::error::Error>;
 
 /// Wrapper que zera o material sensível ao ser dropado.
 struct Zeroizing<T: AsMut<[u8]>>(T);
@@ -637,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_hybrid_static_decrypt_wrong_key() {
-        let (priv_a, pub_a) = hybrid_generate_static_keypair().unwrap();
+        let (_priv_a, pub_a) = hybrid_generate_static_keypair().unwrap();
         let (priv_b, _pub_b) = hybrid_generate_static_keypair().unwrap();
 
         let ciphertext = hybrid_encrypt(&pub_a, b"confidencial").unwrap();
