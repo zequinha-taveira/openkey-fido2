@@ -39,6 +39,18 @@
 //! (polling), comportamento aceito pelos drivers PCSC padrão.
 //!
 //! Buffers fixos ([`MAX_MSG_LEN`]), zero alocação, compatível com `no_std`.
+//!
+//! # Limites de payload vs. comandos YKOATH (análise, 2026-08-22)
+//!
+//! `MAX_MSG_LEN = 288` → 10 B de header CCID + até ~278 B de mensagem; em
+//! forma estendida (cabeçalho APDU de 7 B + Le de 2 B) restam ≈ **269 B**
+//! úteis para dados de comando. O pior caso real do protocolo YKOATH —
+//! `PUT` com nome (≤64 B), issuer (≤64 B) e segredo (≤64 B) mais TLVs —
+//! fica em ≈ **200 B**, dentro do limite com folga. Respostas grandes
+//! (`LIST`/`CALCULATE_ALL`) não competem por esse espaço: fluem via
+//! `SEND REMAINING`/`GET RESPONSE` (chaining no roteador ISO 7816). Um bump
+//! de `MAX_MSG_LEN` só se justificaria para futuros comandos com payloads
+//! maiores que 269 B — nenhum conhecido hoje.
 
 use usb_device::bus::{InterfaceNumber, UsbBus, UsbBusAllocator};
 use usb_device::class::{ControlOut, UsbClass};

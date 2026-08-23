@@ -262,19 +262,47 @@ Dispositivo HID FIDO esperado (`0xF1D0`):
 
 ---
 
-## 7. Ainda não verificado (honesto)
+## 7. Persistência física (Yubico Authenticator + reboot)
+
+A partir do incremento da flash QSPI física, o firmware grava o estado dos
+applets (serial do Management e credenciais OATH) na **região reservada de
+128 KiB no fim da flash real** — tamanho probeado via Boot ROM
+(`FLASH_DEVINFO`/`cs0_size`), resolvendo em runtime a discrepância W25Q16
+(2 MiB) × wiki (4 MiB) da seção 5. Dois slots com geração monótona dão
+recuperação de power-loss (`FlashStorageBackend`).
+
+Procedimento de validação:
+
+- [ ] Gravar `rp2350-firmware.uf2` (seção 3) e confirmar enumeração USB (seção 5)
+- [ ] Abrir o **Yubico Authenticator** (ou `ykman oath accounts list`) e
+      confirmar que o dispositivo aparece via PCSC
+- [ ] Adicionar uma credencial TOTP de teste no app (qualquer issuer/nome;
+      usar segredo conhecido para conferir o código depois)
+- [ ] Anotar o código TOTP exibido: `________`
+- [ ] Desligar/religar a placa (power cycle REAL — puxar o cabo USB)
+- [ ] Reabrir o Yubico Authenticator: credencial **presente** e código
+      consistente com o mesmo segredo ✓
+- [ ] Repetir o reboot 3× para exercitar o two-slot commit (cada alteração
+      alterna o slot ativo)
+- [ ] Opcional (`ykman info`): serial reportado é o MESMO antes/depois do
+      reboot (identidade estável persistida)
+
+> Se a credencial sumir após o reboot: verificar com o Método A/B/C da
+> seção 5 se o tamanho probeado confere; um tamanho errado deslocaria a
+> região. Registrar o resultado aqui: ________________
+
+---
+
+## 8. Ainda não verificado (honesto)
 
 Itens que este runbook **não cobre** e continuam em aberto:
 
-- [ ] Persistência real de credenciais na flash externa: o `FlashStorageBackend`
-      atual é **simulado**; falta o adaptador de storage físico (QSPI NOR via
-      SSI/XIP) para sobreviver a ciclos de energia
 - [ ] WS2812B (GPIO16) como `StatusLed`: a trait existe em
       `transport::embedded`, mas falta o driver PIO; hoje o LED não reflete
       estados do autenticador
-- [ ] CCID sobre a mesma porta única: perfil declara `usb_ccid()` por paridade
-      com o RP2350 genérico; interface dual no porto único não validada
 - [ ] Conformidade FIDO oficial (FIDO Conformance Tool) — requer ambiente
       Linux/UHID + acesso às ferramentas da FIDO Alliance
 - [ ] TrustZone / secure boot / OTP efetivamente configurados no binário
       (hoje o perfil declara as capacidades do silício, não o uso delas)
+- [ ] TRNG contínuo do RP2350 substituindo o PRNG semeado por boot
+      (BootRandom/splitmix64): necessário antes de produção com nonces ECDSA

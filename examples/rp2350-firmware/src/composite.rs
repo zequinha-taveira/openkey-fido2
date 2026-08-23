@@ -23,6 +23,44 @@ use usb_device::device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidP
 
 use transport::embedded::{CcidClass, CtapHidClass};
 
+/// Identidade USB completa do dispositivo composto (VID/PID + strings).
+///
+/// O flavor `yubikey5-identity` troca TODA a identidade — números e strings —
+/// para que ferramentas da Yubico apresentem o dispositivo exatamente como
+/// um YubiKey 5. **NÃO PARA DISTRIBUIÇÃO** (VID/PID/strings de terceiro);
+/// builds publicados usam [`OPENKEY_IDENTITY`].
+pub struct UsbIdentity {
+    pub vid: u16,
+    pub pid: u16,
+    pub manufacturer: &'static str,
+    pub product: &'static str,
+    pub serial: &'static str,
+}
+
+/// Identidade própria do projeto (pid.codes) — padrão dos builds distribuídos.
+pub const OPENKEY_IDENTITY: UsbIdentity = UsbIdentity {
+    vid: 0x1209,
+    pid: 0x0001,
+    manufacturer: "openkey-fido2",
+    product: "FIDO2 Authenticator",
+    serial: "openkey",
+};
+
+/// Identidade opt-in YubiKey 5 (ykman / Yubico Authenticator reconhecem de
+/// cara). Serial permanece honesto ("openkey") de propósito.
+#[cfg(feature = "yubikey5-identity")]
+pub const ACTIVE_IDENTITY: UsbIdentity = UsbIdentity {
+    vid: 0x1050,
+    pid: 0x0407,
+    manufacturer: "Yubico",
+    product: "YubiKey",
+    serial: "openkey",
+};
+
+/// Identidade ativa sem o flavor opt-in.
+#[cfg(not(feature = "yubikey5-identity"))]
+pub const ACTIVE_IDENTITY: UsbIdentity = OPENKEY_IDENTITY;
+
 /// Dispositivo USB composto: CTAPHID (HID) + CCID (smart card).
 pub struct CompositeUsbDevice<'a, B: UsbBus> {
     usb_dev: UsbDevice<'a, B>,
@@ -36,18 +74,18 @@ impl<'a, B: UsbBus> CompositeUsbDevice<'a, B> {
     /// Cria o dispositivo composto a partir do allocator compartilhado.
     ///
     /// O `alloc` deve viver tanto quanto o dispositivo retornado (tipicamente
-    /// o escopo de `main`). A mesma identidade VID/PID cobre as duas
-    /// interfaces — exatamente como num YubiKey real.
-    pub fn new(alloc: &'a UsbBusAllocator<B>, vid: u16, pid: u16) -> Self {
+    /// o escopo de `main`). A mesma identidade cobre as duas interfaces —
+    /// exatamente como num YubiKey real.
+    pub fn new(alloc: &'a UsbBusAllocator<B>, identity: &UsbIdentity) -> Self {
         // Ordem de alocação define a numeração: interface 0 = HID, 1 = CCID.
         let hid = CtapHidClass::new(alloc);
         let ccid = CcidClass::new(alloc);
 
-        let usb_dev = UsbDeviceBuilder::new(alloc, UsbVidPid(vid, pid))
+        let usb_dev = UsbDeviceBuilder::new(alloc, UsbVidPid(identity.vid, identity.pid))
             .strings(&[StringDescriptors::default()
-                .manufacturer("openkey-fido2")
-                .product("FIDO2 Authenticator")
-                .serial_number("openkey")])
+                .manufacturer(identity.manufacturer)
+                .product(identity.product)
+                .serial_number(identity.serial)])
             .unwrap()
             .max_packet_size_0(64)
             .unwrap()

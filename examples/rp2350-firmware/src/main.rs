@@ -19,6 +19,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use panic_halt as _;
 use rp235x_hal as hal;
@@ -45,8 +46,10 @@ use transport::ctaphid::{
 use transport::embedded::usb_ccid_backend::MAX_PAYLOAD_LEN;
 
 mod composite;
+mod qspi_flash;
 
 use composite::CompositeUsbDevice;
+use storage::FlashStorageBackend;
 
 /// Tamanho do heap em bytes (para `Vec` e estruturas alocadas do CTAPHID).
 const HEAP_SIZE: usize = 8192;
@@ -59,26 +62,10 @@ const FW_MAJOR: u8 = 0;
 const FW_MINOR: u8 = 1;
 const FW_BUILD: u8 = 0;
 
-/// Identidade USB do dispositivo.
-///
-/// Padrão: pid.codes do openkey-fido2 (0x1209:0x0001) — identidade própria
-/// do projeto, usada em todos os builds publicados.
-///
-/// Build opt-in `--features yubikey5-identity`: reivindica a identidade
-/// YubiKey 5 da Yubico (0x1050:0x0407), que faz ykman e Yubico Authenticator
-/// reconhecerem o dispositivo automaticamente (casamento por VID/PID).
-///
-/// **NÃO PARA DISTRIBUIÇÃO:** VID/PID de terceiro é válido apenas para
-/// testes privados; builds distribuídos devem manter a identidade padrão.
-#[cfg(not(feature = "yubikey5-identity"))]
-const USB_VID: u16 = 0x1209; // pid.codes — openkey-fido2
-#[cfg(not(feature = "yubikey5-identity"))]
-const USB_PID: u16 = 0x0001;
-
-#[cfg(feature = "yubikey5-identity")]
-const USB_VID: u16 = 0x1050; // Yubico — NÃO PARA DISTRIBUIÇÃO
-#[cfg(feature = "yubikey5-identity")]
-const USB_PID: u16 = 0x0407; // YubiKey 5 (OTP+FIDO+CCID) — NÃO PARA DISTRIBUIÇÃO
+/// Identidade USB do dispositivo: definida em [`composite::UsbIdentity`]
+/// (VID/PID + manufacturer/product/serial), selecionada pelo mesmo flag
+/// `yubikey5-identity`. Padrão: pid.codes do openkey-fido2; o flavor opt-in
+/// reivindica identidade YubiKey 5 da Yubico — **NÃO PARA DISTRIBUIÇÃO**.
 
 /// Alocador global de heap (linked-list first-fit via `embedded-alloc`).
 #[global_allocator]
@@ -202,13 +189,15 @@ fn main() -> ! {
     entropy_seed();
     let _ring_ok = ring_smoke();
 
-    // 1c. Applets Yubico (ISO 7816-4) sobre um único storage compartilhado:
-    //     serial do Management e estado OATH vivem no mesmo kv, então a
-    //     identidade é única e, ao plugar um backend de flash no lugar de
-    //     `StorageEngine::new()`, ambos persistem juntos. A chave-mestra é
-    //     gerada via SystemRandom — que já consome o getrandom custom
-    //     semeado em 1b. Falhas aqui são fatais: sem applets não há CCID.
-    let storage = core::cell::RefCell::new(StorageEngine::new().expect("storage engine"));
+    // 1c. Applets Yubico (ISO 7816-4) sobre um único storage compartilhado
+    //     PERSISTIDO na flash QSPI física: serial do Management e estado OATH
+    //     vivem no mesmo kv e sobrevivem a power cycles (dois slots +
+    //     recuperação, ver FlashStorageBackend). A chave-mestra é gerada via
+    //     SystemRandom — que já consome o getrandom custom semeado em 1b.
+    //     Falhas aqui são fatais: sem applets não há CCID.
+    let flash = qspi_flash::QspiFlashDevice::open().expect("flash QSPI (região de credenciais)");
+    let backend = FlashStorageBackend::new(flash).expect("backend de dois slots");
+    let storage = core::cell::RefCell::new(StorageEngine::with_backend(Box::new(backend)));
     let crypto = CryptoEngine::new().expect("crypto engine");
     let mut oath = OathApplet::new(&storage, crypto.clone()).expect("applet OATH");
     let mut management = ManagementApplet::new(&storage, crypto).expect("applet Management");
@@ -258,7 +247,7 @@ fn main() -> ! {
         true,
         &mut pac.RESETS,
     ));
-    let mut device = CompositeUsbDevice::new(&usb_bus, USB_VID, USB_PID);
+    let mut device = CompositeUsbDevice::new(&usb_bus, &composite::ACTIVE_IDENTITY);
 
     // 8. Estado do protocolo CTAPHID.
     let mut channels = ChannelManager::new();
