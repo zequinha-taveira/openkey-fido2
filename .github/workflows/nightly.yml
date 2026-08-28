@@ -1,0 +1,96 @@
+name: "Nightly deploy"
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  nightly:
+    name: Deploy nightly
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/rp2350-firmware
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Install Python deps
+        run: python -m pip install --upgrade pip maturin
+
+      - name: Install GCC ARM (for ring C build)
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
+
+      - name: Build workspace (release)
+        run: cargo build --workspace --release --locked
+
+      - name: Build simulator (release)
+        run: cargo build -p fido2-simulator --release --locked
+
+      - name: Build openkey_core wheel
+        run: |
+          python -m maturin build --manifest-path python/openkey_core/Cargo.toml --interpreter python --out dist --release
+          ls -lh dist/
+
+      - name: Build RP2350 firmware (release)
+        working-directory: examples/rp2350-firmware
+        run: |
+          cargo build --release --locked
+          ls -lh target/thumbv8m.main-none-eabihf/release/rp2350-firmware || true
+          arm-none-eabi-size target/thumbv8m.main-none-eabihf/release/rp2350-firmware || true
+
+      - name: Stage release artifacts
+        run: |
+          set -e
+          mkdir -p release
+          if [ -f target/release/fido2-simulator ]; then cp target/release/fido2-simulator release/; fi
+          if [ -f target/debug/fido2-simulator ]; then cp target/debug/fido2-simulator release/fido2-simulator-debug || true; fi
+          cp dist/*.whl release/ 2>/dev/null || true
+          if [ -f examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/release/rp2350-firmware ]; then
+            cp examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/release/rp2350-firmware release/
+          fi
+          # UF2 convert
+          if [ -f release/rp2350-firmware ]; then
+            if command -v picotool >/dev/null 2>&1; then
+              picotool uf2 convert release/rp2350-firmware -t elf release/rp2350-firmware.uf2 -t uf2 || true
+            else
+              if ! command -v elf2uf2-rs >/dev/null 2>&1; then
+                cargo install elf2uf2-rs --locked
+              fi
+              ~/.cargo/bin/elf2uf2-rs release/rp2350-firmware release/rp2350-firmware.uf2 || true
+            fi
+          fi
+          (cd release && sha256sum * > SHA256SUMS || true)
+          cat release/SHA256SUMS || true
+          ls -lh release/
+
+      - name: Update nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag: nightly
+          name: Nightly build
+          prerelease: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          files: release/*.*
+          fail_on_unmatched_files: false
