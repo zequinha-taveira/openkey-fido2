@@ -8,11 +8,10 @@
 //! chaves estáticas persistíveis (`[u8; 32]` via `x25519_dalek`), permitindo
 //! decifrar dados armazenados em flash mesmo após reinicializações.
 
+use crate::pin_protocol::Zeroizing;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
-use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{compiler_fence, Ordering};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, X25519};
 use ring::hkdf::{self, HKDF_SHA256};
@@ -38,31 +37,9 @@ const HKDF_INFO: &[u8] = b"openkey-ecies-v1";
 
 type Error = Box<dyn core::error::Error>;
 
-/// Wrapper que zera o material sensível ao ser dropado.
-struct Zeroizing<T: AsMut<[u8]>>(T);
-
-impl<T: AsMut<[u8]>> Drop for Zeroizing<T> {
-    fn drop(&mut self) {
-        for byte in self.0.as_mut() {
-            *byte = 0;
-        }
-        compiler_fence(Ordering::SeqCst);
-    }
-}
-
-impl<T: AsMut<[u8]>> Deref for Zeroizing<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T: AsMut<[u8]>> DerefMut for Zeroizing<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+// Reusa o `Zeroizing` único definido em `pin_protocol` para evitar triplicação
+// de wrappers manuais de zeroização. O tipo central (com `compiler_fence`) é
+// reexportado em `crate::pin_protocol::Zeroizing` e `crate::Zeroizing`.
 
 /// Comprimento de saída solicitado ao HKDF.
 struct OkmLen(usize);
@@ -226,14 +203,14 @@ pub fn hybrid_encrypt(
 
     let recipient_key = UnparsedPublicKey::new(&X25519, recipient_public_key);
 
-    let shared_secret = Zeroizing(
+    let shared_secret = Zeroizing::new(
         agreement::agree_ephemeral(ephemeral_private, &recipient_key, |key_material| {
             key_material.to_vec()
         })
         .map_err(|e| format!("ECDH agreement failed: {:?}", e))?,
     );
 
-    let symmetric_key = Zeroizing(derive_symmetric_key(
+    let symmetric_key = Zeroizing::new(derive_symmetric_key(
         &shared_secret,
         &ephemeral_public_bytes,
         recipient_public_key,
@@ -299,14 +276,14 @@ pub fn hybrid_decrypt(
 
     let ephemeral_key = UnparsedPublicKey::new(&X25519, &ciphertext.ephemeral_public_key);
 
-    let shared_secret = Zeroizing(
+    let shared_secret = Zeroizing::new(
         agreement::agree_ephemeral(recipient_private, &ephemeral_key, |key_material| {
             key_material.to_vec()
         })
         .map_err(|e| format!("ECDH agreement failed: {:?}", e))?,
     );
 
-    let symmetric_key = Zeroizing(derive_symmetric_key(
+    let symmetric_key = Zeroizing::new(derive_symmetric_key(
         &shared_secret,
         &ciphertext.ephemeral_public_key,
         &recipient_public_bytes,

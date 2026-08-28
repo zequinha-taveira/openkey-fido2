@@ -173,7 +173,9 @@ impl Counter {
             all(target_arch = "aarch64", target_endian = "little"),
             // [patch openkey-fido2] arm usa o fallback Rust puro, que
             // precisa deste acesso (as fontes asm foram removidas).
-            false,
+            // `cfg(any())` é sempre falso e estável (evita E0658 em MSRV 1.85,
+            // onde `cfg(false)` é experimental - issue #131204).
+            any(),
             target_arch = "x86_64"
         ))
     ))]

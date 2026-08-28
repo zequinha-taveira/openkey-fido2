@@ -105,6 +105,16 @@ build-rp2350:
 build-rp2350-firmware:
     cd examples/rp2350-firmware && cargo build
 
+# Compilar + converter para UF2 (RP2350)
+# Para automação: picotool uf2 convert <elf> -t elf <out> -t uf2
+build-rp2350-uf2: build-rp2350-firmware
+    picotool uf2 convert examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/debug/rp2350-firmware -t elf examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/debug/rp2350-firmware.uf2 -t uf2
+
+# Versão release (otimizada + UF2)
+build-rp2350-uf2-release:
+    cd examples/rp2350-firmware && cargo build --release
+    picotool uf2 convert examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/release/rp2350-firmware -t elf examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/release/rp2350-firmware.uf2 -t uf2
+
 # Checar o firmware bare-metal do RP2350 sem gerar binario
 check-rp2350-firmware:
     cd examples/rp2350-firmware && cargo check
@@ -129,6 +139,34 @@ build-stm32l4:
 check-targets:
     cargo check -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features
     cargo check -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features
+
+# Validar hardware pos-flash (HID CTAPHID + CCID/PCSC + applets OATH/Management)
+# Requer placa RP2350-Zero gravada e conectada via USB
+hardware-check:
+    python tools/hardware_check.py
+
+hardware-check-json:
+    python tools/hardware_check.py --json
+
+# Flash RP2350: probe-rs SWD ou picotool UF2 + poll VID:PID
+# dry-run valida args sem HW: just hardware-flash-dry
+hardware-flash:
+    python tools/flash_rp2350.py --poll
+
+hardware-flash-dry:
+    python tools/flash_rp2350.py --dry-run
+
+hardware-flash-dry-json:
+    python tools/flash_rp2350.py --dry-run --json
+
+hardware-uhid-bridge:
+    python tools/ctaphid_bridge.py --self-test
+
+# Build de desenvolvimento local (espelha .github/workflows/dev-build.yml: workspace + simulador + wheel + RP2350 + diagnostics)
+dev-build: build build-simulator
+    python -m maturin build --manifest-path python/openkey_core/Cargo.toml --interpreter python --out dist || echo "maturin falhou (opcional)"
+    cd examples/rp2350-firmware && cargo build --locked || echo "RP2350 falhou (requer gcc-arm-none-eabi)"
+    cd tests/python && python -m diagnostics.runner || echo "diagnostics falhou"
 
 # Verificar se tudo esta OK (build + testes + lint + targets embedded)
 ci: build test clippy fmt-check check-targets

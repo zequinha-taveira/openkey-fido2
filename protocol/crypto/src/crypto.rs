@@ -556,19 +556,14 @@ impl Default for CryptoEngine {
 
 /// Compares two byte slices in constant time.
 ///
-/// Returns `true` if `a` and `b` are equal, `false` otherwise.
-/// The time taken is proportional to the length of `b` and does not
-/// depend on the content of `a` or `b`, making it suitable for comparing
-/// secrets such as PIN hashes or authentication tokens.
+/// Delegates to `ring::constant_time::verify_slices_are_equal` (BoringSSL
+/// `CRYPTO_memcmp`) so the comparison of equal-length slices runs in time
+/// independent of content, suitable for PIN hashes and auth tokens. Length
+/// mismatch returns `false` (length is not considered secret for fixed-size
+/// hashes/tokens used in this crate).
+#[allow(deprecated)]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
+    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
 }
 
 #[cfg(test)]

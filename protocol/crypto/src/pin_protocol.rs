@@ -43,12 +43,22 @@ pub const PIN_HASH_LEN: usize = 16;
 type Error = Box<dyn core::error::Error>;
 
 /// Wrapper que zera o conteúdo sensível ao ser dropado.
+///
+/// Este é o **único** `Zeroizing` manual do crate `crypto` (canônico). `hybrid.rs`
+/// reutiliza este tipo via `crate::pin_protocol::Zeroizing` para evitar triplicação;
+/// não duplicar. Preferimos este wrapper a `zeroize::Zeroizing` aqui porque a
+/// bound `AsMut<[u8]>` cobre `Vec<u8>` e `[u8; N]` sem exigir `Zeroize` impl,
+/// e o `Drop` usa `compiler_fence` explícito conforme ADR-0006.
 pub struct Zeroizing<T: AsMut<[u8]>>(T);
 
 impl<T: AsMut<[u8]>> Drop for Zeroizing<T> {
     fn drop(&mut self) {
         for byte in self.0.as_mut() {
-            *byte = 0;
+            // `write_volatile` impede que o otimizador elimine a limpeza
+            // (necessário com LTO), conforme `zeroize` crate faz internamente.
+            unsafe {
+                core::ptr::write_volatile(byte, 0);
+            }
         }
         compiler_fence(Ordering::SeqCst);
     }
@@ -310,7 +320,8 @@ impl hkdf::KeyType for OkmLen {
 
 /// AES-256-CBC bruto (sem padding) — o protocolo CTAP2 exige plaintexts
 /// múltiplos do bloco e nunca adiciona padding (CTAP 2.1 §6.5.6/§6.5.7).
-#[allow(clippy::manual_is_multiple_of)]
+#[allow(unknown_lints)]
+#[allow(clippy::manual_is_multiple_of, clippy::chunks_exact_to_as_chunks)]
 pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
     if key.len() != 32 {
         return Err("AES-256 key must be 32 bytes".into());
@@ -333,7 +344,8 @@ pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
 
 /// AES-256-CBC bruto (sem padding), decifrando dados de
 /// [`aes256_cbc_encrypt`].
-#[allow(clippy::manual_is_multiple_of)]
+#[allow(unknown_lints)]
+#[allow(clippy::manual_is_multiple_of, clippy::chunks_exact_to_as_chunks)]
 pub fn aes256_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
     if key.len() != 32 {
         return Err("AES-256 key must be 32 bytes".into());

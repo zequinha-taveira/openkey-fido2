@@ -27,6 +27,11 @@
 //! a capacidade da região, (3) uso do símbolo de linker `__flash_binary_end`.
 //! Sem eles não existe escrita de flash; o porte bare-metal foi aprovado
 //! explicitamente neste incremento (TODO.md — Suporte Nativo Yubico/Fase E).
+//!
+//! Nota: este é o único arquivo com `unsafe` em `firmware/*` e `protocol/*`;
+//! `vendor/ring` (em `examples/rp2350-firmware/vendor/ring`) é crate externa
+//! vendida e contém `unsafe` fora do controle do projeto — ver `README.md`
+//! seção Segurança.
 
 use rp2350_firmware::{region_for, SECTOR_SIZE, XIP_BASE};
 use core::ptr;

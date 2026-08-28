@@ -93,22 +93,12 @@ cargo build -p rp2350-firmware --release
 
 ### Conversão ELF → UF2 (necessária apenas para gravação via mass-storage)
 
-Marcar o método disponível como **verificar disponibilidade** na sua máquina —
-qualquer um dos dois serve:
-
-- [ ] Opção A — `picotool`:
-
-  ```powershell
-  picotool uf2 convert target\thumbv8m.main-none-eabihf\release\rp2350-firmware `
-      openkey-rp2350.uf2
-  ```
-
-- [x] Opção B — `elf2uf2-rs` (instalado; UF2 já gerado):
-
-  ```powershell
-  elf2uf2-rs target\thumbv8m.main-none-eabihf\release\rp2350-firmware `
-      target\thumbv8m.main-none-eabihf\release\rp2350-firmware.uf2
-  ```
+```powershell
+picotool uf2 convert target\thumbv8m.main-none-eabihf\release\rp2350-firmware -t elf `
+    openkey-rp2350.uf2 -t uf2
+# Para automação:
+# picotool uf2 convert <elf> -t elf <out> -t uf2
+```
 
 ---
 
@@ -197,38 +187,61 @@ O firmware tem duas identidades USB, escolhidas em tempo de compilação:
 | Build | VID:PID | Finalidade |
 |-------|---------|------------|
 | Padrão (distribuição) | `1209:0001` (pid.codes do openkey-fido2) | identidade própria do projeto |
-| Opt-in `--features yubikey5-identity` | `1050:0407` (Yubico YubiKey 5) | reconhecimento automático por ykman / Yubico Authenticator (casamento por VID/PID) — **NÃO PARA DISTRIBUIÇÃO** |
+| Opt-in `--features yubikey5-identity` / `--features yubikey4-identity` (alias, ADR-0025) | `1050:0407` (Yubico YubiKey 4/5 — família `1050:0407` no modo OTP+FIDO+CCID) | reconhecimento automático por ykman / Yubico Authenticator (casamento por VID/PID) — **NÃO PARA DISTRIBUIÇÃO** |
+
+> Vendor do profile `YUBIKEY_4_5` é `Yubikey 4/5` (`board_generic::YUBIKEY_4_5`, `device_profile::UsbIdentity::yubikey()` → `1050:0407`) com **Secure Boot ✅** (`secure_boot`) + **Secure Lock ✅** (`debug_disable+otp+unique_id+tamper`).
 
 > A UF2 padrão desta máquina (`rp2350-firmware.uf2`) usa a identidade
-> pid.codes. A variante YubiKey 5 é gerada com
-> `cargo build --release --features yubikey5-identity` e destina-se apenas a
-> testes privados. Nota de expectativa: mesmo sob `1050:0407`, o firmware
-> expõe somente a interface HID FIDO (`0xF1D0`) — não há interfaces OTP ou
-> CCID; ferramentas da Yubico enumeram o dispositivo mas os comandos
-> específicos dessas interfaces falham.
+> pid.codes. A variante YubiKey 4/5 é gerada com
+> `cargo build --release --features yubikey5-identity` (ou `yubikey4-identity`, mesmo `1050:0407`) e destina-se apenas a
+> testes privados. Firmware atual é **composto HID+CCID** (duas interfaces
+> sobre um único `UsbDevice`): interface 0 HID/CTAPHID (`0xF1D0`) +
+> interface 1 CCID/SmartCard T=0 com applets OATH (`A0000005272101`), Management (`A000000527471117`), PIV e OpenPGP (via `register_multiprotocol_applets`). Não há interface OTP.
 
-Dispositivo HID FIDO esperado (`0xF1D0`):
+Dispositivo composto esperado (HID `0xF1D0` + CCID `0x0B`):
 
-- [ ] PowerShell (identidade padrão):
+- [ ] PowerShell — HID (identidade padrão):
 
   ```powershell
   Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_1209&PID_0001' } |
       Format-List FriendlyName, Class, Status
   ```
 
-- [ ] PowerShell (variante opt-in):
+- [ ] PowerShell — HID (variante opt-in):
 
   ```powershell
   Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_1050&PID_0407' } |
       Format-List FriendlyName, Class, Status
   ```
 
-  Esperado em ambos: dispositivo **HID** classe *Human Interface Device*,
-  status `OK`.
+  Esperado em ambos: entrada **HID** classe *Human Interface Device*,
+  status `OK`. No composto há também um **leitor CCID** enumerado como
+  *Smart Card* / *Leitor USB* (mesma VID:PID, interface 1). Conferir:
+
+  ```powershell
+  Get-PnpDevice | Where-Object { $_.Class -eq 'SmartCardReader' } |
+      Format-List FriendlyName, InstanceId, Status
+  # ou
+  Get-PnpDevice | Where-Object { $_.InstanceId -match 'VID_1209' } |
+      Format-Table FriendlyName, Class, Status -AutoSize
+  ```
 
 - [ ] Alternativa visual: **Gerenciador de Dispositivos** → "Dispositivos de
-      Interface Humana" contém a entrada FIDO correspondente à identidade
-      usada no build gravado.
+      Interface Humana" (HID FIDO) **e** "Leitores de cartão inteligente"
+      (CCID) contêm as duas interfaces do composto sob a mesma VID:PID.
+
+- [ ] Validação automatizada (HID+CCID+applets):
+
+  ```powershell
+  python tools/hardware_check.py
+  # ou: just hardware-check
+  # saída JSON: python tools/hardware_check.py --json
+  #             just hardware-check-json
+  ```
+
+  Esperado: `ctap_ok=true`, `readers` contém o leitor CCID com ATR T=0
+  (`3B DA ... 6F 70 65 6E...`), `select_oath` e `select_management` com
+  `sw=9000` (ou payload de versão/desafio no SELECT).
 
 ---
 

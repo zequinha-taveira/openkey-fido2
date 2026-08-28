@@ -10,7 +10,7 @@
 pub mod board_generic;
 /// Detecção de user presence reaproveitando o botão BOOTSEL (RP2350).
 pub mod bootsel;
-/// Perfis de board pré-definidos (NRF52840, STM32L4, ESP32C3, RP2350, RP2350_ZERO, GENERIC).
+/// Perfis de board pré-definidos (NRF52840, STM32L4, ESP32C3, RP2350, RP2350_ZERO, YUBIKEY_4_5, GENERIC).
 pub mod profiles;
 
 pub use board_generic::{
@@ -20,4 +20,5 @@ pub use board_generic::{
 pub use bootsel::{BootselButton, Rp2350Qspi, UserPresenceButton};
 pub use profiles::{
     rp2350_with_pins, Rp2350Pins, ESP32C3, GENERIC, NRF52840, RP2350, RP2350_ZERO, STM32L4,
+    YUBIKEY_4_5,
 };

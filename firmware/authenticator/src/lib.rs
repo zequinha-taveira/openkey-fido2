@@ -19,8 +19,21 @@ pub mod yubico_oath;
 /// Aplicação Yubico Management como applet ISO 7816-4.
 pub mod yubico_management;
 
+pub mod yubico_openpgp;
+/// Applets stub multi-protocolo (PIV / OpenPGP).
+pub mod yubico_piv;
+
+/// Dispatcher multi-protocolo sobre CardRouter (ADR-0024).
+pub mod multiprotocol;
+
 pub use authenticator::EmbeddedAuthenticator;
 #[cfg(feature = "std")]
 pub use authenticator::InsecureHostStorage;
+pub use multiprotocol::{
+    register_multiprotocol_applets, MULTIPROTOCOL_APPLET_COUNT,
+    MULTIPROTOCOL_SUPPORTED_CAPABILITIES,
+};
 pub use yubico_management::{register_yubico_applets, ManagementApplet, AID_YUBICO_MANAGEMENT};
 pub use yubico_oath::{OathAlgorithm, OathApplet, OathType, AID_YUBICO_OATH, MAX_CREDENTIALS};
+pub use yubico_openpgp::{OpenPgpApplet, AID_OPENPGP};
+pub use yubico_piv::{PivApplet, AID_PIV};

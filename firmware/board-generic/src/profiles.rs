@@ -7,7 +7,7 @@
 //! `DeviceProfileBuilder::from_board` or `EmbeddedAuthenticator::new_with_board`.
 //!
 //! Available profiles: `NRF52840`, `STM32L4`, `ESP32C3`, `RP2350`,
-//! `RP2350_ZERO` and `GENERIC`.
+//! `RP2350_ZERO`, `YUBIKEY_4_5` and `GENERIC`.
 
 use crate::board_generic::{BoardDefinition, SecurityFeatures, UserPresenceSource};
 
@@ -218,6 +218,36 @@ pub const RP2350_ZERO: BoardDefinition = BoardDefinition::new(
 // GPIOs do bank0); a presença vem de `UserPresenceSource::Bootsel`.
 .button(u8::MAX);
 
+/// YubiKey 4/5 — perfil de produto compatível com o ecossistema YubiKey.
+///
+/// Mesma pinagem e transportes do RP2350-Zero (HID+CCID, BOOTSEL para
+/// user presence, WS2812B em GPIO16), mas com `SecurityFeatures::yubico()`
+/// (secure boot ✅ + secure lock ✅ — `tamper_detection=true`, ADR-0025)
+/// e AAGUID dedicado. VID:PID `1050:0407` é do produto (`DeviceProfile.usb`).
+pub const YUBIKEY_4_5: BoardDefinition = BoardDefinition::new(
+    "yubikey-4-5",
+    [
+        0x59, 0x55, 0x42, 0x49, 0x4b, 0x45, 0x59, 0x34, 0x2d, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07,
+    ],
+)
+.usb_hid()
+.usb_ccid()
+.secure_storage(true)
+.crypto_accelerator(true)
+.security_features(SecurityFeatures::yubico())
+.presence_source(UserPresenceSource::Bootsel)
+.i2c_sda(4)
+.i2c_scl(5)
+.spi_mosi(6)
+.spi_miso(7)
+.spi_clk(8)
+.cs(9)
+.reset(10)
+.irq(11)
+.led(16)
+.button(u8::MAX);
+
 /// Generic board profile with USB-CCID transport only.
 pub const GENERIC: BoardDefinition = BoardDefinition::new(
     "generic-fido",
@@ -280,5 +310,34 @@ mod tests {
         assert_eq!(NRF52840.presence_source, UserPresenceSource::None);
         assert_eq!(STM32L4.presence_source, UserPresenceSource::None);
         assert_eq!(ESP32C3.presence_source, UserPresenceSource::None);
+    }
+
+    #[test]
+    fn test_yubikey_4_5_secure_boot_and_lock() {
+        assert_eq!(YUBIKEY_4_5.presence_source, UserPresenceSource::Bootsel);
+        assert_eq!(YUBIKEY_4_5.led_pin, 16);
+        assert_eq!(YUBIKEY_4_5.button_pin, u8::MAX);
+        assert!(YUBIKEY_4_5.security.secure_boot);
+        assert!(YUBIKEY_4_5.security.debug_disable);
+        assert!(YUBIKEY_4_5.security.otp_memory);
+        assert!(YUBIKEY_4_5.security.tamper_detection);
+        assert!(YUBIKEY_4_5.security.has_any());
+        assert_eq!(YUBIKEY_4_5.security, SecurityFeatures::yubico());
+    }
+
+    #[test]
+    fn test_yubikey_aaguid_is_unique_and_derived() {
+        assert_eq!(YUBIKEY_4_5.name, "yubikey-4-5");
+        assert_eq!(YUBIKEY_4_5.aaguid[15], 0x07);
+        for other in [
+            NRF52840.aaguid,
+            STM32L4.aaguid,
+            ESP32C3.aaguid,
+            RP2350.aaguid,
+            RP2350_ZERO.aaguid,
+            GENERIC.aaguid,
+        ] {
+            assert_ne!(YUBIKEY_4_5.aaguid, other);
+        }
     }
 }

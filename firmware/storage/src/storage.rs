@@ -35,6 +35,9 @@ pub enum StorageError {
     /// Erro de I/O ao acessar o meio persistente.
     #[error("IO error: {0}")]
     IoError(String),
+    /// Parâmetro inválido — usado para validar LargeBlobs e outros limites.
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
 }
 
 #[cfg(feature = "std")]
@@ -424,6 +427,12 @@ impl<D: FlashDevice> StorageBackend for FlashStorageBackend<D> {
     }
 
     fn write(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        // Limitação documentada: clona o cache inteiro (O(n)) a cada write para
+        // garantir atomicidade two-slot com rollback em caso de falha no commit.
+        // Para o número típico de credenciais (<50) o custo é desprezível; para
+        // large blobs o snapshot CBOR pode atingir `sector_size` e o erro
+        // "flash snapshot exceeds sector capacity" é mapeado na fronteira CTAP
+        // para `Ctap2Error::LargeBlobStorageFull` (0x18) em vez de `Unknown`.
         let mut next = self.cache.clone();
         next.insert(key.to_string(), value.to_vec());
         self.commit(&next)?;
@@ -474,16 +483,24 @@ impl WearLevelCounter {
         }
     }
 
+    #[allow(clippy::manual_is_multiple_of)]
     fn increment(&mut self) -> Result<(), StorageError> {
         self.write_count += 1;
-        if self.write_count >= WEAR_LEVELING_THRESHOLD {
+        if self.write_count == WEAR_LEVELING_THRESHOLD {
             warn!(
-                "Wear leveling threshold reached for sector '{}' (count={})",
+                "Wear leveling threshold reached for sector '{}' (count={}) - wear leveling is warn-only in this backend (no sector rotation)",
                 self.sector, self.write_count
             );
-            return Err(StorageError::WearLevelingThresholdExceeded(
-                self.sector.clone(),
-            ));
+            // Real flash would rotate/erase sectors here. This simulator backend
+            // only warns to avoid failing legitimate storage after 10k writes.
+            // The threshold is informational; operation succeeds.
+        } else if self.write_count > WEAR_LEVELING_THRESHOLD
+            && (self.write_count - WEAR_LEVELING_THRESHOLD) % 1000 == 0
+        {
+            warn!(
+                "Wear leveling still beyond threshold for sector '{}' (count={}) - periodic reminder (every 1000 writes)",
+                self.sector, self.write_count
+            );
         }
         Ok(())
     }
@@ -958,22 +975,52 @@ impl StorageEngine {
     /// A validação de capacidade ocorre **antes** de qualquer redimensionamento:
     /// um offset/length atacante-controlado não pode inflar o buffer em memória
     /// (CTAP 2.1 §6.10; limite de [`MAX_LARGE_BLOBS_SIZE`]).
+    ///
+    /// Validações adicionais no StorageEngine (não só no handler CTAP) evitam
+    /// alocação sparse via chamada direta pelo simulador/python:
+    /// - `offset <= current_len` (rejeita buracos esparsos)
+    /// - quando `expected_len` presente: `offset+data.len() <= expected_len` e `expected_len <= MAX`
     pub fn write_large_blobs(
         &mut self,
         offset: usize,
         data: &[u8],
-        expected_len: usize,
+        expected_len: Option<usize>,
     ) -> Result<(), Box<dyn core::error::Error>> {
-        if expected_len > MAX_LARGE_BLOBS_SIZE {
-            return Err("Large blob exceeds maximum supported size (4096 bytes)".into());
-        }
-        let end = offset
-            .checked_add(data.len())
-            .ok_or("large blobs offset overflow")?;
+        let end = offset.checked_add(data.len()).ok_or_else(|| {
+            Box::new(StorageError::InvalidParameter(
+                "large blobs offset overflow".into(),
+            )) as Box<dyn core::error::Error>
+        })?;
         if end > MAX_LARGE_BLOBS_SIZE {
-            return Err("Large blobs write exceeds maximum supported size (4096 bytes)".into());
+            return Err(Box::new(StorageError::InvalidParameter(
+                "Large blobs write exceeds maximum supported size (4096 bytes)".into(),
+            )));
         }
-        let target = core::cmp::max(expected_len, end);
+        if let Some(exp) = expected_len {
+            if exp > MAX_LARGE_BLOBS_SIZE {
+                return Err(Box::new(StorageError::InvalidParameter(
+                    "Large blob exceeds maximum supported size (4096 bytes)".into(),
+                )));
+            }
+            if end > exp {
+                return Err(Box::new(StorageError::InvalidParameter(format!(
+                    "large blobs write end {} exceeds expected_len {}",
+                    end, exp
+                ))));
+            }
+        }
+        // Rejeita buracos esparsos: offset não pode saltar além do tamanho atual
+        if offset > self.large_blobs.len() {
+            return Err(Box::new(StorageError::InvalidParameter(format!(
+                "sparse hole: offset {} > current_len {}",
+                offset,
+                self.large_blobs.len()
+            ))));
+        }
+        let target = match expected_len {
+            Some(exp) => core::cmp::max(exp, end),
+            None => end,
+        };
         if target > self.large_blobs.len() {
             self.large_blobs.resize(target, 0);
         }
@@ -1234,7 +1281,9 @@ mod tests {
 
         let backend = FileStorageBackend::new(path.clone()).unwrap();
         let mut storage = StorageEngine::with_backend(Box::new(backend));
-        storage.write_large_blobs(0, b"persisted-blob", 14).unwrap();
+        storage
+            .write_large_blobs(0, b"persisted-blob", Some(14))
+            .unwrap();
 
         let backend = FileStorageBackend::new(path.clone()).unwrap();
         let reopened = StorageEngine::with_backend(Box::new(backend));
@@ -1281,10 +1330,12 @@ mod tests {
     #[test]
     fn test_write_large_blobs_rejects_offset_beyond_capacity() {
         let mut storage = StorageEngine::new().unwrap();
-        storage.write_large_blobs(0, &[0x11u8; 16], 16).unwrap();
+        storage
+            .write_large_blobs(0, &[0x11u8; 16], Some(16))
+            .unwrap();
 
         // Offset fora da capacidade deve ser rejeitado sem alterar o array.
-        assert!(storage.write_large_blobs(5000, &[0x22u8; 8], 0).is_err());
+        assert!(storage.write_large_blobs(5000, &[0x22u8; 8], None).is_err());
         assert_eq!(storage.get_large_blobs_len(), 16);
         assert_eq!(storage.read_large_blobs(0, 16), vec![0x11u8; 16]);
     }
@@ -1294,7 +1345,7 @@ mod tests {
         let mut storage = StorageEngine::new().unwrap();
 
         assert!(storage
-            .write_large_blobs(0, &[0x33u8; 8], MAX_LARGE_BLOBS_SIZE + 1)
+            .write_large_blobs(0, &[0x33u8; 8], Some(MAX_LARGE_BLOBS_SIZE + 1))
             .is_err());
         assert_eq!(storage.get_large_blobs_len(), 0);
     }
@@ -1303,21 +1354,72 @@ mod tests {
     fn test_write_large_blobs_boundary_at_capacity_succeeds() {
         let mut storage = StorageEngine::new().unwrap();
 
-        // Escrita terminando exatamente no limite é permitida.
+        // Escrita terminando exatamente no limite é permitida via fragmentos contíguos
         let offset = MAX_LARGE_BLOBS_SIZE - 8;
-        storage.write_large_blobs(offset, &[0x44u8; 8], 0).unwrap();
+        // Primeiro preenche até offset de forma contígua
+        storage
+            .write_large_blobs(0, &vec![0x44u8; offset], Some(MAX_LARGE_BLOBS_SIZE))
+            .unwrap();
         assert_eq!(storage.get_large_blobs_len(), MAX_LARGE_BLOBS_SIZE);
+        // Sobrescrever os últimos 8 bytes dentro do array já alocado é permitido
+        storage
+            .write_large_blobs(offset, &[0x44u8; 8], Some(MAX_LARGE_BLOBS_SIZE))
+            .unwrap();
         assert_eq!(storage.read_large_blobs(offset, 8), vec![0x44u8; 8]);
 
         // Um byte a mais já estoura a capacidade.
-        assert!(storage.write_large_blobs(offset, &[0x55u8; 9], 0).is_err());
+        assert!(storage
+            .write_large_blobs(offset, &[0x55u8; 9], None)
+            .is_err());
         assert_eq!(storage.get_large_blobs_len(), MAX_LARGE_BLOBS_SIZE);
+    }
+
+    #[test]
+    fn test_write_large_blobs_rejects_sparse_hole() {
+        let mut storage = StorageEngine::new().unwrap();
+        storage
+            .write_large_blobs(0, &[0x11u8; 16], Some(16))
+            .unwrap();
+        // Gap: offset 32 > current_len 16 => rejeita alocação sparse
+        assert!(storage
+            .write_large_blobs(32, &[0x22u8; 8], Some(40))
+            .is_err());
+        assert_eq!(storage.get_large_blobs_len(), 16);
+        // offset+data além de expected_len também rejeita
+        assert!(storage
+            .write_large_blobs(16, &[0x33u8; 8], Some(20))
+            .is_err());
+        assert_eq!(storage.get_large_blobs_len(), 16);
+        // Escrita contígua deve passar
+        storage
+            .write_large_blobs(16, &[0x44u8; 8], Some(24))
+            .unwrap();
+        assert_eq!(storage.get_large_blobs_len(), 24);
+        // Tentativa direta via simulator/python de alocar 4096 zeros sparse a partir do zero
+        let mut sparse = StorageEngine::new().unwrap();
+        // offset 4000 com expected_len 4096 e 8 bytes deveria falhar quando len=0 (gap)
+        assert!(sparse
+            .write_large_blobs(4000, &[0x55u8; 8], Some(4096))
+            .is_err());
+        assert_eq!(sparse.get_large_blobs_len(), 0);
+        // Escrita sequencial até 4096 deve funcionar via fragments contíguos
+        sparse
+            .write_large_blobs(0, &[0xAAu8; 2048], Some(4096))
+            .unwrap();
+        assert_eq!(sparse.get_large_blobs_len(), 4096);
+        sparse
+            .write_large_blobs(2048, &[0xBBu8; 2048], Some(4096))
+            .unwrap();
+        assert_eq!(sparse.read_large_blobs(0, 8), vec![0xAAu8; 8]);
+        assert_eq!(sparse.read_large_blobs(2048, 8), vec![0xBBu8; 8]);
     }
 
     #[test]
     fn test_read_large_blobs_huge_count_does_not_panic() {
         let mut storage = StorageEngine::new().unwrap();
-        storage.write_large_blobs(0, &[0x66u8; 16], 16).unwrap();
+        storage
+            .write_large_blobs(0, &[0x66u8; 16], Some(16))
+            .unwrap();
 
         let huge_count = usize::MAX;
         assert_eq!(storage.read_large_blobs(4, huge_count), vec![0x66u8; 12]);
@@ -1409,5 +1511,20 @@ mod tests {
         assert_eq!(credential.cred_protect, Some(CRED_PROTECT_UV_REQUIRED));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_wear_leveling_threshold_is_warn_only() {
+        // Após 10k escritas o contador deve apenas avisar, não falhar (warn-only)
+        let mut storage = StorageEngine::new().unwrap();
+        for i in 0..WEAR_LEVELING_THRESHOLD + 5 {
+            let key = format!("key_{}", i % 10);
+            assert!(
+                storage.store(&key, b"value".to_vec()).is_ok(),
+                "store não deve falhar após threshold (warn-only)"
+            );
+        }
+        // Após ultrapassar o limite, operações continuam normais
+        assert_eq!(storage.retrieve("key_0").unwrap(), b"value".to_vec());
     }
 }

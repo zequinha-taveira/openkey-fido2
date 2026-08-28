@@ -16,8 +16,12 @@ use std::path::PathBuf;
 #[cfg(feature = "std")]
 use storage::FileStorageBackend;
 use storage::StorageEngine;
-use transport::{BleGattTransport, NfcTransport, Transport, UsbCcidTransport, UsbHidTransport};
+use transport::{
+    BleGattTransport, MultiTransport, NfcTransport, Transport, UsbCcidTransport, UsbHidTransport,
+};
 use webauthn::WebAuthnAuthenticator;
+
+extern crate alloc;
 
 /// Deriva a chave-mestra do caminho do arquivo de persistência (host).
 ///
@@ -77,17 +81,20 @@ impl fmt::Debug for InsecureHostStorage {
     }
 }
 
-extern crate alloc;
-
 /// Autenticador FIDO2 completo, pronto para uso por um host ou transporte.
 ///
 /// Reúne validação WebAuthn, estado CTAP2, criptografia, storage e o
 /// transporte derivado do [`DeviceProfile`]. É a única API que integradores
 /// precisam conhecer.
+///
+/// Suporte multi-protocolo (ADR-0024): o autenticador pode operar com
+/// múltiplos transportes simultâneos (HID + CCID + NFC + BLE). O campo
+/// legado `transport` foi unificado em `transports: Vec<>` com acessores
+/// compatíveis (`transport()` retorna o primeiro).
 pub struct EmbeddedAuthenticator {
     webauthn: WebAuthnAuthenticator,
     discovery: CapabilityDiscovery,
-    transport: Option<Box<dyn Transport>>,
+    transports: Vec<Box<dyn Transport>>,
 }
 
 impl EmbeddedAuthenticator {
@@ -173,25 +180,61 @@ impl EmbeddedAuthenticator {
         injected_transport: Option<Box<dyn Transport>>,
     ) -> Result<Self, Box<dyn core::error::Error>> {
         let mut webauthn = WebAuthnAuthenticator::new(profile.aaguid, crypto, storage)?;
-        let transport = injected_transport.or_else(|| init_transport(&profile.transport_config));
+        let mut transports = init_transports(&profile.active_transport_configs());
+        if let Some(injected) = injected_transport {
+            // Injeção explícita tem precedência sobre o perfil; substitui a lista.
+            transports = alloc::vec![injected];
+        }
         let discovery = CapabilityDiscovery::new(profile);
         webauthn.set_capabilities(ctap2_capabilities(&discovery.capabilities()));
 
         Ok(Self {
             webauthn,
             discovery,
-            transport,
+            transports,
         })
     }
 
-    /// Transporte configurado no perfil ou injetado pelo chamador, quando houver.
+    /// Transporte configurado no perfil ou injetado pelo chamador, quando houver (legado: primeiro da lista).
     pub fn transport(&self) -> Option<&dyn Transport> {
-        self.transport.as_deref()
+        self.transports.first().map(|t| t.as_ref())
     }
 
-    /// Acesso mutável ao transporte, para `init`/`send`/`recv`/`close`.
+    /// Acesso mutável ao transporte, para `init`/`send`/`recv`/`close` (legado: primeiro).
     pub fn transport_mut(&mut self) -> Option<&mut Box<dyn Transport>> {
-        self.transport.as_mut()
+        self.transports.first_mut()
+    }
+
+    /// Lista completa de transportes ativos (multi-protocolo, ADR-0024).
+    pub fn transports(&self) -> &[Box<dyn Transport>] {
+        &self.transports
+    }
+
+    /// Acesso mutável à lista completa de transportes.
+    pub fn transports_mut(&mut self) -> &mut [Box<dyn Transport>] {
+        &mut self.transports
+    }
+
+    /// Adiciona um transporte adicional em runtime (multi-protocolo).
+    pub fn add_transport(&mut self, transport: Box<dyn Transport>) {
+        self.transports.push(transport);
+    }
+
+    /// Cria um autenticador com múltiplos transportes injetados (multi-protocolo).
+    pub fn new_with_profile_and_transports(
+        profile: DeviceProfile,
+        transports: Vec<Box<dyn Transport>>,
+    ) -> Result<Self, Box<dyn core::error::Error>> {
+        let crypto = CryptoEngine::new()?;
+        let storage = StorageEngine::new()?;
+        let mut webauthn = WebAuthnAuthenticator::new(profile.aaguid, crypto, storage)?;
+        let discovery = CapabilityDiscovery::new(profile);
+        webauthn.set_capabilities(ctap2_capabilities(&discovery.capabilities()));
+        Ok(Self {
+            webauthn,
+            discovery,
+            transports,
+        })
     }
 
     /// Acesso à camada WebAuthn, para inspeção em testes e ferramentas.
@@ -304,31 +347,47 @@ impl fmt::Debug for EmbeddedAuthenticator {
         f.debug_struct("EmbeddedAuthenticator")
             .field("webauthn", &"...")
             .field("discovery", &self.discovery)
-            .field("transport", &self.transport.is_some())
+            .field("transports", &self.transports.len())
             .finish()
     }
 }
 
+fn init_transports(configs: &[TransportConfig]) -> Vec<Box<dyn Transport>> {
+    configs
+        .iter()
+        .map(|config| match config.transport_type {
+            TransportType::UsbHid => {
+                info!("Transport configured: USB-HID (stub)");
+                Box::new(UsbHidTransport::new()) as Box<dyn Transport>
+            }
+            TransportType::UsbCcid => {
+                info!("Transport configured: USB-CCID (stub)");
+                Box::new(UsbCcidTransport::new()) as Box<dyn Transport>
+            }
+            TransportType::Nfc => {
+                info!("Transport configured: NFC (stub)");
+                Box::new(NfcTransport::new()) as Box<dyn Transport>
+            }
+            TransportType::BleGatt => {
+                info!("Transport configured: BLE GATT (stub)");
+                Box::new(BleGattTransport::new()) as Box<dyn Transport>
+            }
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
 fn init_transport(config: &Option<TransportConfig>) -> Option<Box<dyn Transport>> {
-    let config = config.as_ref()?;
-    match config.transport_type {
-        TransportType::UsbHid => {
-            info!("Transport configured: USB-HID (stub)");
-            Some(Box::new(UsbHidTransport::new()))
-        }
-        TransportType::UsbCcid => {
-            info!("Transport configured: USB-CCID (stub)");
-            Some(Box::new(UsbCcidTransport::new()))
-        }
-        TransportType::Nfc => {
-            info!("Transport configured: NFC (stub)");
-            Some(Box::new(NfcTransport::new()))
-        }
-        TransportType::BleGatt => {
-            info!("Transport configured: BLE GATT (stub)");
-            Some(Box::new(BleGattTransport::new()))
-        }
-    }
+    let slice = config
+        .as_ref()
+        .map(|c| alloc::vec![c.clone()])
+        .unwrap_or_default();
+    init_transports(&slice).into_iter().next()
+}
+
+/// Helper público para criar um `MultiTransport` a partir de configs.
+pub fn transports_from_profile(profile: &DeviceProfile) -> MultiTransport {
+    MultiTransport::new(init_transports(&profile.active_transport_configs()))
 }
 
 /// Maps runtime capabilities to the CTAP2 GetInfo wire format.
@@ -411,6 +470,8 @@ fn ctap2_capabilities(caps: &Capabilities) -> ctap2::Ctap2Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate alloc;
+    use alloc::{string::ToString, vec};
 
     fn request_with_up(up: bool) -> ctap2::MakeCredentialRequest {
         ctap2::MakeCredentialRequest {
@@ -522,6 +583,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn test_insecure_host_storage_persists_across_restart() {
         // Caminho único por execução para não colidir com testes paralelos.
         let nanos = std::time::SystemTime::now()
@@ -570,5 +632,30 @@ mod tests {
         assert_eq!(user.id, b"user123".to_vec());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_multiprotocol_authenticator_holds_multiple_transports() {
+        let profile = DeviceProfileBuilder::new()
+            .transport_config(TransportConfig::usb_hid())
+            .add_transport(TransportConfig::usb_ccid())
+            .add_transport(TransportConfig::nfc())
+            .build();
+        let auth = EmbeddedAuthenticator::new_with_profile(profile).unwrap();
+        // Legado transport() deve ser o primeiro (HID).
+        assert!(auth.transport().is_some());
+        // Multi-protocolo: 3 ativos.
+        assert_eq!(auth.transports().len(), 3);
+        // O dispatcher MultiTransport agregaria os mesmos 3.
+        let mt = transports_from_profile(auth.profile());
+        assert_eq!(mt.len(), 3);
+    }
+
+    #[test]
+    fn test_multiprotocol_empty_profile_has_no_transport() {
+        let auth =
+            EmbeddedAuthenticator::new_with_profile(DeviceProfileBuilder::new().build()).unwrap();
+        assert!(auth.transport().is_none());
+        assert_eq!(auth.transports().len(), 0);
     }
 }

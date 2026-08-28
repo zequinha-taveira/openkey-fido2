@@ -34,7 +34,10 @@ use board_generic::profiles::RP2350_ZERO;
 
 // Stack do autenticador: applets Yubico compartilham um único StorageEngine
 // (mesmo kv ⇒ mesma identidade) e um CryptoEngine com a MESMA chave-mestra.
-use authenticator::{register_yubico_applets, ManagementApplet, OathApplet};
+// Família YubiKey 4/5 no mesmo PID (1050:0407) é coberta pelo modo composto.
+use authenticator::{
+    register_multiprotocol_applets, ManagementApplet, OathApplet, OpenPgpApplet, PivApplet,
+};
 use crypto::CryptoEngine;
 use storage::StorageEngine;
 use transport::iso7816::CardRouter;
@@ -64,7 +67,8 @@ const FW_BUILD: u8 = 0;
 
 /// Identidade USB do dispositivo: definida em [`composite::UsbIdentity`]
 /// (VID/PID + manufacturer/product/serial), selecionada pelo mesmo flag
-/// `yubikey5-identity`. Padrão: pid.codes do openkey-fido2; o flavor opt-in
+/// `yubikey5-identity`/`yubikey4-identity` (família YubiKey 4/5, mesmo
+/// `1050:0407`, ADR-0025). Padrão: pid.codes do openkey-fido2; o flavor opt-in
 /// reivindica identidade YubiKey 5 da Yubico — **NÃO PARA DISTRIBUIÇÃO**.
 
 /// Alocador global de heap (linked-list first-fit via `embedded-alloc`).
@@ -163,8 +167,10 @@ pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
 // Este binário é direcionado à Waveshare RP2350-Zero (perfil `RP2350_ZERO`):
 // o pino de status abaixo DEVE ser o registrado no perfil (WS2812B em GPIO16).
+// O perfil YubiKey 4/5 (`YUBIKEY_4_5`) reusa a mesma pinagem (ADR-0025).
 // Se o perfil mudar, esta asserção de compilação falha e força a revisão.
 const _: () = assert!(RP2350_ZERO.led_pin == 16);
+const _: () = assert!(board_generic::profiles::YUBIKEY_4_5.led_pin == 16);
 
 /// Metadados para `picotool info`.
 #[link_section = ".bi_entries"]
@@ -201,8 +207,16 @@ fn main() -> ! {
     let crypto = CryptoEngine::new().expect("crypto engine");
     let mut oath = OathApplet::new(&storage, crypto.clone()).expect("applet OATH");
     let mut management = ManagementApplet::new(&storage, crypto).expect("applet Management");
+    let mut piv = PivApplet::default();
+    let mut openpgp = OpenPgpApplet::default();
     let mut router = CardRouter::new();
-    register_yubico_applets(&mut router, &mut management, &mut oath);
+    register_multiprotocol_applets(
+        &mut router,
+        &mut management,
+        &mut oath,
+        &mut piv,
+        &mut openpgp,
+    );
 
     // 2. Periféricos singleton.
     let mut pac = hal::pac::Peripherals::take().unwrap();
@@ -260,7 +274,8 @@ fn main() -> ! {
 
         // CCID: APDUs brutos vão para o roteador ISO 7816-4. O SELECT pelo
         // AID escolhe o applet (A000000527471117 ⇒ Management; A0000005272101
-        // ⇒ OATH) e os demais comandos são despachados ao applet selecionado.
+        // ⇒ OATH; + PIV/OpenPGP via `register_multiprotocol_applets`) e os
+        // demais comandos são despachados ao applet selecionado.
         // Respostas saem como `DATA || SW` no XfrBlock. O caminho CTAPHID
         // abaixo permanece intocado.
         if device.ccid.is_pending() {

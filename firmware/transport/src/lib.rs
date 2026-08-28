@@ -20,6 +20,7 @@ pub mod embedded;
 pub mod ble_gatt;
 pub mod ctaphid;
 pub mod iso7816;
+pub mod multitransport;
 pub mod nfc;
 pub mod transport;
 pub mod usb_ccid;
@@ -44,6 +45,7 @@ pub use framed_ccid::FramedCcidTransport;
 #[cfg(feature = "embedded")]
 pub use framed_hid::FramedUsbHidTransport;
 pub use iso7816::{Applet, CardRouter, ResponseData};
+pub use multitransport::MultiTransport;
 pub use nfc::NfcTransport;
 pub use transport::{DummyTransport, Transport, TransportError};
 pub use usb_ccid::UsbCcidTransport;

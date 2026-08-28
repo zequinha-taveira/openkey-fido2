@@ -44,3 +44,81 @@ jobs:
 
       - name: Run pytest
         run: python -m pytest tests/python -v
+
+  build-rp2350-firmware:
+    name: Build RP2350 Firmware (no HW)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv8m.main-none-eabihf
+
+      - name: Install GCC ARM (for ring C build)
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: examples/rp2350-firmware
+
+      - name: Build RP2350 firmware ELF
+        working-directory: examples/rp2350-firmware
+        run: cargo build --locked
+
+      - name: ELF info
+        working-directory: examples/rp2350-firmware
+        run: |
+          ls -lh target/thumbv8m.main-none-eabihf/debug/rp2350-firmware
+          file target/thumbv8m.main-none-eabihf/debug/rp2350-firmware || true
+          arm-none-eabi-size target/thumbv8m.main-none-eabihf/debug/rp2350-firmware || true
+
+      - name: Install picotool (apt) or fallback elf2uf2-rs
+        run: |
+          set -e
+          if command -v picotool >/dev/null 2>&1; then
+            echo "picotool already installed: $(picotool version || picotool --version || echo ok)"
+          elif sudo apt-get install -y picotool 2>/dev/null; then
+            echo "picotool from apt"
+          else
+            echo "picotool not in apt, installing elf2uf2-rs fallback"
+            cargo install elf2uf2-rs --locked
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
+      - name: UF2 convert (picotool dry-run)
+        working-directory: examples/rp2350-firmware
+        run: |
+          set -e
+          ELF=target/thumbv8m.main-none-eabihf/debug/rp2350-firmware
+          UF2=target/thumbv8m.main-none-eabihf/debug/rp2350-firmware.uf2
+          if command -v picotool >/dev/null 2>&1; then
+            picotool uf2 convert "$ELF" -t elf "$UF2" -t uf2
+            echo "picotool uf2 convert OK"
+          else
+            elf2uf2-rs "$ELF" "$UF2"
+            echo "elf2uf2-rs convert OK"
+          fi
+          ls -lh "$UF2"
+          test -s "$UF2"
+
+      - name: SHA256
+        working-directory: examples/rp2350-firmware
+        run: |
+          sha256sum target/thumbv8m.main-none-eabihf/debug/rp2350-firmware target/thumbv8m.main-none-eabihf/debug/rp2350-firmware.uf2 > SHA256SUMS
+          cat SHA256SUMS
+          # også via wrapper dry-run para validar sem HW
+          python ../../tools/flash_rp2350.py --dry-run --json | tee flash-dry.json
+          cat flash-dry.json
+
+      - name: Upload UF2 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: rp2350-firmware-uf2
+          path: |
+            examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/debug/rp2350-firmware
+            examples/rp2350-firmware/target/thumbv8m.main-none-eabihf/debug/rp2350-firmware.uf2
+            examples/rp2350-firmware/SHA256SUMS
+            examples/rp2350-firmware/flash-dry.json
+          retention-days: 14

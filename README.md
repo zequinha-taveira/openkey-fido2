@@ -1,6 +1,7 @@
 # openkey-fido2
 
 [![CI](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/ci.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/ci.yml)
+[![Dev Build](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/dev-build.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/dev-build.yml)
 [![Release](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/release.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/release.yml)
 [![E2E](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/e2e.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/e2e.yml)
 [![Coverage](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/coverage.yml/badge.svg)](https://github.com/zequinha-taveira/openkey-fido2/actions/workflows/coverage.yml)
@@ -145,6 +146,7 @@ Para um guia detalhado de compilação, testes, fuzzing e opções de build, con
 | Workflow | Arquivo | O que roda |
 |----------|---------|------------|
 | CI | `.github/workflows/ci.yml` | `cargo build/test --workspace`, `cargo fmt --check`, `cargo clippy -D warnings` |
+| Dev Build | `.github/workflows/dev-build.yml` | Build debug + testes + artefatos dev (`fido2-simulator`, wheel `openkey_core`, RP2350 `.elf`/`.uf2`, `SHA256SUMS`, diagnostics) em todo push/PR |
 | E2E | `.github/workflows/e2e.yml` | Compila o simulador e roda `pytest tests/python` |
 | Coverage | `.github/workflows/coverage.yml` | `cargo tarpaulin` (relatórios Xml + Html como artifact) |
 
@@ -162,11 +164,12 @@ Detalhes do harness de fuzzing em [`fuzz/README.md`](fuzz/README.md).
 
 ## Segurança
 
-- Sem blocos `unsafe` no codebase
+- Sem `unsafe` nas crates `protocol/*` e `firmware/*` exceto `examples/rp2350-firmware/src/qspi_flash.rs` (uso justificado no header do módulo, conforme `AGENTS.md`) e `vendor/ring` (crate externa vendida em `examples/rp2350-firmware/vendor/ring`, fora do controle do projeto)
 - Nenhum log de chaves privadas, seeds ou PINs
 - Nonces via `SystemRandom` (imprevisíveis)
 - Comparação constant-time para PINs
 - Chaves zeradas após uso quando possível
+- Wear leveling no `StorageEngine` é contador informativo (`warn`-only) sem rotação de setor — documentado em `firmware/storage/src/storage.rs:447`
 
 ## Licença
 

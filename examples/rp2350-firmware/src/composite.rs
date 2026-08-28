@@ -11,7 +11,8 @@
 //! composição alternativo que constrói o [`UsbDevice`] diretamente sobre a
 //! fatia `[&mut dyn UsbClass<B>]` das duas classes. As identidades USB
 //! (`USB_VID`/`USB_PID` de `main`) alimentam o único builder, valendo para
-//! ambas as interfaces nos flavors padrão e `yubikey5-identity`.
+//! ambas as interfaces nos flavors padrão e `yubikey5-identity`/`yubikey4-identity`
+//! (família YubiKey 4/5, mesmo `1050:0407`, ADR-0025).
 //!
 //! O loop de polling é não bloqueante: cada ciclo chama o stack uma única
 //! vez e processa as classes; quem consome os pacotes é o chamador via os
@@ -46,14 +47,23 @@ pub const OPENKEY_IDENTITY: UsbIdentity = UsbIdentity {
     serial: "openkey",
 };
 
-/// Identidade opt-in YubiKey 5 (ykman / Yubico Authenticator reconhecem de
-/// cara). Serial permanece honesto ("openkey") de propósito.
+/// Identidade opt-in YubiKey 4/5 — VID:PID `1050:0407` + `Yubico YubiKey 5`.
+///
+/// Família YubiKey 4/5 no modo OTP+FIDO+CCID (`0407`) — literature Yubico
+/// lista `1050:0407` para YK4 e YK5 no mesmo modo composto. Product literal
+/// `YubiKey 5` com manufacturer `Yubico` → PCSC forma `Yubico YubiKey 5 0`
+/// (ykman `_pid_from_name` compatível, case-insensitive `yubico`+`yubikey`;
+/// substring `yubikey 4`/`yubikey 5` casa — `tools/hardware_check.py:250`);
+/// Vendor configurável do profile é `Yubikey 4/5` (`board_generic::YUBIKEY_4_5`,
+/// `device_profile::UsbIdentity::yubikey()`). Feature `yubikey4-identity` é
+/// alias de `yubikey5-identity` (ADR-0025). VID:PID de terceiro — **NÃO PARA
+/// DISTRIBUIÇÃO**. Serial permanece honesto (`openkey`).
 #[cfg(feature = "yubikey5-identity")]
 pub const ACTIVE_IDENTITY: UsbIdentity = UsbIdentity {
     vid: 0x1050,
     pid: 0x0407,
     manufacturer: "Yubico",
-    product: "YubiKey",
+    product: "YubiKey 5",
     serial: "openkey",
 };
 

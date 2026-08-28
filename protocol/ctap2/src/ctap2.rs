@@ -690,6 +690,40 @@ fn hash_rp_id(rp_id: &str, crypto: &CryptoEngine) -> [u8; 32] {
     rp_hash
 }
 
+/// Retorna timestamp atual em milissegundos desde UNIX_EPOCH quando `std` está ativo.
+///
+/// Em alvos `no_std` (sem `std`) retorna `0` como fallback determinístico,
+/// preservando compatibilidade: o pruning cai em ordem de inserção arbitrária
+/// mas não quebra. Quando `std` está disponível (`host`, testes, simulador),
+/// o valor real alimenta `prune_oldest_credential` para LRU correto.
+///
+/// Garantia de monotonicidade híbrida: combina millis do sistema com um contador
+/// atômico para que duas credenciais criadas dentro do mesmo milissegundo não
+/// colidam (`created_at`). Usa `max(last+1, millis)` com CAS loop, garantindo
+/// ordem total estrita mesmo sob chamadas concorrentes ou clock skew.
+#[cfg(feature = "std")]
+fn current_timestamp() -> u64 {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static LAST_TS: AtomicU64 = AtomicU64::new(0);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut prev = LAST_TS.load(Ordering::Relaxed);
+    loop {
+        let candidate = if millis > prev { millis } else { prev + 1 };
+        match LAST_TS.compare_exchange_weak(prev, candidate, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return candidate,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn current_timestamp() -> u64 {
+    0
+}
+
 /// Converts the top-level CTAP map from serde's text field names to the
 /// integer labels required by the CTAP 2.1 wire format. Nested maps are left
 /// untouched because RP/user/options/extension maps use text labels.
@@ -1475,7 +1509,7 @@ impl Ctap2Authenticator {
             rp_id_hash: rp_id_hash.to_vec(),
             user_handle: Some(request.user.id.clone()),
             cred_blob: cred_blob.clone(),
-            created_at: 0,
+            created_at: current_timestamp(),
             algorithm: selected_alg,
             rp_id: request.rp.id.clone(),
             large_blob_key: large_blob_key.clone(),
@@ -2182,7 +2216,10 @@ impl Ctap2Authenticator {
 
         // Write operation: `set` is Some
         let blob_data = request.set.unwrap();
-        let expected_len = request.length.unwrap_or(0) as usize;
+        let expected_len: Option<usize> = request
+            .length
+            .map(|v| usize::try_from(v).map_err(|_| Ctap2Error::InvalidParameter))
+            .transpose()?;
         let offset = usize::try_from(request.offset).map_err(|_| Ctap2Error::InvalidParameter)?;
 
         // CTAP 2.1 §6.10: valida offset e length contra a capacidade máxima
@@ -2195,13 +2232,46 @@ impl Ctap2Authenticator {
         let write_end = offset
             .checked_add(blob_data.len())
             .ok_or(Ctap2Error::InvalidParameter)?;
-        if expected_len > max_size || write_end > max_size {
+        if write_end > max_size {
             return Err(Ctap2Error::InvalidParameter);
+        }
+        if let Some(exp) = expected_len {
+            if exp > max_size {
+                return Err(Ctap2Error::InvalidParameter);
+            }
+            if write_end > exp {
+                return Err(Ctap2Error::InvalidParameter);
+            }
         }
 
         self.storage
             .write_large_blobs(offset, &blob_data, expected_len)
-            .map_err(|_| Ctap2Error::Unknown)?;
+            .map_err(|e| {
+                if let Some(se) = e.downcast_ref::<storage::StorageError>() {
+                    match se {
+                        storage::StorageError::InvalidParameter(_) => Ctap2Error::InvalidParameter,
+                        storage::StorageError::BackendError(msg)
+                            if msg.contains("exceeds sector capacity") =>
+                        {
+                            Ctap2Error::LargeBlobStorageFull
+                        }
+                        _ => Ctap2Error::Unknown,
+                    }
+                } else {
+                    let msg = e.to_string();
+                    if msg.contains("InvalidParameter")
+                        || msg.contains("sparse")
+                        || msg.contains("exceeds")
+                    {
+                        // Validação de LargeBlobs (gap, expected_len, capacidade)
+                        Ctap2Error::InvalidParameter
+                    } else if msg.contains("exceeds sector capacity") {
+                        Ctap2Error::LargeBlobStorageFull
+                    } else {
+                        Ctap2Error::Unknown
+                    }
+                }
+            })?;
 
         let response = large_blobs::LargeBlobsResponse { config: None };
         let encoded = encode_cbor(&response).map_err(|_| Ctap2Error::Unknown)?;
@@ -6243,9 +6313,22 @@ mod tests {
         let storage = StorageEngine::new().unwrap();
         let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
 
-        // Escrita terminando exatamente no limite (4096) é permitida.
+        // Escrita terminando exatamente no limite (4096) é permitida via fragmentos contíguos
+        let prefix_len = (4096 - 64) as u64;
+        // Primeiro fragmento preenche até o offset de forma contígua
+        let prefix_req = large_blobs::LargeBlobsRequest {
+            offset: 0,
+            get: None,
+            set: Some(vec![0x42u8; prefix_len as usize]),
+            length: Some(4096),
+            pin_uv_auth_param: None,
+            pin_uv_auth_protocol: None,
+        };
+        authenticator
+            .process_command(0x0C, encode_cbor(&prefix_req).unwrap())
+            .unwrap();
         let write_req = large_blobs::LargeBlobsRequest {
-            offset: (4096 - 64) as u64,
+            offset: prefix_len,
             get: None,
             set: Some(vec![0x42u8; 64]),
             length: Some(4096),
@@ -6565,5 +6648,78 @@ mod tests {
         let stored = authenticator.get_storage().list_credentials();
         assert_eq!(stored[0].algorithm, -7);
         let _ = response;
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_created_at_is_nonzero_and_monotonic() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        let resp1 = authenticator
+            .make_credential(make_credential_request(false))
+            .unwrap();
+        let id1 = credential_id_from_auth_data(&resp1.auth_data);
+        let cred1 = authenticator
+            .get_storage()
+            .get_credential(&id1, &crypto)
+            .unwrap()
+            .unwrap();
+        assert!(
+            cred1.created_at > 0,
+            "created_at deve ser timestamp real quando std ativo"
+        );
+
+        // Sem sleep: monotonicidade híbrida garante timestamp estritamente crescente
+        // mesmo dentro do mesmo millis (AtomicU64 max(last+1, millis))
+        let mut req2 = make_credential_request(false);
+        req2.user.id = b"user2".to_vec();
+        let resp2 = authenticator.make_credential(req2).unwrap();
+        let id2 = credential_id_from_auth_data(&resp2.auth_data);
+        let cred2 = authenticator
+            .get_storage()
+            .get_credential(&id2, &crypto)
+            .unwrap()
+            .unwrap();
+        assert!(
+            cred2.created_at > cred1.created_at,
+            "segundo credential deve ter timestamp > primeiro (monotonic hybrid)"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_created_at_lru_pruning_uses_timestamp_order() {
+        let crypto = CryptoEngine::new().unwrap();
+        let mut storage = StorageEngine::new().unwrap();
+        storage.set_max_credential_count(2);
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto.clone(), storage).unwrap();
+
+        // Cria 3 credenciais back-to-back sem sleep; monotonic hybrid garante ordem LRU
+        let resp1 = authenticator
+            .make_credential(make_credential_request(false))
+            .unwrap();
+        let id1 = credential_id_from_auth_data(&resp1.auth_data);
+
+        let mut req2 = make_credential_request(false);
+        req2.user.id = b"user2".to_vec();
+        let resp2 = authenticator.make_credential(req2).unwrap();
+        let id2 = credential_id_from_auth_data(&resp2.auth_data);
+
+        let mut req3 = make_credential_request(false);
+        req3.user.id = b"user3".to_vec();
+        let resp3 = authenticator.make_credential(req3).unwrap();
+        let id3 = credential_id_from_auth_data(&resp3.auth_data);
+
+        let stored = authenticator.get_storage().list_credentials();
+        assert_eq!(stored.len(), 2, "max 2 deve manter apenas 2 credenciais");
+        let ids: Vec<Vec<u8>> = stored.iter().map(|c| c.credential_id.clone()).collect();
+        assert!(
+            !ids.contains(&id1),
+            "credencial mais antiga (id1) deve ter sido podada por LRU"
+        );
+        assert!(ids.contains(&id2), "id2 deve permanecer");
+        assert!(ids.contains(&id3), "id3 deve permanecer");
     }
 }

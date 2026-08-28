@@ -1270,7 +1270,7 @@ impl Drop for OathApplet<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use storage::{FileStorageBackend, StorageBackend};

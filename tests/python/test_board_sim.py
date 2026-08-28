@@ -201,6 +201,8 @@ class TestProfiles:
             "stm32l4-fido",
             "esp32c3-fido",
             "rp2350-fido",
+            "rp2350-zero",
+            "yubikey-4-5",
             "generic-fido",
         }
         assert {profile.name for profile in ALL} == expected

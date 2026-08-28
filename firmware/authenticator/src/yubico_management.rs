@@ -367,7 +367,7 @@ pub fn register_yubico_applets<'a, 's>(
     router.register(oath);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use crate::yubico_oath::OathApplet;

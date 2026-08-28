@@ -103,13 +103,13 @@ pub const RDR_TO_PC_SLOTSTATUS: u8 = 0x81;
 /// Resposta de parâmetros de protocolo.
 pub const RDR_TO_PC_PARAMETERS: u8 = 0x82;
 
-// --- bStatus (§6.2.2): bits 7-6 presença do ICC; bit 5 status do comando ---
+// --- bStatus (§6.2.2): bits 1:0 bmICCStatus; bit 6 bmCommandStatus ---
 /// ICC presente mas inativo (antes de PowerOn bem-sucedido).
-pub const STATUS_ICC_INACTIVE: u8 = 0x40;
+pub const STATUS_ICC_INACTIVE: u8 = 0x01;
 /// ICC presente e ativo.
-pub const STATUS_ICC_ACTIVE: u8 = 0x80;
-/// Falha no comando (torna `bError` válido).
-pub const STATUS_CMD_FAILED: u8 = 0x20;
+pub const STATUS_ICC_ACTIVE: u8 = 0x00;
+/// Falha no comando — OR com o status do slot (torna `bError` válido, bit 6).
+pub const STATUS_CMD_FAILED: u8 = 0x40;
 
 // --- bError (§6.2.6, códigos usados nesta implementação) --------------------
 /// Comando não suportado / tipo de mensagem desconhecido.
@@ -565,7 +565,7 @@ impl<'a, B: UsbBus> CcidClass<'a, B> {
         }
     }
 
-    /// bStatus para comando com falha (bit 5 setado).
+    /// bStatus para comando com falha (bit 6 `bmCommandStatus` setado).
     fn fail_status(&self) -> u8 {
         self.ok_status() | STATUS_CMD_FAILED
     }

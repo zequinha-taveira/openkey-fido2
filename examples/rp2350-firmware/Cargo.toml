@@ -25,9 +25,12 @@ ring = { path = "vendor/ring" }
 #
 # ATENÇÃO: usa o VID/PID da Yubico — uso restrito a testes privados;
 # NÃO PARA DISTRIBUIÇÃO. Builds publicados devem usar a identidade
-# pid.codes padrão do projeto.
+# pid.codes padrão do projeto. `yubikey4-identity` é alias de
+# `yubikey5-identity` para cobrir a família YubiKey 4/5 (mesmo 1050:0407,
+# ADR-0025) e o profile `YUBIKEY_4_5` (Vendor Yubikey 4/5).
 [features]
 yubikey5-identity = []
+yubikey4-identity = ["yubikey5-identity"]
 
 # Biblioteca mínima com geometria pura da região de flash (sem deps de alvo),
 # permitindo testes de unidade em host via `cargo test -p rp2350-firmware --lib`.
