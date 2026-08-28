@@ -11,15 +11,12 @@
 //! Ambos usam acordo de chaves P-256 (ECDH) via `ring`; o segredo efêmero `Z`
 //! é a coordenada x do ponto compartilhado (32 bytes, big-endian).
 
-use aes::cipher::generic_array::typenum::U16;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{consts::U16, Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::Aes256;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
-use cbc::{Decryptor, Encryptor};
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{compiler_fence, Ordering};
 use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
@@ -320,6 +317,8 @@ impl hkdf::KeyType for OkmLen {
 
 /// AES-256-CBC bruto (sem padding) — o protocolo CTAP2 exige plaintexts
 /// múltiplos do bloco e nunca adiciona padding (CTAP 2.1 §6.5.6/§6.5.7).
+/// Implementação manual de CBC para compatibilidade com aes 0.9 + cipher 0.5
+/// (hybrid-array) e aes 0.8 (generic-array) via `cipher::Array`.
 #[allow(unknown_lints)]
 #[allow(clippy::manual_is_multiple_of, clippy::chunks_exact_to_as_chunks)]
 pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
@@ -332,14 +331,19 @@ pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
     if data.len() % AES_BLOCK_LEN != 0 {
         return Err("AES-CBC input must be a multiple of 16 bytes".into());
     }
-    let mut buf = data.to_vec();
-    let mut cipher =
-        Encryptor::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
-    for chunk in buf.chunks_exact_mut(AES_BLOCK_LEN) {
-        let block: &mut GenericArray<u8, U16> = GenericArray::from_mut_slice(chunk);
-        cipher.encrypt_block_mut(block);
+    let cipher = Aes256::new_from_slice(key).map_err(|e| format!("AES-256 key error: {:?}", e))?;
+    let mut prev = Array::<u8, U16>::try_from(iv).unwrap();
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(AES_BLOCK_LEN) {
+        let mut block = Array::<u8, U16>::try_from(chunk).unwrap();
+        for i in 0..AES_BLOCK_LEN {
+            block[i] ^= prev[i];
+        }
+        cipher.encrypt_block(&mut block);
+        out.extend_from_slice(&block);
+        prev = block;
     }
-    Ok(buf)
+    Ok(out)
 }
 
 /// AES-256-CBC bruto (sem padding), decifrando dados de
@@ -356,14 +360,20 @@ pub fn aes256_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
     if data.len() % AES_BLOCK_LEN != 0 {
         return Err("AES-CBC input must be a multiple of 16 bytes".into());
     }
-    let mut buf = data.to_vec();
-    let mut cipher =
-        Decryptor::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
-    for chunk in buf.chunks_exact_mut(AES_BLOCK_LEN) {
-        let block: &mut GenericArray<u8, U16> = GenericArray::from_mut_slice(chunk);
-        cipher.decrypt_block_mut(block);
+    let cipher = Aes256::new_from_slice(key).map_err(|e| format!("AES-256 key error: {:?}", e))?;
+    let mut prev = Array::<u8, U16>::try_from(iv).unwrap();
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(AES_BLOCK_LEN) {
+        let block = Array::<u8, U16>::try_from(chunk).unwrap();
+        let mut plain = block;
+        cipher.decrypt_block(&mut plain);
+        for i in 0..AES_BLOCK_LEN {
+            plain[i] ^= prev[i];
+        }
+        out.extend_from_slice(&plain);
+        prev = block;
     }
-    Ok(buf)
+    Ok(out)
 }
 
 /// Preenche `data` à direita com zeros até 64 bytes (formato `paddedPin`
