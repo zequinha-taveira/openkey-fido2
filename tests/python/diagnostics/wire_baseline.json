@@ -1,0 +1,32 @@
+{
+  "_meta": {
+    "updated": "2026-08-22T23:29:36+00:00",
+    "cases": 23,
+    "note": "Golden master dos outcomes no fio por caso do catálogo. Atualize SOMENTE com 'python -m diagnostics.runner --lock' após mudança intencional de comportamento, junto com a correção atribuída à camada responsável."
+  },
+  "outcomes": {
+    "framing/empty-frame-discarded": "DISCARDED",
+    "framing/truncated-frame-eof": "EOF_NO_STATUS",
+    "dispatch/garbage-payload-precedence": 1,
+    "leniency/paramless-extra-payload": 0,
+    "dispatch/unknown-opcode-0x10": 1,
+    "dispatch/unknown-opcode-0x20": 1,
+    "dispatch/unknown-opcode-0x3F": 1,
+    "dispatch/unknown-opcode-0x50": 1,
+    "dispatch/unknown-opcode-0x7D": 1,
+    "dispatch/unknown-opcode-0xFE": 1,
+    "codec/empty-payload": 18,
+    "codec/break-token": 18,
+    "codec/truncated-cbor": 18,
+    "codec/wrong-top-level-type": 18,
+    "codec/missing-required-field": 18,
+    "validation/unsupported-algorithm": 38,
+    "validation/exclude-collision": 25,
+    "state/gna-without-txn": 48,
+    "state/rpsnext-without-initial": 48,
+    "state/rps-initial-empty-storage": 46,
+    "state/ga-ghost-rp": 46,
+    "state/pin-not-set": 53,
+    "state/wrong-pin-retries": 49
+  }
+}

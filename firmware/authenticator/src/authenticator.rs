@@ -1,3 +1,6 @@
+use alloc::boxed::Box;
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use board_generic::{
     BoardDefinition, BootselButton, Rp2350Qspi, UserPresenceButton, UserPresenceSource,
 };
@@ -8,11 +11,22 @@ use device_profile::{
     TransportConfig, TransportType,
 };
 use log::info;
+#[cfg(feature = "std")]
 use std::path::PathBuf;
-use storage::{FileStorageBackend, StorageEngine};
-use transport::{BleGattTransport, NfcTransport, Transport, UsbCcidTransport, UsbHidTransport};
+#[cfg(feature = "std")]
+use storage::FileStorageBackend;
+use storage::StorageEngine;
+use transport::{
+    BleGattTransport, MultiTransport, NfcTransport, Transport, UsbCcidTransport, UsbHidTransport,
+};
 use webauthn::WebAuthnAuthenticator;
 
+extern crate alloc;
+
+/// Deriva a chave-mestra do caminho do arquivo de persistência (host).
+///
+/// **Inseguro por construção**: ver [`InsecureHostStorage`].
+#[cfg(feature = "std")]
 fn derive_key_from_path(path: &std::path::Path) -> [u8; 32] {
     use ring::digest;
     let path_bytes = path.to_string_lossy();
@@ -22,17 +36,65 @@ fn derive_key_from_path(path: &std::path::Path) -> [u8; 32] {
     key
 }
 
-extern crate alloc;
+/// Marcador explícito de storage de host **inseguro**.
+///
+/// A chave-mestra do storage persistente é derivada do caminho do arquivo
+/// (`SHA-256(caminho)`): **qualquer** leitor local pode rederivá-la a partir
+/// do próprio caminho e decifrar todas as credenciais gravadas. A cifra em
+/// repouso (ChaCha20-Poly1305) não muda esse quadro — a confidencialidade se
+/// reduz a ofuscação do caminho.
+///
+/// O tipo existe para que esse risco fique visível no código:
+/// [`EmbeddedAuthenticator::new_with_insecure_host_storage`] só aceita este
+/// marcador, então todo call site declara estar usando uma chave publicamente
+/// derivável. Uso restrito a simulador e testes; produto real exige chave de
+/// secure element injetada pelo integrador (crypto/storage próprios).
+///
+/// Disponível apenas em hosts (feature `std`); o alvo embarcado usa
+/// `StorageEngine::new()` (RAM) ou um backend de flash próprio.
+#[cfg(feature = "std")]
+pub struct InsecureHostStorage {
+    path: PathBuf,
+}
+
+#[cfg(feature = "std")]
+impl InsecureHostStorage {
+    /// Cria o marcador para o arquivo de persistência indicado.
+    ///
+    /// O par com [`EmbeddedAuthenticator::new_with_insecure_host_storage`]
+    /// deixa o risco evidente no call site:
+    /// `EmbeddedAuthenticator::new_with_insecure_host_storage(
+    /// InsecureHostStorage::new(path), profile)`.
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+#[cfg(feature = "std")]
+impl fmt::Debug for InsecureHostStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // O caminho é configuração fornecida pelo chamador (não é material
+        // criptográfico); imprimi-lo identifica o storage em diagnóstico.
+        f.debug_struct("InsecureHostStorage")
+            .field("path", &self.path)
+            .finish()
+    }
+}
 
 /// Autenticador FIDO2 completo, pronto para uso por um host ou transporte.
 ///
 /// Reúne validação WebAuthn, estado CTAP2, criptografia, storage e o
 /// transporte derivado do [`DeviceProfile`]. É a única API que integradores
 /// precisam conhecer.
+///
+/// Suporte multi-protocolo (ADR-0024): o autenticador pode operar com
+/// múltiplos transportes simultâneos (HID + CCID + NFC + BLE). O campo
+/// legado `transport` foi unificado em `transports: Vec<>` com acessores
+/// compatíveis (`transport()` retorna o primeiro).
 pub struct EmbeddedAuthenticator {
     webauthn: WebAuthnAuthenticator,
     discovery: CapabilityDiscovery,
-    transport: Option<Box<dyn Transport>>,
+    transports: Vec<Box<dyn Transport>>,
 }
 
 impl EmbeddedAuthenticator {
@@ -40,14 +102,14 @@ impl EmbeddedAuthenticator {
     ///
     /// Adequado a testes; produtos reais devem usar
     /// [`EmbeddedAuthenticator::new_with_board`] ou `new_with_profile`.
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new() -> Result<Self, Box<dyn core::error::Error>> {
         Self::new_with_profile(DeviceProfileBuilder::new().build())
     }
 
     /// Cria um autenticador derivando o perfil de uma definição de board.
     ///
     /// AAGUID, transportes e features de segurança vêm do hardware.
-    pub fn new_with_board(board: &BoardDefinition) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new_with_board(board: &BoardDefinition) -> Result<Self, Box<dyn core::error::Error>> {
         let profile = DeviceProfileBuilder::from_board(board).build();
         let mut auth = Self::new_with_profile(profile)?;
         auth.set_board_user_presence(board);
@@ -58,7 +120,7 @@ impl EmbeddedAuthenticator {
     ///
     /// As capabilities do perfil são traduzidas para o formato do CTAP2
     /// GetInfo, mantendo perfil e resposta de protocolo em sincronia.
-    pub fn new_with_profile(profile: DeviceProfile) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new_with_profile(profile: DeviceProfile) -> Result<Self, Box<dyn core::error::Error>> {
         let crypto = CryptoEngine::new()?;
         let storage = StorageEngine::new()?;
         let authenticator = Self::from_profile_and_storage(profile, crypto, storage, None)?;
@@ -77,7 +139,7 @@ impl EmbeddedAuthenticator {
     pub fn new_with_profile_and_transport(
         profile: DeviceProfile,
         transport: Box<dyn Transport>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn core::error::Error>> {
         let crypto = CryptoEngine::new()?;
         let storage = StorageEngine::new()?;
         let authenticator =
@@ -89,18 +151,23 @@ impl EmbeddedAuthenticator {
 
     /// Cria um autenticador com credenciais persistidas em arquivo.
     ///
-    /// A chave-mestra é derivada do caminho do arquivo, de modo que reabrir o
-    /// mesmo storage recupere as credenciais. Isso é adequado ao simulador e
-    /// a testes — **não** a produtos, onde a chave deve vir de secure element.
-    pub fn new_with_storage_path(
-        path: PathBuf,
+    /// A chave-mestra é derivada do caminho do arquivo (veja
+    /// [`InsecureHostStorage`]), de modo que reabrir o mesmo storage recupere
+    /// as credenciais. O gate é deliberado: só é possível invocar este
+    /// construtor com o marcador [`InsecureHostStorage`], tornando o uso de
+    /// chave publicamente derivável explícito em todo call site. Adequado ao
+    /// simulador e a testes — **não** a produtos, onde a chave deve vir de
+    /// secure element.
+    #[cfg(feature = "std")]
+    pub fn new_with_insecure_host_storage(
+        storage: InsecureHostStorage,
         profile: DeviceProfile,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let key = derive_key_from_path(&path);
+    ) -> Result<Self, Box<dyn core::error::Error>> {
+        let key = derive_key_from_path(&storage.path);
         let crypto = CryptoEngine::from_key(key);
-        let backend = FileStorageBackend::new(path)?;
-        let storage = StorageEngine::with_backend(Box::new(backend));
-        let authenticator = Self::from_profile_and_storage(profile, crypto, storage, None)?;
+        let backend = FileStorageBackend::new(storage.path)?;
+        let engine = StorageEngine::with_backend(Box::new(backend));
+        let authenticator = Self::from_profile_and_storage(profile, crypto, engine, None)?;
 
         info!("FIDO2 Embedded Authenticator initialized with persistent storage");
         Ok(authenticator)
@@ -111,27 +178,63 @@ impl EmbeddedAuthenticator {
         crypto: CryptoEngine,
         storage: StorageEngine,
         injected_transport: Option<Box<dyn Transport>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn core::error::Error>> {
         let mut webauthn = WebAuthnAuthenticator::new(profile.aaguid, crypto, storage)?;
-        let transport = injected_transport.or_else(|| init_transport(&profile.transport_config));
+        let mut transports = init_transports(&profile.active_transport_configs());
+        if let Some(injected) = injected_transport {
+            // Injeção explícita tem precedência sobre o perfil; substitui a lista.
+            transports = alloc::vec![injected];
+        }
         let discovery = CapabilityDiscovery::new(profile);
         webauthn.set_capabilities(ctap2_capabilities(&discovery.capabilities()));
 
         Ok(Self {
             webauthn,
             discovery,
-            transport,
+            transports,
         })
     }
 
-    /// Transporte configurado no perfil ou injetado pelo chamador, quando houver.
+    /// Transporte configurado no perfil ou injetado pelo chamador, quando houver (legado: primeiro da lista).
     pub fn transport(&self) -> Option<&dyn Transport> {
-        self.transport.as_deref()
+        self.transports.first().map(|t| t.as_ref())
     }
 
-    /// Acesso mutável ao transporte, para `init`/`send`/`recv`/`close`.
+    /// Acesso mutável ao transporte, para `init`/`send`/`recv`/`close` (legado: primeiro).
     pub fn transport_mut(&mut self) -> Option<&mut Box<dyn Transport>> {
-        self.transport.as_mut()
+        self.transports.first_mut()
+    }
+
+    /// Lista completa de transportes ativos (multi-protocolo, ADR-0024).
+    pub fn transports(&self) -> &[Box<dyn Transport>] {
+        &self.transports
+    }
+
+    /// Acesso mutável à lista completa de transportes.
+    pub fn transports_mut(&mut self) -> &mut [Box<dyn Transport>] {
+        &mut self.transports
+    }
+
+    /// Adiciona um transporte adicional em runtime (multi-protocolo).
+    pub fn add_transport(&mut self, transport: Box<dyn Transport>) {
+        self.transports.push(transport);
+    }
+
+    /// Cria um autenticador com múltiplos transportes injetados (multi-protocolo).
+    pub fn new_with_profile_and_transports(
+        profile: DeviceProfile,
+        transports: Vec<Box<dyn Transport>>,
+    ) -> Result<Self, Box<dyn core::error::Error>> {
+        let crypto = CryptoEngine::new()?;
+        let storage = StorageEngine::new()?;
+        let mut webauthn = WebAuthnAuthenticator::new(profile.aaguid, crypto, storage)?;
+        let discovery = CapabilityDiscovery::new(profile);
+        webauthn.set_capabilities(ctap2_capabilities(&discovery.capabilities()));
+        Ok(Self {
+            webauthn,
+            discovery,
+            transports,
+        })
     }
 
     /// Acesso à camada WebAuthn, para inspeção em testes e ferramentas.
@@ -188,7 +291,7 @@ impl EmbeddedAuthenticator {
     pub fn make_credential(
         &mut self,
         request: ctap2::MakeCredentialRequest,
-    ) -> Result<ctap2::MakeCredentialResponse, Box<dyn std::error::Error>> {
+    ) -> Result<ctap2::MakeCredentialResponse, Box<dyn core::error::Error>> {
         self.webauthn.make_credential(request)
     }
 
@@ -196,17 +299,17 @@ impl EmbeddedAuthenticator {
     pub fn get_assertion(
         &mut self,
         request: ctap2::GetAssertionRequest,
-    ) -> Result<ctap2::GetAssertionResponse, Box<dyn std::error::Error>> {
+    ) -> Result<ctap2::GetAssertionResponse, Box<dyn core::error::Error>> {
         self.webauthn.get_assertion(request)
     }
 
     /// Reporta versões, extensões e opções suportadas (CTAP2 `getInfo`).
-    pub fn get_info(&self) -> Result<ctap2::GetInfoResponse, Box<dyn std::error::Error>> {
+    pub fn get_info(&self) -> Result<ctap2::GetInfoResponse, Box<dyn core::error::Error>> {
         self.webauthn.get_info()
     }
 
     /// Reporta versão, commit e build do firmware (comando de vendor).
-    pub fn get_version(&self) -> Result<ctap2::GetVersionResponse, Box<dyn std::error::Error>> {
+    pub fn get_version(&self) -> Result<ctap2::GetVersionResponse, Box<dyn core::error::Error>> {
         self.webauthn.get_version()
     }
 
@@ -244,31 +347,47 @@ impl fmt::Debug for EmbeddedAuthenticator {
         f.debug_struct("EmbeddedAuthenticator")
             .field("webauthn", &"...")
             .field("discovery", &self.discovery)
-            .field("transport", &self.transport.is_some())
+            .field("transports", &self.transports.len())
             .finish()
     }
 }
 
+fn init_transports(configs: &[TransportConfig]) -> Vec<Box<dyn Transport>> {
+    configs
+        .iter()
+        .map(|config| match config.transport_type {
+            TransportType::UsbHid => {
+                info!("Transport configured: USB-HID (stub)");
+                Box::new(UsbHidTransport::new()) as Box<dyn Transport>
+            }
+            TransportType::UsbCcid => {
+                info!("Transport configured: USB-CCID (stub)");
+                Box::new(UsbCcidTransport::new()) as Box<dyn Transport>
+            }
+            TransportType::Nfc => {
+                info!("Transport configured: NFC (stub)");
+                Box::new(NfcTransport::new()) as Box<dyn Transport>
+            }
+            TransportType::BleGatt => {
+                info!("Transport configured: BLE GATT (stub)");
+                Box::new(BleGattTransport::new()) as Box<dyn Transport>
+            }
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
 fn init_transport(config: &Option<TransportConfig>) -> Option<Box<dyn Transport>> {
-    let config = config.as_ref()?;
-    match config.transport_type {
-        TransportType::UsbHid => {
-            info!("Transport configured: USB-HID (stub)");
-            Some(Box::new(UsbHidTransport::new()))
-        }
-        TransportType::UsbCcid => {
-            info!("Transport configured: USB-CCID (stub)");
-            Some(Box::new(UsbCcidTransport::new()))
-        }
-        TransportType::Nfc => {
-            info!("Transport configured: NFC (stub)");
-            Some(Box::new(NfcTransport::new()))
-        }
-        TransportType::BleGatt => {
-            info!("Transport configured: BLE GATT (stub)");
-            Some(Box::new(BleGattTransport::new()))
-        }
-    }
+    let slice = config
+        .as_ref()
+        .map(|c| alloc::vec![c.clone()])
+        .unwrap_or_default();
+    init_transports(&slice).into_iter().next()
+}
+
+/// Helper público para criar um `MultiTransport` a partir de configs.
+pub fn transports_from_profile(profile: &DeviceProfile) -> MultiTransport {
+    MultiTransport::new(init_transports(&profile.active_transport_configs()))
 }
 
 /// Maps runtime capabilities to the CTAP2 GetInfo wire format.
@@ -351,6 +470,8 @@ fn ctap2_capabilities(caps: &Capabilities) -> ctap2::Ctap2Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate alloc;
+    use alloc::{string::ToString, vec};
 
     fn request_with_up(up: bool) -> ctap2::MakeCredentialRequest {
         ctap2::MakeCredentialRequest {
@@ -427,5 +548,114 @@ mod tests {
         let mut auth = EmbeddedAuthenticator::new_with_board(&board_generic::GENERIC).unwrap();
         // Sem fonte automática => user presence ausente => up satisfeito.
         assert!(auth.make_credential(request_with_up(true)).is_ok());
+    }
+
+    fn resident_request() -> ctap2::MakeCredentialRequest {
+        ctap2::MakeCredentialRequest {
+            client_data_hash: b"test".to_vec(),
+            rp: ctap2::RelyingParty {
+                id: "example.com".to_string(),
+                name: None,
+                icon: None,
+            },
+            user: ctap2::User {
+                id: b"user123".to_vec(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            },
+            pub_key_cred_params: vec![ctap2::PublicKeyCredParams {
+                r#type: "public-key".to_string(),
+                algorithms: -7,
+            }],
+            exclude_list: vec![],
+            extensions: None,
+            options: ctap2::MakeCredentialOptions {
+                rk: true,
+                uv: false,
+                up: true,
+                extended: false,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            enterprise_protections: None,
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn test_insecure_host_storage_persists_across_restart() {
+        // Caminho único por execução para não colidir com testes paralelos.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "openkey_insecure_gate_{}_{}.json",
+            std::process::id(),
+            nanos
+        ));
+
+        // Sessão 1: credencial residente gravada no arquivo sob o gate.
+        let mut first = EmbeddedAuthenticator::new_with_insecure_host_storage(
+            InsecureHostStorage::new(path.clone()),
+            DeviceProfileBuilder::new().build(),
+        )
+        .unwrap();
+        assert!(first.make_credential(resident_request()).is_ok());
+        drop(first);
+
+        // Sessão 2: instância nova sobre o MESMO caminho recupera a
+        // credencial — prova que a derivação da chave sob o gate permaneceu
+        // idêntica ao comportamento anterior (mesmo SHA-256 do caminho).
+        let mut restarted = EmbeddedAuthenticator::new_with_insecure_host_storage(
+            InsecureHostStorage::new(path.clone()),
+            DeviceProfileBuilder::new().build(),
+        )
+        .unwrap();
+        let assertion = restarted
+            .get_assertion(ctap2::GetAssertionRequest {
+                rp_id: "example.com".to_string(),
+                credentials: vec![], // vazia ⇒ descoberta por RP (resident key)
+                allow_list: None,
+                client_data_hash: b"test".to_vec(),
+                extensions: None,
+                options: ctap2::GetAssertionOptions::default(),
+                pin_uv_auth_param: None,
+                pin_protocol: None,
+                uv: None,
+            })
+            .expect("credencial deve sobreviver ao restart sob o gate");
+        let credential = assertion.credential.expect("assertion cita a credencial");
+        assert_eq!(credential.r#type, "public-key");
+        let user = assertion.user.expect("resident key carrega o usuário");
+        assert_eq!(user.id, b"user123".to_vec());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_multiprotocol_authenticator_holds_multiple_transports() {
+        let profile = DeviceProfileBuilder::new()
+            .transport_config(TransportConfig::usb_hid())
+            .add_transport(TransportConfig::usb_ccid())
+            .add_transport(TransportConfig::nfc())
+            .build();
+        let auth = EmbeddedAuthenticator::new_with_profile(profile).unwrap();
+        // Legado transport() deve ser o primeiro (HID).
+        assert!(auth.transport().is_some());
+        // Multi-protocolo: 3 ativos.
+        assert_eq!(auth.transports().len(), 3);
+        // O dispatcher MultiTransport agregaria os mesmos 3.
+        let mt = transports_from_profile(auth.profile());
+        assert_eq!(mt.len(), 3);
+    }
+
+    #[test]
+    fn test_multiprotocol_empty_profile_has_no_transport() {
+        let auth =
+            EmbeddedAuthenticator::new_with_profile(DeviceProfileBuilder::new().build()).unwrap();
+        assert!(auth.transport().is_none());
+        assert_eq!(auth.transports().len(), 0);
     }
 }

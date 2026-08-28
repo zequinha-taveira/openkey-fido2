@@ -14,7 +14,39 @@ publish = false
 # funcionando normalmente.
 [workspace]
 
-[dependencies]
+# Ring vendido com patch APENAS de seleção de fontes (exclui asm armv4/armv7
+# que não monta em Thumb-2/Cortex-M33; fallbacks C do próprio ring entram).
+# Nenhum código criptográfico modificado — ver vendor/ring/build.rs.
+[patch.crates-io]
+ring = { path = "vendor/ring" }
+
+# Identidade USB opcional para reconhecimento automático por ferramentas
+# da Yubico (ykman / Yubico Authenticator), que casam por VID/PID.
+#
+# ATENÇÃO: usa o VID/PID da Yubico — uso restrito a testes privados;
+# NÃO PARA DISTRIBUIÇÃO. Builds publicados devem usar a identidade
+# pid.codes padrão do projeto. `yubikey4-identity` é alias de
+# `yubikey5-identity` para cobrir a família YubiKey 4/5 (mesmo 1050:0407,
+# ADR-0025) e o profile `YUBIKEY_4_5` (Vendor Yubikey 4/5).
+[features]
+yubikey5-identity = []
+yubikey4-identity = ["yubikey5-identity"]
+
+# Biblioteca mínima com geometria pura da região de flash (sem deps de alvo),
+# permitindo testes de unidade em host via `cargo test -p rp2350-firmware --lib`.
+[lib]
+path = "src/lib.rs"
+test = true
+
+# Dependências do binário bare-metal — TODAS restritas a alvos ARM (a lib
+# de geometria é pura e testa em host; ver [lib] acima).
+[target.'cfg(target_arch = "arm")'.dependencies]
+board-generic = { path = "../../firmware/board-generic" }
+# Stack do autenticador: applets Yubico (OATH/Management) para o roteador
+# CCID. Sem `rs256` (RSA exige rand/std) e sem `std` — alvo bare-metal.
+authenticator = { path = "../../firmware/authenticator", default-features = false }
+crypto = { path = "../../protocol/crypto", default-features = false }
+storage = { path = "../../firmware/storage", default-features = false }
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 panic-halt = "0.2"
@@ -23,6 +55,11 @@ embedded-hal = "1.0"
 rp235x-hal = { version = "0.4.0", features = ["binary-info", "critical-section-impl", "rt"] }
 transport = { path = "../../firmware/transport", default-features = false, features = ["embedded", "usb-device"] }
 usb-device = "0.3"
+# getrandom com feature "custom" (sem defaults = sem std): unificação habilita
+# "custom" TAMBÉM na cópia usada pelo ring, contornando o compile_error do
+# alvo. O registro da implementação custom fica em src/main.rs.
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }
+ring = { version = "0.17", default-features = false }
 
 [profile.dev]
 panic = "abort"

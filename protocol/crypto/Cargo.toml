@@ -8,10 +8,40 @@ license = "MIT"
 [dependencies]
 log = "0.4"
 ring = "0.17"
-rsa = { version = "0.9", features = ["sha2"] }
-rand = { workspace = true }
-num-bigint-dig = "0.8"
 zeroize = { workspace = true }
 x25519-dalek = { workspace = true }
 aes = { workspace = true }
 cbc = { workspace = true }
+
+# RSA/RS256 fica opcional: a geração de chaves RSA depende de `rand`/
+# `getrandom`, que não suporta alvos bare-metal (`thumbv8m.main-none-eabi*`).
+# Consumidores embarcados compilam sem `rs256`; hosts mantêm o padrão.
+[dependencies.rsa]
+version = "0.9"
+features = ["sha2"]
+optional = true
+
+[dependencies.rand]
+workspace = true
+optional = true
+
+[dependencies.num-bigint-dig]
+version = "0.8"
+optional = true
+
+[features]
+default = ["rs256", "std"]
+# Mantém o vínculo com `std` em hosts (harness de testes e pré-luas completos);
+# alvos bare-metal compilam com `--no-default-features` (`no_std` + `alloc`).
+std = []
+# Habilita RS256 (-257) e PS256 (-37): geração de chaves RSA (rsa/rand) e as
+# operações de assinatura/verificação correspondentes. Sem a feature, a
+# negociação CTAP2 trata os algoritmos RSA como não suportados.
+rs256 = ["dep:rsa", "dep:rand", "dep:num-bigint-dig"]
+
+# Entropia bare-metal: no alvo embarcado, o getrandom usado pelo ring cai na
+# feature "custom" (implementacao registrada pelo firmware RP2350, semente
+# BootRandom do ROM). Hosts nao ativam esta dependencia e mantem o caminho
+# padrao do SystemRandom.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
+getrandom = { version = "0.2", default-features = false, features = ["custom"] }

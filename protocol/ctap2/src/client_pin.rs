@@ -12,14 +12,16 @@
 //!   implementado em [`crypto::pin_protocol`].
 
 use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use ciborium::de::from_reader;
 use ciborium::ser::into_writer;
 use ciborium::value::Integer;
 use ciborium::Value;
-use crypto::pin_protocol::{strip_zero_padding, PinAgreementKey, PinUvProtocol, Zeroizing};
+use crypto::pin_protocol::{
+    strip_zero_padding, PinAgreementKey, PinUvProtocol, Zeroizing, PIN_HASH_LEN,
+};
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
 
 use crate::ctap2::Ctap2Authenticator;
 use crate::ctap2::Ctap2Error;
@@ -97,11 +99,12 @@ impl CoseEc2Key {
     pub fn encode_cose(&self) -> Result<Vec<u8>, Ctap2Error> {
         let value = self.to_cose_value();
         let mut buf = Vec::new();
-        into_writer(&value, &mut buf).map_err(|_| Ctap2Error::InvalidData)?;
+        into_writer(&value, &mut buf).map_err(|_| Ctap2Error::Unknown)?;
         Ok(buf)
     }
 
-    fn from_cose_value(value: &Value) -> Result<Self, Ctap2Error> {
+    /// Decodifica um COSE_Key EC2 P-256 de um valor CBOR.
+    pub(crate) fn from_cose_value(value: &Value) -> Result<Self, Ctap2Error> {
         let Value::Map(entries) = value else {
             return Err(Ctap2Error::InvalidParameter);
         };
@@ -308,9 +311,13 @@ pub fn is_pin_set(storage: &storage::StorageEngine) -> bool {
 }
 
 /// Indica se o PIN está bloqueado após [`PIN_BLOCK_THRESHOLD`] falhas
-/// consecutivas (powerCycleState = true).
-pub fn is_pin_blocked(storage: &storage::StorageEngine) -> bool {
-    read_retries(storage) <= PIN_MAX_RETRIES - PIN_BLOCK_THRESHOLD
+/// consecutivas na sessão atual (`PIN_AUTH_BLOCKED`, powerCycleState = true).
+///
+/// O bloqueio é **volátil**: nasce limpo em cada instância do autenticador
+/// (um novo power cycle o encerra), enquanto o contador persistente de
+/// tentativas continua valendo (CTAP 2.1 §6.5.5.6).
+pub fn is_pin_blocked(authenticator: &Ctap2Authenticator) -> bool {
+    authenticator.is_pin_auth_blocked()
 }
 
 /// Processa o comando authenticatorClientPIN (0x06) e devolve a response CBOR.
@@ -357,28 +364,31 @@ fn perform_key_agreement(
     let peer_point = peer_cose.to_uncompressed()?;
     let agreement_key = match authenticator.take_pin_agreement_key() {
         Some(key) => key,
-        None => PinAgreementKey::generate().map_err(|_| Ctap2Error::InvalidData)?,
+        None => PinAgreementKey::generate().map_err(|_| Ctap2Error::Unknown)?,
     };
     let z = Zeroizing::new(
         agreement_key
             .agree(&peer_point)
             .map_err(|_| Ctap2Error::InvalidParameter)?,
     );
-    let secret = Zeroizing::new(protocol.kdf(&z).map_err(|_| Ctap2Error::InvalidData)?);
+    let secret = Zeroizing::new(protocol.kdf(&z).map_err(|_| Ctap2Error::Unknown)?);
     Ok(secret)
 }
 
-/// Decifra `pinHashEnc`/`newPinEnc` com o segredo compartilhado, valida e
-/// remove o zero-padding.
-fn decrypt_padded(
+/// Decifra `pinHashEnc` com o segredo compartilhado, exigindo exatamente
+/// [`PIN_HASH_LEN`] bytes.
+///
+/// O plaintext do `pinHashEnc` é exatamente `LEFT(SHA-256(PIN),16)` — **sem**
+/// zero-padding (CTAP 2.1 §6.5.5.5). Remover zeros à direita rejeitaria
+/// ~1/256 dos PINs corretos, cujo prefixo do hash termina em 0x00.
+fn decrypt_pin_hash(
     protocol: &PinUvProtocol,
     secret: &[u8],
-    ciphertext: &[u8],
+    pin_hash_enc: &[u8],
 ) -> Result<Vec<u8>, Ctap2Error> {
-    let padded = protocol
-        .decrypt(secret, ciphertext)
-        .map_err(|_| Ctap2Error::PinAuthInvalid)?;
-    strip_zero_padding(&padded).map_err(|_| Ctap2Error::PinAuthInvalid)
+    protocol
+        .decrypt_exact(secret, pin_hash_enc, PIN_HASH_LEN)
+        .map_err(|_| Ctap2Error::PinAuthInvalid)
 }
 
 /// Valida `pinHashEnc` contra o hash armazenado (comparação em tempo
@@ -399,15 +409,9 @@ fn verify_decrypted_pin_hash(
 
 /// Escada de erros após um PIN incorreto (CTAP 2.1 §6.5.5.4/§6.5.5.7):
 /// `PIN_BLOCKED` sem tentativas, `PIN_AUTH_BLOCKED` após 3 falhas
-/// consecutivas, senão `PIN_INVALID`.
-fn pin_failure_error(authenticator: &Ctap2Authenticator) -> Ctap2Error {
-    if authenticator.get_pin_retries() == 0 {
-        Ctap2Error::PinBlocked
-    } else if is_pin_blocked(authenticator.get_storage()) {
-        Ctap2Error::PinAuthBlocked
-    } else {
-        Ctap2Error::PinInvalid
-    }
+/// consecutivas da sessão, senão `PIN_INVALID`.
+fn pin_failure_error(authenticator: &mut Ctap2Authenticator) -> Ctap2Error {
+    authenticator.register_pin_failure()
 }
 
 /// Emite um pinUvAuthToken novo (32 bytes aleatórios), registra o estado da
@@ -422,13 +426,16 @@ fn issue_pin_uv_auth_token(
     let token = Zeroizing::new(authenticator.get_crypto().random_bytes(32));
     let encrypted = protocol
         .encrypt(secret, &token)
-        .map_err(|_| Ctap2Error::InvalidData)?;
+        .map_err(|_| Ctap2Error::Unknown)?;
     authenticator.set_pin_uv_auth_token(
         token.to_vec(),
         permissions,
         permissions_rp_id,
         protocol.version(),
     );
+    // Retém o segredo compartilhado para operações que cifram dados com ele
+    // (ex.: `currentPIN` do setMinPINLength — ADR-0021).
+    authenticator.set_pin_shared_secret(secret.to_vec(), protocol.version());
     Ok(encrypted)
 }
 
@@ -459,7 +466,7 @@ fn validate_permissions(
 
 fn handle_get_retries(authenticator: &Ctap2Authenticator) -> Result<ClientPinResponse, Ctap2Error> {
     let retries = authenticator.get_pin_retries();
-    let blocked = is_pin_blocked(authenticator.get_storage());
+    let blocked = is_pin_blocked(authenticator);
     Ok(ClientPinResponse {
         retries: Some(retries),
         power_cycle_state: if blocked { Some(true) } else { None },
@@ -472,10 +479,10 @@ fn handle_get_key_agreement(
     request: &ClientPinRequest,
 ) -> Result<ClientPinResponse, Ctap2Error> {
     let _protocol = validate_protocol(request.pin_protocol)?;
-    let agreement_key = PinAgreementKey::generate().map_err(|_| Ctap2Error::InvalidData)?;
+    let agreement_key = PinAgreementKey::generate().map_err(|_| Ctap2Error::Unknown)?;
     let public_key = agreement_key
         .public_key_bytes()
-        .map_err(|_| Ctap2Error::InvalidData)?;
+        .map_err(|_| Ctap2Error::Unknown)?;
     let cose_key = CoseEc2Key {
         x: public_key[1..33].to_vec(),
         y: public_key[33..65].to_vec(),
@@ -551,7 +558,7 @@ fn handle_change_pin(
     if authenticator.get_pin_retries() == 0 {
         return Err(Ctap2Error::PinBlocked);
     }
-    if is_pin_blocked(authenticator.get_storage()) {
+    if is_pin_blocked(authenticator) {
         return Err(Ctap2Error::PinAuthBlocked);
     }
 
@@ -589,7 +596,7 @@ fn handle_change_pin(
     // Decrementa antes da verificação do PIN (CTAP 2.1 §6.5.5.6).
     authenticator.decrement_pin_retries();
 
-    let submitted_hash = match decrypt_padded(&protocol, &secret, pin_hash_enc) {
+    let submitted_hash = match decrypt_pin_hash(&protocol, &secret, pin_hash_enc) {
         Ok(hash) => hash,
         Err(_) => return Err(pin_failure_error(authenticator)),
     };
@@ -619,7 +626,7 @@ fn handle_change_pin(
     authenticator
         .get_storage_mut()
         .store(PIN_STORAGE_KEY, full_hash[..16].to_vec())
-        .map_err(|_| Ctap2Error::InvalidData)?;
+        .map_err(|_| Ctap2Error::Unknown)?;
 
     Ok(ClientPinResponse::default())
 }
@@ -647,6 +654,14 @@ fn handle_get_pin_token_with_permissions(
     let permissions = request.permissions.ok_or(Ctap2Error::MissingParameter)?;
     validate_permissions(authenticator, permissions)?;
 
+    // Tokens que autorizam MakeCredential/GetAssertion exigem rpId: sem ele,
+    // o token valeria para qualquer RP (CTAP 2.1 §6.5.5.7; comportamento do
+    // dispositivo virtual do Chromium). Outros conjuntos de permissões (ex.:
+    // be|cm) podem omitir rpId.
+    if permissions & (PERMISSION_MC | PERMISSION_GA) != 0 && request.rp_id.is_none() {
+        return Err(Ctap2Error::MissingParameter);
+    }
+
     handle_get_pin_token_common(
         authenticator,
         request,
@@ -666,10 +681,15 @@ fn handle_get_pin_token_common(
     if !is_pin_set(authenticator.get_storage()) {
         return Err(Ctap2Error::PinNotSet);
     }
+    if crate::authnr_config::is_force_change_pin(authenticator.get_storage()) {
+        // PIN precisa ser trocado antes de emitir um novo token
+        // (setMinPINLength com forceChangePin — ADR-0021).
+        return Err(Ctap2Error::PinPolicyViolation);
+    }
     if authenticator.get_pin_retries() == 0 {
         return Err(Ctap2Error::PinBlocked);
     }
-    if is_pin_blocked(authenticator.get_storage()) {
+    if is_pin_blocked(authenticator) {
         return Err(Ctap2Error::PinAuthBlocked);
     }
 
@@ -687,7 +707,7 @@ fn handle_get_pin_token_common(
     // Decrementa antes da verificação do PIN (CTAP 2.1 §6.5.5.7).
     authenticator.decrement_pin_retries();
 
-    let submitted_hash = match decrypt_padded(protocol, &secret, pin_hash_enc) {
+    let submitted_hash = match decrypt_pin_hash(protocol, &secret, pin_hash_enc) {
         Ok(hash) => hash,
         Err(_) => return Err(pin_failure_error(authenticator)),
     };
@@ -735,9 +755,9 @@ fn handle_get_uv_token(
 /// pinHashEnc, _, _, permissions, rpId]`), o mapa com chaves inteiras do
 /// CTAP 2.1 e, por compatibilidade, mapas com chaves string do CTAP 2.0.
 pub(crate) fn decode_client_pin_request(data: &[u8]) -> Result<ClientPinRequest, Ctap2Error> {
-    let mut reader = Cursor::new(data);
-    let value: Value = from_reader(&mut reader).map_err(|_| Ctap2Error::InvalidCbor)?;
-    if reader.position() != data.len() as u64 {
+    let mut restante = data;
+    let value: Value = from_reader(&mut restante).map_err(|_| Ctap2Error::InvalidCbor)?;
+    if !restante.is_empty() {
         return Err(Ctap2Error::InvalidCbor);
     }
 
@@ -901,7 +921,7 @@ pub(crate) fn encode_client_pin_response(
     let mut entries: Vec<(Value, Value)> = Vec::with_capacity(5);
     if let Some(key_agreement) = &response.key_agreement {
         let value: Value =
-            from_reader(Cursor::new(key_agreement)).map_err(|_| Ctap2Error::InvalidData)?;
+            from_reader(key_agreement.as_slice()).map_err(|_| Ctap2Error::Unknown)?;
         entries.push((Value::Integer(Integer::from(1)), value));
     }
     if let Some(token) = &response.pin_uv_auth_token {
@@ -930,7 +950,7 @@ pub(crate) fn encode_client_pin_response(
     }
     let value = Value::Map(entries);
     let mut buf = Vec::new();
-    into_writer(&value, &mut buf).map_err(|_| Ctap2Error::InvalidData)?;
+    into_writer(&value, &mut buf).map_err(|_| Ctap2Error::Unknown)?;
     Ok(buf)
 }
 
@@ -938,9 +958,9 @@ pub(crate) fn encode_client_pin_response(
 /// Usado em testes e ferramentas.
 #[cfg(test)]
 pub(crate) fn decode_client_pin_response(data: &[u8]) -> Result<ClientPinResponse, Ctap2Error> {
-    let mut reader = Cursor::new(data);
-    let value: Value = from_reader(&mut reader).map_err(|_| Ctap2Error::InvalidCbor)?;
-    if reader.position() != data.len() as u64 {
+    let mut restante = data;
+    let value: Value = from_reader(&mut restante).map_err(|_| Ctap2Error::InvalidCbor)?;
+    if !restante.is_empty() {
         return Err(Ctap2Error::InvalidCbor);
     }
     let Value::Map(entries) = value else {
@@ -951,7 +971,7 @@ pub(crate) fn decode_client_pin_response(data: &[u8]) -> Result<ClientPinRespons
         match key {
             Value::Integer(n) if *n == Integer::from(1) => {
                 let mut buf = Vec::new();
-                into_writer(val, &mut buf).map_err(|_| Ctap2Error::InvalidData)?;
+                into_writer(val, &mut buf).map_err(|_| Ctap2Error::Unknown)?;
                 response.key_agreement = Some(buf);
             }
             Value::Integer(n) if *n == Integer::from(2) => {
@@ -1012,7 +1032,7 @@ pub(crate) fn encode_client_pin_request_array(
     }
     let value = Value::Array(items);
     let mut buf = Vec::new();
-    into_writer(&value, &mut buf).map_err(|_| Ctap2Error::InvalidData)?;
+    into_writer(&value, &mut buf).map_err(|_| Ctap2Error::Unknown)?;
     Ok(buf)
 }
 
@@ -1022,7 +1042,9 @@ mod tests {
     use crate::ctap2::{Ctap2Authenticator, AAGUID};
     use crypto::pin_protocol::{zero_pad_to_64, PinUvProtocol};
     use crypto::CryptoEngine;
-    use storage::StorageEngine;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use storage::{StorageBackend, StorageEngine};
 
     fn create_authenticator() -> Ctap2Authenticator {
         let crypto = CryptoEngine::new().unwrap();
@@ -1073,7 +1095,7 @@ mod tests {
             )
             .unwrap();
             let cose_bytes = response.key_agreement.expect("keyAgreement ausente");
-            let value: Value = from_reader(Cursor::new(&cose_bytes)).unwrap();
+            let value: Value = from_reader(cose_bytes.as_slice()).unwrap();
             let authenticator_cose = CoseEc2Key::from_cose_value(&value).unwrap();
 
             let key = PinAgreementKey::generate().unwrap();
@@ -1187,6 +1209,34 @@ mod tests {
         engine.sha256(pin)[..16].to_vec()
     }
 
+    /// Backend em memória compartilhável entre instâncias: simula a
+    /// persistência que sobrevive a um power cycle do autenticador.
+    #[derive(Clone, Default)]
+    struct SharedMemoryBackend(Arc<Mutex<HashMap<String, Vec<u8>>>>);
+
+    impl StorageBackend for SharedMemoryBackend {
+        fn read(&self, key: &str) -> Result<Option<Vec<u8>>, storage::StorageError> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+
+        fn write(&mut self, key: &str, value: &[u8]) -> Result<(), storage::StorageError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_vec());
+            Ok(())
+        }
+
+        fn delete(&mut self, key: &str) -> Result<(), storage::StorageError> {
+            self.0.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        fn list_keys(&self) -> Result<Vec<String>, storage::StorageError> {
+            Ok(self.0.lock().unwrap().keys().cloned().collect())
+        }
+    }
+
     #[test]
     fn test_get_pin_retries_initial() {
         let mut authenticator = create_authenticator();
@@ -1216,7 +1266,7 @@ mod tests {
         )
         .unwrap();
         let cose_bytes = response.key_agreement.unwrap();
-        let value: Value = from_reader(Cursor::new(&cose_bytes)).unwrap();
+        let value: Value = from_reader(cose_bytes.as_slice()).unwrap();
         let key = CoseEc2Key::from_cose_value(&value).unwrap();
         assert_eq!(key.x.len(), 32);
         assert_eq!(key.y.len(), 32);
@@ -1418,6 +1468,134 @@ mod tests {
 
         assert!(platform.get_pin_token(&mut authenticator, b"1234").is_ok());
         assert_eq!(authenticator.get_pin_retries(), PIN_MAX_RETRIES);
+    }
+
+    /// O bloqueio `PIN_AUTH_BLOCKED` é volátil: sobrevive dentro da sessão
+    /// (até uma verificação bem-sucedida), mas um power cycle — nova
+    /// instância sobre o mesmo backend persistente — o encerra, enquanto o
+    /// contador persistente de tentativas continua valendo (CTAP 2.1 §6.5.5.6).
+    #[test]
+    fn test_pin_auth_blocked_clears_on_power_cycle() {
+        let backend = SharedMemoryBackend::default();
+
+        // Sessão atual: define o PIN e acumula 3 falhas consecutivas.
+        let storage = StorageEngine::with_backend(Box::new(backend.clone()));
+        let crypto = CryptoEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 1);
+        platform.set_pin(&mut authenticator, b"1234").unwrap();
+
+        assert_eq!(
+            platform
+                .get_pin_token(&mut authenticator, b"0000")
+                .unwrap_err(),
+            Ctap2Error::PinInvalid
+        );
+        assert_eq!(
+            platform
+                .get_pin_token(&mut authenticator, b"0000")
+                .unwrap_err(),
+            Ctap2Error::PinInvalid
+        );
+        assert_eq!(
+            platform
+                .get_pin_token(&mut authenticator, b"0000")
+                .unwrap_err(),
+            Ctap2Error::PinAuthBlocked
+        );
+
+        // Na mesma sessão, mesmo o PIN correto segue bloqueado...
+        assert_eq!(
+            platform
+                .get_pin_token(&mut authenticator, b"1234")
+                .unwrap_err(),
+            Ctap2Error::PinAuthBlocked
+        );
+        assert_eq!(authenticator.get_pin_retries(), PIN_MAX_RETRIES - 3);
+
+        // ...até o "power cycle": nova instância sobre o mesmo backend.
+        drop(platform);
+        drop(authenticator);
+        let storage = StorageEngine::with_backend(Box::new(backend));
+        let crypto = CryptoEngine::new().unwrap();
+        let mut rebooted = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        assert_eq!(rebooted.get_pin_retries(), PIN_MAX_RETRIES - 3);
+
+        let (mut platform_after, _cose) = TestPlatform::start(&mut rebooted, 1);
+        // O PIN correto é aceito e restaura as tentativas.
+        assert!(platform_after.get_pin_token(&mut rebooted, b"1234").is_ok());
+        assert_eq!(rebooted.get_pin_retries(), PIN_MAX_RETRIES);
+    }
+
+    /// Localiza um PIN cujo `LEFT(SHA-256(PIN),16)` termina em 0x00 — caso que
+    /// a remoção indevida de zero-padding do pinHashEnc rejeitava (~1/256 dos
+    /// PINs, CTAP 2.1 §6.5.5.5).
+    fn find_pin_with_trailing_zero_hash() -> Vec<u8> {
+        let engine = CryptoEngine::new().unwrap();
+        for n in 0u32..100_000 {
+            let candidate = format!("{:04}", n);
+            if engine.sha256(candidate.as_bytes())[15] == 0x00 {
+                return candidate.into_bytes();
+            }
+        }
+        panic!("nenhum PIN com hash terminando em 0x00 foi encontrado");
+    }
+
+    fn full_flow_with_trailing_zero_pin(version: u8) {
+        let pin = find_pin_with_trailing_zero_hash();
+        assert_eq!(hash_pin(&pin)[15], 0x00);
+
+        let mut authenticator = create_authenticator();
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, version);
+
+        // setPIN + getPinToken com hash terminando em 0x00 devem funcionar.
+        platform.set_pin(&mut authenticator, &pin).unwrap();
+        assert!(platform.get_pin_token(&mut authenticator, &pin).is_ok());
+
+        // changePIN compara os mesmos 16 bytes exatos do PIN atual.
+        platform
+            .change_pin(&mut authenticator, &pin, b"9876")
+            .unwrap();
+        assert!(platform.get_pin_token(&mut authenticator, b"9876").is_ok());
+        assert!(platform.get_pin_token(&mut authenticator, &pin).is_err());
+    }
+
+    #[test]
+    fn test_trailing_zero_hash_pin_accepted_protocol_1() {
+        full_flow_with_trailing_zero_pin(1);
+    }
+
+    #[test]
+    fn test_trailing_zero_hash_pin_accepted_protocol_2() {
+        full_flow_with_trailing_zero_pin(2);
+    }
+
+    /// Tokens emitidos via getPinUvAuthTokenUsingPinWithPermissions com
+    /// permissões mc|ga exigem rpId (CTAP 2.1 §6.5.5.7); sem ele o token
+    /// autorizaria MakeCredential/GetAssertion para qualquer RP.
+    #[test]
+    fn test_mc_ga_permissions_require_rp_id() {
+        let mut authenticator = create_authenticator();
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        platform.set_pin(&mut authenticator, b"1234").unwrap();
+
+        let result = platform.get_pin_token_with_permissions(
+            &mut authenticator,
+            b"1234",
+            PERMISSION_MC_GA,
+            None,
+        );
+        assert_eq!(result.unwrap_err(), Ctap2Error::MissingParameter);
+
+        // Com rpId o token é emitido normalmente.
+        assert!(platform
+            .get_pin_token_with_permissions(
+                &mut authenticator,
+                b"1234",
+                PERMISSION_MC_GA,
+                Some("example.com"),
+            )
+            .is_ok());
     }
 
     #[test]

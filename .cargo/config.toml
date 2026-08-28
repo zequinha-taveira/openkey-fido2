@@ -21,3 +21,11 @@ check-stm32l4 = "check -p transport --target thumbv7em-none-eabihf --features em
 build-rp2350 = "build -p transport --target thumbv8m.main-none-eabihf --features embedded --no-default-features"
 build-nrf52840 = "build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features"
 build-stm32l4 = "build -p transport --target thumbv7em-none-eabihf --features embedded --no-default-features"
+
+# Toolchain C do ring para checks cross (mesma config do crate standalone).
+# NOTA: usa nome sem caminho para funcionar em Linux CI (via gcc-arm-none-eabi)
+# e Windows (via PATH do Pico SDK). Evita path com espaço que quebra cc-rs.
+[env]
+CC_thumbv8m_main_none_eabihf = "arm-none-eabi-gcc"
+AR_thumbv8m_main_none_eabihf = "arm-none-eabi-ar"
+CXX_thumbv8m_main_none_eabihf = "arm-none-eabi-g++"

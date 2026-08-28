@@ -33,7 +33,7 @@ code.
 - ClientPIN CTAP 2.1 wire format with protocols 1 and 2, retry handling, permissions, and Python conformance coverage
 - WebAuthn extensions: credProtect, credBlob, minPinLength, hmac-secret, and largeBlobKey
 - Crypto: Ed25519, ES256, ES384, PS256, RS256, HMAC-SHA256, SHA-256, ChaCha20-Poly1305, hybrid X25519, and SystemRandom nonces
-- Storage: encryption at rest, file and simulated flash backends, wear leveling, credential pruning, RP enumeration, and sign counter persistence
+- Storage: encryption at rest, file and simulated flash backends, wear leveling, credential pruning, RP enumeration, and sign counter persistence (in-memory and backend, with restart coverage)
 - Device Profile: BoardDefinition builder, DeviceProfileBuilder, CapabilityDiscovery, security features, and five board profiles
 - Attestation: None, Packed, and Self formats with configurable device profiles
 - Transport infrastructure: CTAPHID framing, channel management, reference HALs, USB-HID/CCID adapters, and the RP2350 usb-device backend
@@ -42,11 +42,10 @@ code.
 - Quick Wins: credProtect enum, Reset, Selection, justfile, and docs metadata
 
 ### Remaining Work (🚧)
-- Wire `pinUvAuthParam` validation into MakeCredential, GetAssertion, and Credential Management
 - Implement built-in UV and `getUVRetries` when supported by hardware
 - Connect concrete board drivers to the authenticator for USB-HID and USB-CCID
 - Integrate NFC ISO 14443 and BLE GATT stacks; current types remain hardware stubs
-- Resolve bare-metal linker/runtime gaps and validate firmware on physical boards
+- Validate firmware on physical boards (probe-rs flashing, USB enumeration, browser flows)
 - Run FIDO Conformance Tool and artifact signing when external access and protected secrets are available
 
 ## Workspace Structure

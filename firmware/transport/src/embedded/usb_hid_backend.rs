@@ -9,7 +9,7 @@
 //! reports de 64 bytes (IN e OUT), conforme exigido pelo CTAPHID (CTAP 2.1 §8.2).
 
 use usb_device::bus::{InterfaceNumber, UsbBus, UsbBusAllocator};
-use usb_device::class::{ControlIn, UsbClass};
+use usb_device::class::{ControlIn, ControlOut, UsbClass};
 use usb_device::control;
 use usb_device::descriptor::DescriptorWriter;
 use usb_device::device::{
@@ -101,6 +101,31 @@ impl<'a, B: UsbBus> CtapHidClass<'a, B> {
         self.out_len = 0;
         Some(m)
     }
+
+    /// Modo composto: consome o pacote OUT recebido do host, se houver.
+    ///
+    /// Espelha [`UsbHidBackend::recv_packet`] sem possuir o [`UsbDevice`] —
+    /// para quando esta classe é montada em conjunto com outras (ex.: HID +
+    /// CCID) sobre um único dispositivo USB; o polling do stack fica sob
+    /// responsabilidade do montador.
+    pub fn recv_report(&mut self, buf: &mut [u8]) -> Option<usize> {
+        self.take_data(buf)
+    }
+
+    /// Modo composto: envia um pacote IN ao host.
+    ///
+    /// Retorna `Err(BufferTooSmall)` acima de 64 bytes e `Err(SendFailed)`
+    /// quando o endpoint ainda não está pronto (`WouldBlock`) — reenviar no
+    /// próximo ciclo de polling.
+    pub fn send_report(&mut self, buf: &[u8]) -> Result<(), EmbeddedTransportError> {
+        if buf.len() > PACKET_SIZE {
+            return Err(EmbeddedTransportError::BufferTooSmall);
+        }
+        self.ep_in
+            .write(buf)
+            .map(|_| ())
+            .map_err(|_| EmbeddedTransportError::SendFailed)
+    }
 }
 
 impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
@@ -132,8 +157,56 @@ impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
             && (req.value >> 8) == 0x22
         {
             let _ = xfer.accept_with(CTAPHID_REPORT_DESCRIPTOR);
+            return;
+        }
+
+        // HID class requests IN que o driver Windows envia durante o start
+        // (GET_REPORT 0x01, GET_IDLE 0x02, GET_PROTOCOL 0x03). Stall aqui
+        // faz CM_PROB_FAILED_START 10 no composto; CTAPHID não usa essas
+        // features, então responde com payload zero.
+        if req.request_type == control::RequestType::Class
+            && req.recipient == control::Recipient::Interface
+        {
+            match req.request {
+                0x01 | 0x02 | 0x03 => {
+                    let _ = xfer.accept(|_| Ok(0));
+                    return;
+                }
+                // SET_* via IN com wLength=0 chegam aqui em alguns stacks;
+                // aceitar também para não travar enumeração.
+                0x09 | 0x0A | 0x0B => {
+                    let _ = xfer.accept(|_| Ok(0));
+                    return;
+                }
+                _ => {}
+            }
         }
         // Demais pedidos ficam sem resposta (stall pelo framework).
+    }
+
+    fn control_out(&mut self, xfer: ControlOut<B>) {
+        let req = *xfer.request();
+        if req.request_type == control::RequestType::Class
+            && req.recipient == control::Recipient::Interface
+        {
+            match req.request {
+                // SET_REPORT (0x09) — CTAPHID usa interrupt OUT, não control;
+                // apenas consome o estágio de dados.
+                // SET_IDLE (0x0A) / SET_PROTOCOL (0x0B) — sem payload, mas
+                // Windows os envia no barramento de controle durante o start.
+                0x09 | 0x0A | 0x0B => {
+                    let _ = xfer.accept();
+                    return;
+                }
+                // GET_* que por algum motivo cheguem como OUT (wLength=0):
+                // aceitar para não stallar.
+                0x01 | 0x02 | 0x03 => {
+                    let _ = xfer.accept();
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 }
 

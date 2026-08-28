@@ -28,10 +28,12 @@ from board.profiles import (  # noqa: E402
     GENERIC,
     NRF52840,
     RP2350,
+    RP2350_ZERO,
     STM32L4,
     TRANSPORT_USB_CCID,
     TRANSPORT_USB_HID,
     SecurityFeatures,
+    YUBIKEY_4_5,
 )
 
 TRANSPORT_NFC = 0x04
@@ -149,14 +151,32 @@ class TestAllProfilesSecurity:
     def test_all_profiles_have_unique_names(self):
         names = {profile.name for profile in ALL}
         assert "rp2350-fido" in names
-        assert len(ALL) == 5
+        assert "yubikey-4-5" in names
+        assert "rp2350-zero" in names
+        assert len(ALL) == 7
 
     def test_rp2350_is_in_all_profiles(self):
         assert RP2350 in ALL
+        assert RP2350_ZERO in ALL
+        assert YUBIKEY_4_5 in ALL
 
     def test_only_rp2350_has_security_features(self):
         for profile in ALL:
-            if profile is RP2350:
+            if profile in (RP2350, RP2350_ZERO, YUBIKEY_4_5):
                 assert profile.security is not None
             else:
                 assert profile.security is None
+
+    def test_yubikey_has_secure_boot_and_secure_lock(self):
+        sec = YUBIKEY_4_5.security
+        assert sec.secure_boot is True
+        assert sec.debug_disable is True
+        assert sec.otp_memory is True
+        assert sec.unique_id is True
+        assert sec.tamper_detection is True
+
+    def test_yubikey_differs_from_rp2350_by_tamper(self):
+        assert YUBIKEY_4_5.security.tamper_detection is True
+        assert RP2350.security.tamper_detection is False
+        assert YUBIKEY_4_5.aaguid[-1] == 0x07
+        assert RP2350_ZERO.aaguid[-1] == 0x06

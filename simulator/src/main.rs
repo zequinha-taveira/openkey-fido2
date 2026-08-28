@@ -2,14 +2,14 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process;
 
-use authenticator::EmbeddedAuthenticator;
+use authenticator::{EmbeddedAuthenticator, InsecureHostStorage};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ciborium::Value as CborValue;
 use ctap2::{
     AttestationCertificate, AttestationFormat, CredentialDescriptor, Ctap2Error, Extensions,
-    GetAssertionOptions, GetAssertionRequest, HmacSecretInput, MakeCredentialOptions,
-    MakeCredentialRequest, PublicKeyCredParams, RelyingParty, User,
+    GetAssertionOptions, GetAssertionRequest, MakeCredentialOptions, MakeCredentialRequest,
+    PublicKeyCredParams, RelyingParty, User,
 };
 use device_profile::{DeviceProfile, DeviceProfileBuilder, PinPolicy};
 use serde_json::{json, Value};
@@ -36,11 +36,14 @@ fn b64_encode(data: &[u8]) -> String {
     BASE64.encode(data)
 }
 
-fn b64_decode(value: &Value) -> Vec<u8> {
-    value
-        .as_str()
-        .map(|s| BASE64.decode(s).unwrap_or_default())
-        .unwrap_or_default()
+fn b64_decode(value: &Value) -> Result<Vec<u8>, String> {
+    match value {
+        Value::String(s) => BASE64
+            .decode(s)
+            .map_err(|e| format!("base64 invalido: {e}")),
+        Value::Null => Ok(Vec::new()),
+        _ => Err("campo base64 deve ser string".to_string()),
+    }
 }
 
 fn bool_field(obj: &Value, name: &str, default: bool) -> bool {
@@ -55,7 +58,8 @@ fn error_value(error: Box<dyn std::error::Error>) -> Value {
     if let Some(code) = error.downcast_ref::<Ctap2Error>() {
         json!({"ok": false, "code": code.as_u8(), "message": error.to_string()})
     } else {
-        json!({"ok": false, "code": 0x05, "message": error.to_string()})
+        // 0x7F (unspecified failure): 0x05 seria lido como TIMEOUT por hosts.
+        json!({"ok": false, "code": Ctap2Error::Unknown.as_u8(), "message": error.to_string()})
     }
 }
 
@@ -83,38 +87,99 @@ fn att_stmt_to_json(att_stmt: &std::collections::BTreeMap<i64, CborValue>) -> Va
     Value::Object(obj)
 }
 
-fn build_extensions(ext_val: Option<&Value>) -> Option<Extensions> {
-    let ext_val = ext_val?;
-    if ext_val.is_null() {
-        return None;
-    }
+fn build_extensions(ext_val: Option<&Value>) -> Result<Option<Extensions>, Value> {
+    let ext_val = match ext_val {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(None),
+    };
     let cred_protect = ext_val
         .get("credProtect")
         .and_then(Value::as_u64)
-        .map(|v| ctap2::CredProtectPolicy::from(v as u8));
-    let cred_blob = ext_val
-        .get("credBlob")
-        .map(b64_decode)
-        .filter(|b| !b.is_empty());
+        .map(|v| u8::try_from(v).unwrap_or(1));
+    let cred_blob = match ext_val.get("credBlob") {
+        Some(v) => {
+            let decoded = b64_decode(v)
+                .map_err(|msg| json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}))?;
+            if decoded.is_empty() {
+                None
+            } else {
+                Some(decoded)
+            }
+        }
+        None => None,
+    };
     let min_pin_length = ext_val
         .get("minPinLength")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let hmac_secret = ext_val.get("hmacSecret").map(|v| HmacSecretInput {
-        salt_enc: b64_decode(v.get("saltEnc").unwrap_or(&Value::Null)),
-        pin_uv_auth_protocol: v
-            .get("pinUvAuthProtocol")
-            .and_then(Value::as_u64)
-            .map(|p| p as u8),
-    });
+    // `hmac-secret` (CTAP 2.1 §12.5): booleano no MakeCredential ou mapa
+    // `{1: keyAgreement, 2: saltEnc, 3: saltAuth, 4: pinUvAuthProtocol}` no
+    // GetAssertion. O mapa JSON é convertido para as chaves inteiras da spec.
+    let hmac_secret = match ext_val.get("hmacSecret") {
+        Some(v) => {
+            let mapped = if v.is_boolean() {
+                CborValue::Bool(v.as_bool().unwrap())
+            } else {
+                let key_agreement = match v.get("keyAgreement") {
+                    Some(key) => {
+                        let x = b64_decode(key.get("x").unwrap_or(&Value::Null)).map_err(
+                            |msg| json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+                        )?;
+                        let y = b64_decode(key.get("y").unwrap_or(&Value::Null)).map_err(
+                            |msg| json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+                        )?;
+                        Some(CborValue::Map(vec![
+                            (CborValue::Integer(1.into()), CborValue::Integer(2.into())),
+                            (
+                                CborValue::Integer(3.into()),
+                                CborValue::Integer((-25).into()),
+                            ),
+                            (
+                                CborValue::Integer((-1).into()),
+                                CborValue::Integer(1.into()),
+                            ),
+                            (CborValue::Integer((-2).into()), CborValue::Bytes(x)),
+                            (CborValue::Integer((-3).into()), CborValue::Bytes(y)),
+                        ]))
+                    }
+                    None => None,
+                };
+                let mut entries = Vec::with_capacity(4);
+                if let Some(key) = key_agreement {
+                    entries.push((CborValue::Integer(1.into()), key));
+                }
+                if let Some(salt) = v.get("saltEnc") {
+                    let decoded = b64_decode(salt).map_err(
+                        |msg| json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+                    )?;
+                    entries.push((CborValue::Integer(2.into()), CborValue::Bytes(decoded)));
+                }
+                if let Some(auth) = v.get("saltAuth") {
+                    let decoded = b64_decode(auth).map_err(
+                        |msg| json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+                    )?;
+                    entries.push((CborValue::Integer(3.into()), CborValue::Bytes(decoded)));
+                }
+                if let Some(protocol) = v.get("pinUvAuthProtocol").and_then(Value::as_u64) {
+                    entries.push((
+                        CborValue::Integer(4.into()),
+                        CborValue::Integer((protocol as i64).into()),
+                    ));
+                }
+                CborValue::Map(entries)
+            };
+            Some(mapped)
+        }
+        None => None,
+    };
 
-    Some(Extensions {
+    Ok(Some(Extensions {
         cred_protect,
         cred_blob,
         min_pin_length,
         hmac_secret,
         large_blob_key: false,
-    })
+    }))
 }
 
 impl Simulator {
@@ -127,14 +192,20 @@ impl Simulator {
 
     fn with_storage_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
-            auth: EmbeddedAuthenticator::new_with_storage_path(path.clone(), simulator_profile())?,
+            auth: EmbeddedAuthenticator::new_with_insecure_host_storage(
+                InsecureHostStorage::new(path.clone()),
+                simulator_profile(),
+            )?,
             storage_path: Some(path),
         })
     }
 
     fn reset(&mut self) -> Value {
         let result = if let Some(path) = &self.storage_path {
-            EmbeddedAuthenticator::new_with_storage_path(path.clone(), simulator_profile())
+            EmbeddedAuthenticator::new_with_insecure_host_storage(
+                InsecureHostStorage::new(path.clone()),
+                simulator_profile(),
+            )
         } else {
             EmbeddedAuthenticator::new_with_profile(simulator_profile())
         };
@@ -189,8 +260,14 @@ impl Simulator {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let client_data = b64_decode(req.get("client_data").unwrap_or(&Value::Null));
-        let user_id = b64_decode(req.get("user_id").unwrap_or(&Value::Null));
+        let client_data = match b64_decode(req.get("client_data").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
+        let user_id = match b64_decode(req.get("user_id").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
 
         let pub_key_cred_params: Vec<PublicKeyCredParams> = req
             .get("algorithms")
@@ -207,20 +284,28 @@ impl Simulator {
             })
             .unwrap_or_default();
 
-        let exclude_list: Vec<CredentialDescriptor> = req
+        let exclude_list: Vec<CredentialDescriptor> = match req
             .get("exclude")
             .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| CredentialDescriptor {
-                        r#type: "public-key".to_string(),
-                        id: b64_decode(item),
-                        transports: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        {
+            Some(items) => {
+                let mut list = Vec::with_capacity(items.len());
+                for item in items {
+                    match b64_decode(item) {
+                        Ok(id) => list.push(CredentialDescriptor {
+                            r#type: "public-key".to_string(),
+                            id,
+                            transports: None,
+                        }),
+                        Err(msg) => {
+                            return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg})
+                        }
+                    }
+                }
+                list
+            }
+            None => Vec::new(),
+        };
 
         let options = req.get("options").cloned().unwrap_or_else(|| json!({}));
         let mc_options = MakeCredentialOptions {
@@ -230,7 +315,10 @@ impl Simulator {
             extended: false,
         };
 
-        let extensions = build_extensions(req.get("extensions"));
+        let extensions = match build_extensions(req.get("extensions")) {
+            Ok(v) => v,
+            Err(err_val) => return err_val,
+        };
 
         let request = MakeCredentialRequest {
             client_data_hash: client_data,
@@ -292,8 +380,15 @@ impl Simulator {
                     if let Some(policy) = ext.cred_protect {
                         ext_obj.insert("credProtect".to_string(), json!(policy));
                     }
-                    if let Some(secret) = ext.hmac_secret {
-                        ext_obj.insert("hmac-secret".to_string(), json!(b64_encode(&secret)));
+                    // §12.5: `true` no MakeCredential; bytes cifrados no GetAssertion.
+                    match ext.hmac_secret {
+                        Some(CborValue::Bool(enabled)) => {
+                            ext_obj.insert("hmac-secret".to_string(), json!(enabled));
+                        }
+                        Some(CborValue::Bytes(secret)) => {
+                            ext_obj.insert("hmac-secret".to_string(), json!(b64_encode(&secret)));
+                        }
+                        _ => {}
                     }
                     if let Some(obj) = result.as_object_mut() {
                         for (k, v) in ext_obj {
@@ -313,37 +408,63 @@ impl Simulator {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let credential_id = b64_decode(req.get("credential_id").unwrap_or(&Value::Null));
-        let client_data_hash = b64_decode(req.get("client_data_hash").unwrap_or(&Value::Null));
+        let credential_id = match b64_decode(req.get("credential_id").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
+        let client_data_hash = match b64_decode(req.get("client_data_hash").unwrap_or(&Value::Null))
+        {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
 
-        let allow_list: Vec<CredentialDescriptor> = req
+        let allow_list: Vec<CredentialDescriptor> = match req
             .get("allow_list")
             .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| CredentialDescriptor {
-                        r#type: "public-key".to_string(),
-                        id: b64_decode(item),
-                        transports: None,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        {
+            Some(items) => {
+                let mut list = Vec::with_capacity(items.len());
+                for item in items {
+                    match b64_decode(item) {
+                        Ok(id) => list.push(CredentialDescriptor {
+                            r#type: "public-key".to_string(),
+                            id,
+                            transports: None,
+                        }),
+                        Err(msg) => {
+                            return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg})
+                        }
+                    }
+                }
+                list
+            }
+            None => Vec::new(),
+        };
 
         let options = req.get("options").cloned().unwrap_or_else(|| json!({}));
         let up = bool_field(&options, "up", true);
         let uv = bool_field(&options, "uv", true);
 
-        let extensions = build_extensions(req.get("extensions"));
+        let extensions = match build_extensions(req.get("extensions")) {
+            Ok(v) => v,
+            Err(err_val) => return err_val,
+        };
 
         let request = GetAssertionRequest {
             rp_id,
-            credentials: vec![CredentialDescriptor {
-                r#type: "public-key".to_string(),
-                id: credential_id,
-                transports: None,
-            }],
+            // Campo wire `allowList`: só nomeia uma credencial quando o
+            // chamador fornece um ID; com ID vazio a descoberta é por RP
+            // (um descritor vazio aqui esconderia todas as credenciais na
+            // contagem de multi-assertion).
+            credentials: if credential_id.is_empty() {
+                Vec::new()
+            } else {
+                vec![CredentialDescriptor {
+                    r#type: "public-key".to_string(),
+                    id: credential_id,
+                    transports: None,
+                }]
+            },
             allow_list: if allow_list.is_empty() {
                 None
             } else {
@@ -387,7 +508,8 @@ impl Simulator {
                     if let Some(policy) = ext.cred_protect {
                         ext_obj.insert("credProtect".to_string(), json!(policy));
                     }
-                    if let Some(secret) = ext.hmac_secret {
+                    // §12.5: bytes cifrados sob o segredo compartilhado.
+                    if let Some(CborValue::Bytes(secret)) = ext.hmac_secret {
                         ext_obj.insert("hmac-secret".to_string(), json!(b64_encode(&secret)));
                     }
                     if let Some(obj) = result.as_object_mut() {
@@ -403,10 +525,23 @@ impl Simulator {
     }
 
     fn verify_assertion(&self, req: &Value) -> Value {
-        let credential_id = b64_decode(req.get("credential_id").unwrap_or(&Value::Null));
-        let auth_data = b64_decode(req.get("auth_data").unwrap_or(&Value::Null));
-        let signature = b64_decode(req.get("signature").unwrap_or(&Value::Null));
-        let client_data_hash = b64_decode(req.get("client_data_hash").unwrap_or(&Value::Null));
+        let credential_id = match b64_decode(req.get("credential_id").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
+        let auth_data = match b64_decode(req.get("auth_data").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
+        let signature = match b64_decode(req.get("signature").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
+        let client_data_hash = match b64_decode(req.get("client_data_hash").unwrap_or(&Value::Null))
+        {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
 
         let ctap = self.auth.get_webauthn_authenticator().get_ctap();
         let stored = ctap.get_storage().list_credentials();
@@ -423,10 +558,22 @@ impl Simulator {
                         .get_crypto()
                         .verify_p256(&credential.public_key, &data_to_sign, &signature)
                         .is_ok(),
+                    -35 => ctap
+                        .get_crypto()
+                        .verify_p384(&credential.public_key, &data_to_sign, &signature)
+                        .is_ok(),
                     -257 => ctap
                         .get_crypto()
                         .verify_rsa(&credential.public_key, &data_to_sign, &signature)
                         .is_ok(),
+                    -37 => ctap
+                        .get_crypto()
+                        .verify_rsa_pss(&credential.public_key, &data_to_sign, &signature)
+                        .is_ok(),
+                    -8 => ctap
+                        .get_crypto()
+                        .verify(&data_to_sign, &signature, &credential.public_key)
+                        .unwrap_or(false),
                     _ => ctap
                         .get_crypto()
                         .verify(&data_to_sign, &signature, &credential.public_key)
@@ -461,7 +608,10 @@ impl Simulator {
 
     fn process_command(&mut self, req: &Value) -> Value {
         let cmd = req.get("cmd").and_then(Value::as_u64).unwrap_or(0) as u8;
-        let data = b64_decode(req.get("data").unwrap_or(&Value::Null));
+        let data = match b64_decode(req.get("data").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
         match self.auth.process_command(cmd, data) {
             Ok(response) => json!({"ok": true, "cbor": b64_encode(&response)}),
             Err(error) => json!({"ok": false, "code": error.as_u8(), "message": error.to_string()}),
@@ -472,8 +622,14 @@ impl Simulator {
         use ctap2::client_pin::{self, ClientPin, ClientPinSubCommand};
 
         let sub = req.get("sub_command").and_then(Value::as_u64).unwrap_or(0) as u8;
-        let pin = b64_decode(req.get("pin").unwrap_or(&Value::Null));
-        let new_pin = b64_decode(req.get("new_pin").unwrap_or(&Value::Null));
+        let pin = match b64_decode(req.get("pin").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
+        let new_pin = match b64_decode(req.get("new_pin").unwrap_or(&Value::Null)) {
+            Ok(v) => v,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
 
         let ctap = self.auth.get_webauthn_authenticator_mut().get_ctap_mut();
 
@@ -487,7 +643,7 @@ impl Simulator {
         match sub_command {
             ClientPinSubCommand::GetPINRetries => {
                 let retries = ctap.get_pin_retries();
-                let blocked = client_pin::is_pin_blocked(ctap.get_storage());
+                let blocked = client_pin::is_pin_blocked(ctap);
                 json!({"ok": true, "retries": retries, "power_cycle_state": blocked})
             }
             ClientPinSubCommand::SetPIN => match ctap.set_pin(&pin) {
@@ -560,7 +716,9 @@ impl Simulator {
                     "rp_hash": b64_encode(&rps.rp_hash),
                     "total_rps": rps.total_rps,
                 }),
-                Err(error) => json!({"ok": false, "code": 0x04, "message": error.to_string()}),
+                Err(error) => {
+                    json!({"ok": false, "code": Ctap2Error::InvalidCbor.as_u8(), "message": error.to_string()})
+                }
             },
             Err(error) => json!({"ok": false, "code": error.as_u8(), "message": error.to_string()}),
         }
@@ -580,7 +738,9 @@ impl Simulator {
                     "rp_hash": b64_encode(&rps.rp_hash),
                     "total_rps": rps.total_rps,
                 }),
-                Err(error) => json!({"ok": false, "code": 0x04, "message": error.to_string()}),
+                Err(error) => {
+                    json!({"ok": false, "code": Ctap2Error::InvalidCbor.as_u8(), "message": error.to_string()})
+                }
             },
             Err(error) => json!({"ok": false, "code": error.as_u8(), "message": error.to_string()}),
         }

@@ -137,10 +137,12 @@ def test_flags_up_e_uv_refletem_options(auth):
     assert att_up.auth_data.is_user_present()
     assert not att_up.auth_data.is_user_verified()
 
+    # Pedir `uv` sem verificador disponível (sem PIN/token) não implica
+    # user verification: o bit UVR só é setado após verificação real.
     att_uv = register(
         auth, user_id=b"user-2", options={"rk": False, "uv": True, "up": False}
     )
-    assert att_uv.auth_data.is_user_verified()
+    assert not att_uv.auth_data.is_user_verified()
     assert not att_uv.auth_data.is_user_present()
 
 

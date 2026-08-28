@@ -45,7 +45,7 @@ zeroize = { version = "1.7", features = ["derive"] }
 rand = "0.8"
 x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }
 aes = "0.9"
-cbc = "0.1"
+cbc = "0.2"
 
 [profile.dev]
 opt-level = 2
@@ -63,3 +63,7 @@ panic = "abort"
 inherits = "release"
 debug = true
 strip = false
+
+[patch.crates-io]
+# Ring vendido (patch de selecao de fontes p/ thumbv8m) compartilhado com examples/rp2350-firmware.
+ring = { path = "examples/rp2350-firmware/vendor/ring" }

@@ -103,6 +103,48 @@ RP2350 = BoardProfile(
     reset_pin=10, irq_pin=11, led_pin=25, button_pin=13,
 )
 
+RP2350_ZERO = BoardProfile(
+    name="rp2350-zero",
+    aaguid=bytes([0x52, 0x50, 0x32, 0x33, 0x35, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06]),
+    transports=TRANSPORT_USB_HID | TRANSPORT_USB_CCID,
+    has_secure_storage=True,
+    has_crypto_accelerator=True,
+    security=SecurityFeatures(
+        secure_boot=True,
+        trust_zone=True,
+        hardware_rng=True,
+        sha256_accelerator=True,
+        debug_disable=True,
+        otp_memory=True,
+        unique_id=True,
+        tamper_detection=False,
+    ),
+    i2c_sda_pin=4, i2c_scl_pin=5,
+    spi_mosi_pin=6, spi_miso_pin=7, spi_clk_pin=8, cs_pin=9,
+    reset_pin=10, irq_pin=11, led_pin=16, button_pin=255,
+)
+
+YUBIKEY_4_5 = BoardProfile(
+    name="yubikey-4-5",
+    aaguid=bytes([0x59, 0x55, 0x42, 0x49, 0x4b, 0x45, 0x59, 0x34, 0x2d, 0x35, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07]),
+    transports=TRANSPORT_USB_HID | TRANSPORT_USB_CCID,
+    has_secure_storage=True,
+    has_crypto_accelerator=True,
+    security=SecurityFeatures(
+        secure_boot=True,
+        trust_zone=True,
+        hardware_rng=True,
+        sha256_accelerator=True,
+        debug_disable=True,
+        otp_memory=True,
+        unique_id=True,
+        tamper_detection=True,
+    ),
+    i2c_sda_pin=4, i2c_scl_pin=5,
+    spi_mosi_pin=6, spi_miso_pin=7, spi_clk_pin=8, cs_pin=9,
+    reset_pin=10, irq_pin=11, led_pin=16, button_pin=255,
+)
+
 GENERIC = BoardProfile(
     name="generic-fido",
     aaguid=bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF]),
@@ -114,4 +156,4 @@ GENERIC = BoardProfile(
     reset_pin=6, irq_pin=7, led_pin=8, button_pin=9,
 )
 
-ALL = [NRF52840, STM32L4, ESP32C3, RP2350, GENERIC]
+ALL = [NRF52840, STM32L4, ESP32C3, RP2350, RP2350_ZERO, YUBIKEY_4_5, GENERIC]

@@ -65,6 +65,26 @@ impl SecurityFeatures {
         }
     }
 
+    /// Perfil Yubico (YubiKey 4/5) — secure boot + secure lock completos.
+    ///
+    /// Deriva de `rp2350()` com `tamper_detection=true`.
+    ///
+    /// Secure Boot (`secure_boot`) + Secure Lock
+    /// (`debug_disable + otp_memory + unique_id + tamper_detection`)
+    /// para compatibilidade com o ecossistema YubiKey (ADR-0025).
+    pub const fn yubico() -> Self {
+        Self {
+            secure_boot: true,
+            trust_zone: true,
+            hardware_rng: true,
+            sha256_accelerator: true,
+            debug_disable: true,
+            otp_memory: true,
+            unique_id: true,
+            tamper_detection: true,
+        }
+    }
+
     /// Indica se ao menos um recurso de segurança está presente.
     pub fn has_any(&self) -> bool {
         self.secure_boot

@@ -99,13 +99,19 @@ just check-targets
 Além da crate `transport`, há um **binário `no_std` completo de boot** para o
 RP2350 em [`examples/rp2350-firmware/`](examples/rp2350-firmware/):
 
-```bash
-# Gerar o binário ELF para o RP2350 (Cortex-M33)
-cd examples/rp2350-firmware && cargo build
-
-# Via just
-just build-rp2350-firmware
-```
+ ```bash
+ # Gerar o binário ELF para o RP2350 (Cortex-M33)
+ cd examples/rp2350-firmware && cargo build
+ 
+ # Converter ELF → UF2 (RP2350)
+ # Para automação: picotool uf2 convert <elf> -t elf <out> -t uf2
+ picotool uf2 convert target/thumbv8m.main-none-eabihf/debug/rp2350-firmware -t elf target/thumbv8m.main-none-eabihf/debug/rp2350-firmware.uf2 -t uf2
+ # ou via just:
+ just build-rp2350-uf2
+ 
+ # Via just
+ just build-rp2350-firmware
+ ```
 
 O crate é **standalone** (workspace próprio, como `fuzz/`), portanto não é
 compilado por `cargo build --workspace`. Ele configura os clocks reais via

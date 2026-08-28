@@ -106,6 +106,15 @@ def _build_simulator():
             pytest.skip(f"cargo build falhou:\n{proc.stderr[-1000:]}")
 
 
+def _stop_simulator(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=RUN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
 def _start_simulator(storage_path=None):
     _build_simulator()
     args = [str(SIM_BIN)]
@@ -261,3 +270,88 @@ def test_persistence_with_multiple_credentials():
         except subprocess.TimeoutExpired:
             proc2.kill()
             proc2.wait()
+
+
+def test_pin_survives_restart():
+    """PIN configurado deve continuar válido após reiniciar o simulador."""
+    import base64
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage_path = Path(tmpdir) / "test_pin_persist.json"
+
+        client1, proc1 = _start_simulator(storage_path=storage_path)
+        result = client1._send(
+            {
+                "op": "client_pin",
+                "sub_command": 0x03,
+                "pin": _b64(b"1234"),
+            }
+        )
+        assert result["ok"], result
+        _stop_simulator(proc1)
+
+        client2, proc2 = _start_simulator(storage_path=storage_path)
+        retries = client2._send({"op": "client_pin", "sub_command": 0x01})
+        assert retries["ok"], retries
+        assert retries["retries"] == 8
+
+        change = client2._send(
+            {
+                "op": "client_pin",
+                "sub_command": 0x04,
+                "pin": _b64(b"1234"),
+                "new_pin": _b64(b"5678"),
+            }
+        )
+        assert change["ok"], change
+        _stop_simulator(proc2)
+
+
+def test_reset_persists_across_restart():
+    """Reset deve apagar credenciais do backend, não apenas da memória."""
+    import base64
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage_path = Path(tmpdir) / "test_reset_persist.json"
+
+        client1, proc1 = _start_simulator(storage_path=storage_path)
+        result = client1.make_credential(user_id=b"reset_restart_user")
+        assert result["ok"], result
+        cred_id = base64.b64decode(result["credential_id"])
+        _stop_simulator(proc1)
+
+        client2, proc2 = _start_simulator(storage_path=storage_path)
+        asserted = client2.get_assertion(credential_id=cred_id)
+        assert asserted["ok"], asserted
+        reset = client2._send({"op": "process_command", "cmd": 0x07})
+        assert reset["ok"], reset
+        _stop_simulator(proc2)
+
+        client3, proc3 = _start_simulator(storage_path=storage_path)
+        asserted = client3.get_assertion(credential_id=cred_id)
+        assert not asserted["ok"], asserted
+        _stop_simulator(proc3)
+
+
+def test_sign_counter_survives_restart():
+    """signCount deve permanecer monotônico entre reinicializações."""
+    import base64
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        storage_path = Path(tmpdir) / "test_sign_count_persist.json"
+
+        client1, proc1 = _start_simulator(storage_path=storage_path)
+        result = client1.make_credential(user_id=b"counter_user")
+        assert result["ok"], result
+        cred_id = base64.b64decode(result["credential_id"])
+
+        asserted = client1.get_assertion(credential_id=cred_id)
+        assert asserted["ok"], asserted
+        count_before = asserted["sign_count"]
+        _stop_simulator(proc1)
+
+        client2, proc2 = _start_simulator(storage_path=storage_path)
+        asserted = client2.get_assertion(credential_id=cred_id)
+        assert asserted["ok"], asserted
+        assert asserted["sign_count"] > count_before
+        _stop_simulator(proc2)

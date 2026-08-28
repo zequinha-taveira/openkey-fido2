@@ -1,3 +1,4 @@
+use alloc::vec;
 use alloc::vec::Vec;
 use board_generic::BoardDefinition;
 use board_generic::{
@@ -115,6 +116,43 @@ pub enum Extension {
     HmacSecret,
 }
 
+/// Identidade USB do produto (VID/PID).
+///
+/// `None` = identidade padrão pid.codes `1209:0001`. `Some(1050:0407)` =
+/// modo compatível YubiKey 4/5 para ykman/Yubico Authenticator (ADR-0025).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UsbIdentity {
+    /// Vendor ID (USB-IF).
+    pub vid: u16,
+    /// Product ID.
+    pub pid: u16,
+}
+
+impl UsbIdentity {
+    /// Cria a identidade VID:PID.
+    pub const fn new(vid: u16, pid: u16) -> Self {
+        Self { vid, pid }
+    }
+
+    /// pid.codes openkey-fido2 padrão.
+    pub const fn openkey() -> Self {
+        Self {
+            vid: 0x1209,
+            pid: 0x0001,
+        }
+    }
+
+    /// Yubico YubiKey 4/5 (OTP+FIDO+CCID, `0x0407`).
+    ///
+    /// **NÃO PARA DISTRIBUIÇÃO** — VID `0x1050` pertence à Yubico (USB-IF).
+    pub const fn yubikey() -> Self {
+        Self {
+            vid: 0x1050,
+            pid: 0x0407,
+        }
+    }
+}
+
 /// Product-level configuration that combines a board definition with
 /// product-specific settings (vendor, firmware, enabled features).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,10 +199,32 @@ pub struct DeviceProfile {
     pub max_cred_blob_length: u32,
     /// Número de relying parties registrados.
     pub rp_count: u32,
-    /// Transporte que o autenticador instancia em runtime.
+    /// Transporte que o autenticador instancia em runtime (legado, primeiro da lista).
     pub transport_config: Option<TransportConfig>,
+    /// Transportes ativos multi-protocolo (ADR-0024). Quando não vazio, prevalece
+    /// sobre `transport_config`; `transport_config` permanece como view da primeira
+    /// posição para compatibilidade com call sites legados.
+    pub transport_configs: Vec<TransportConfig>,
     /// Recursos de segurança herdados do board.
     pub security: SecurityFeatures,
+    /// Identidade USB do produto. `None` = padrão pid.codes.
+    pub usb: Option<UsbIdentity>,
+}
+
+impl DeviceProfile {
+    /// Transportes ativos considerados pelo `EmbeddedAuthenticator`.
+    ///
+    /// Retorna `transport_configs` quando não vazio; caso contrário, converte
+    /// o legado `transport_config` singular em fatia unitária.
+    pub fn active_transport_configs(&self) -> Vec<TransportConfig> {
+        if !self.transport_configs.is_empty() {
+            self.transport_configs.clone()
+        } else if let Some(cfg) = &self.transport_config {
+            vec![cfg.clone()]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 /// Builder that derives sensible defaults from a [`BoardDefinition`]
@@ -192,8 +252,9 @@ pub struct DeviceProfileBuilder {
     max_credential_id_length: u16,
     max_cred_blob_length: u32,
     rp_count: u32,
-    transport_config: Option<TransportConfig>,
+    transport_configs: Vec<TransportConfig>,
     security: SecurityFeatures,
+    usb: Option<UsbIdentity>,
 }
 
 impl DeviceProfileBuilder {
@@ -226,8 +287,9 @@ impl DeviceProfileBuilder {
             max_credential_id_length: 64,
             max_cred_blob_length: 32,
             rp_count: 0,
-            transport_config: None,
+            transport_configs: Vec::new(),
             security: SecurityFeatures::none(),
+            usb: None,
         }
     }
 
@@ -331,15 +393,51 @@ impl DeviceProfileBuilder {
         self
     }
 
-    /// Define o transporte ativo instanciado pelo autenticador.
+    /// Define o transporte ativo instanciado pelo autenticador (legado).
+    ///
+    /// Empurra `config` para a lista multi-protocolo caso ainda não exista.
     pub fn transport_config(mut self, config: TransportConfig) -> Self {
-        self.transport_config = Some(config);
+        if !self.transport_configs.contains(&config) {
+            self.transport_configs.push(config);
+        }
+        self
+    }
+
+    /// Define múltiplos transportes ativos de uma só vez (multi-protocolo).
+    pub fn transport_configs(mut self, configs: Vec<TransportConfig>) -> Self {
+        self.transport_configs = configs;
+        self
+    }
+
+    /// Adiciona um transporte adicional sem duplicatas (multi-protocolo).
+    pub fn add_transport(mut self, config: TransportConfig) -> Self {
+        if !self.transport_configs.contains(&config) {
+            self.transport_configs.push(config);
+        }
         self
     }
 
     /// Substitui os recursos de segurança herdados do board.
     pub const fn security(mut self, features: SecurityFeatures) -> Self {
         self.security = features;
+        self
+    }
+
+    /// Define a identidade USB do produto (VID:PID).
+    pub const fn usb(mut self, identity: UsbIdentity) -> Self {
+        self.usb = Some(identity);
+        self
+    }
+
+    /// Atalho para VID:PID explícito.
+    pub const fn usb_vid_pid(mut self, vid: u16, pid: u16) -> Self {
+        self.usb = Some(UsbIdentity::new(vid, pid));
+        self
+    }
+
+    /// Atalho YubiKey 4/5 (`1050:0407`, não para distribuição).
+    pub const fn yubikey_usb(mut self) -> Self {
+        self.usb = Some(UsbIdentity::yubikey());
         self
     }
 
@@ -369,6 +467,7 @@ impl DeviceProfileBuilder {
 
     /// Materializa o [`DeviceProfile`] final.
     pub fn build(self) -> DeviceProfile {
+        let legacy = self.transport_configs.first().cloned();
         DeviceProfile {
             product_name: self.product_name,
             vendor_name: self.vendor_name,
@@ -391,8 +490,10 @@ impl DeviceProfileBuilder {
             max_credential_id_length: self.max_credential_id_length,
             max_cred_blob_length: self.max_cred_blob_length,
             rp_count: self.rp_count,
-            transport_config: self.transport_config,
+            transport_config: legacy.clone(),
+            transport_configs: self.transport_configs,
             security: self.security,
+            usb: self.usb,
         }
     }
 }
@@ -400,5 +501,118 @@ impl DeviceProfileBuilder {
 impl Default for DeviceProfileBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_single_transport_config_is_legacy_compatible() {
+        let profile = DeviceProfileBuilder::new()
+            .transport_config(TransportConfig::usb_hid())
+            .build();
+        assert_eq!(
+            profile.transport_config.as_ref().unwrap().transport_type,
+            TransportType::UsbHid
+        );
+        assert_eq!(profile.transport_configs.len(), 1);
+        assert_eq!(
+            profile.active_transport_configs()[0].transport_type,
+            TransportType::UsbHid
+        );
+    }
+
+    #[test]
+    fn test_multi_transport_via_add_transport() {
+        let profile = DeviceProfileBuilder::new()
+            .transport_config(TransportConfig::usb_hid())
+            .add_transport(TransportConfig::usb_ccid())
+            .add_transport(TransportConfig::nfc())
+            .add_transport(TransportConfig::ble_gatt())
+            .build();
+        assert_eq!(profile.transport_configs.len(), 4);
+        // Legado ainda aponta para o primeiro.
+        assert_eq!(
+            profile.transport_config.as_ref().unwrap().transport_type,
+            TransportType::UsbHid
+        );
+        let active = profile.active_transport_configs();
+        assert_eq!(active.len(), 4);
+        assert!(active.contains(&TransportConfig::usb_hid()));
+        assert!(active.contains(&TransportConfig::usb_ccid()));
+        assert!(active.contains(&TransportConfig::nfc()));
+        assert!(active.contains(&TransportConfig::ble_gatt()));
+    }
+
+    #[test]
+    fn test_multi_transport_via_transport_configs_vec() {
+        let profile = DeviceProfileBuilder::new()
+            .transport_configs(vec![
+                TransportConfig::usb_hid(),
+                TransportConfig::usb_ccid(),
+            ])
+            .build();
+        assert_eq!(profile.transport_configs.len(), 2);
+        assert_eq!(profile.active_transport_configs().len(), 2);
+    }
+
+    #[test]
+    fn test_add_transport_ignores_duplicates() {
+        let profile = DeviceProfileBuilder::new()
+            .transport_config(TransportConfig::usb_hid())
+            .add_transport(TransportConfig::usb_hid())
+            .build();
+        assert_eq!(profile.transport_configs.len(), 1);
+    }
+
+    #[test]
+    fn test_active_configs_empty_when_no_transport() {
+        let profile = DeviceProfileBuilder::new().build();
+        assert!(profile.transport_config.is_none());
+        assert!(profile.transport_configs.is_empty());
+        assert!(profile.active_transport_configs().is_empty());
+    }
+
+    #[test]
+    fn test_usb_identity_yubikey() {
+        let profile = DeviceProfileBuilder::new().yubikey_usb().build();
+        assert_eq!(profile.usb, Some(UsbIdentity::yubikey()));
+        assert_eq!(profile.usb.unwrap().vid, 0x1050);
+        assert_eq!(profile.usb.unwrap().pid, 0x0407);
+    }
+
+    #[test]
+    fn test_usb_vid_pid_explicit() {
+        let profile = DeviceProfileBuilder::new()
+            .usb_vid_pid(0x1050, 0x0407)
+            .build();
+        assert_eq!(profile.usb.unwrap().vid, 0x1050);
+        assert_eq!(profile.usb.unwrap().pid, 0x0407);
+    }
+
+    #[test]
+    fn test_yubikey_board_profile_propagates_secure_boot_and_lock() {
+        let profile =
+            DeviceProfileBuilder::from_board(&board_generic::profiles::YUBIKEY_4_5).build();
+        assert!(profile.security.secure_boot);
+        assert!(profile.security.debug_disable);
+        assert!(profile.security.tamper_detection);
+        assert!(profile.security.otp_memory);
+    }
+
+    #[test]
+    fn test_yubikey_vendor_usb_profile() {
+        let profile = DeviceProfileBuilder::from_board(&board_generic::profiles::YUBIKEY_4_5)
+            .vendor_name("Yubico")
+            .product_name("YubiKey 4/5")
+            .yubikey_usb()
+            .build();
+        assert_eq!(profile.vendor_name, "Yubico");
+        assert_eq!(profile.product_name, "YubiKey 4/5");
+        assert_eq!(profile.usb, Some(UsbIdentity::new(0x1050, 0x0407)));
+        assert!(profile.security.secure_boot);
+        assert!(profile.security.tamper_detection);
     }
 }

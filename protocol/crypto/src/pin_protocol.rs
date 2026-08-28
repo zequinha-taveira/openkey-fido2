@@ -11,13 +11,12 @@
 //! Ambos usam acordo de chaves P-256 (ECDH) via `ring`; o segredo efêmero `Z`
 //! é a coordenada x do ponto compartilhado (32 bytes, big-endian).
 
-use aes::cipher::generic_array::typenum::U16;
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{consts::U16, Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use aes::Aes256;
+use alloc::boxed::Box;
+use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
-use cbc::{Decryptor, Encryptor};
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{compiler_fence, Ordering};
 use ring::agreement::{self, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
@@ -34,16 +33,29 @@ pub const ECDH_SHARED_SECRET_LEN: usize = 32;
 pub const AES_BLOCK_LEN: usize = 16;
 /// Tamanho do plaintext preenchido de PINs (máx. 63 bytes + 1 de padding).
 pub const PIN_PAD_LEN: usize = 64;
+/// Tamanho do hash de PIN comparado pelo autenticador:
+/// `LEFT(SHA-256(PIN),16)` (`CurrentPIN`/`pinHashEnc`, CTAP 2.1 §6.5.5.5).
+pub const PIN_HASH_LEN: usize = 16;
 
-type Error = Box<dyn std::error::Error>;
+type Error = Box<dyn core::error::Error>;
 
 /// Wrapper que zera o conteúdo sensível ao ser dropado.
+///
+/// Este é o **único** `Zeroizing` manual do crate `crypto` (canônico). `hybrid.rs`
+/// reutiliza este tipo via `crate::pin_protocol::Zeroizing` para evitar triplicação;
+/// não duplicar. Preferimos este wrapper a `zeroize::Zeroizing` aqui porque a
+/// bound `AsMut<[u8]>` cobre `Vec<u8>` e `[u8; N]` sem exigir `Zeroize` impl,
+/// e o `Drop` usa `compiler_fence` explícito conforme ADR-0006.
 pub struct Zeroizing<T: AsMut<[u8]>>(T);
 
 impl<T: AsMut<[u8]>> Drop for Zeroizing<T> {
     fn drop(&mut self) {
         for byte in self.0.as_mut() {
-            *byte = 0;
+            // `write_volatile` impede que o otimizador elimine a limpeza
+            // (necessário com LTO), conforme `zeroize` crate faz internamente.
+            unsafe {
+                core::ptr::write_volatile(byte, 0);
+            }
         }
         compiler_fence(Ordering::SeqCst);
     }
@@ -60,6 +72,12 @@ impl<T: AsMut<[u8]>> Deref for Zeroizing<T> {
 impl<T: AsMut<[u8]>> DerefMut for Zeroizing<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl<T: AsMut<[u8]>> core::fmt::Debug for Zeroizing<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Zeroizing([redacted])")
     }
 }
 
@@ -215,6 +233,31 @@ impl PinUvProtocol {
         }
     }
 
+    /// Decifra e exige um plaintext de tamanho exato, **sem remover padding**.
+    ///
+    /// Para plaintexts que a spec define sem preenchimento — como o
+    /// `pinHashEnc`, cujo conteúdo é exatamente `LEFT(SHA-256(PIN),16)`
+    /// (CTAP 2.1 §6.5.5.5) — usar [`strip_zero_padding`](crate::pin_protocol::strip_zero_padding)
+    /// rejeitaria ~1/256 dos PINs corretos cujo prefixo do hash termina em
+    /// 0x00. Retorna `Err` se o plaintext decifrado for menor que `expected`.
+    pub fn decrypt_exact(
+        &self,
+        shared_secret: &[u8],
+        ciphertext: &[u8],
+        expected: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let plaintext = self.decrypt(shared_secret, ciphertext)?;
+        if plaintext.len() < expected {
+            return Err(format!(
+                "Plaintext must have at least {} bytes, got {}",
+                expected,
+                plaintext.len()
+            )
+            .into());
+        }
+        Ok(plaintext[..expected].to_vec())
+    }
+
     /// Computa o MAC de autenticação do protocolo.
     ///
     /// - Protocolo 1: primeiros 16 bytes de HMAC-SHA-256(key, message).
@@ -274,7 +317,10 @@ impl hkdf::KeyType for OkmLen {
 
 /// AES-256-CBC bruto (sem padding) — o protocolo CTAP2 exige plaintexts
 /// múltiplos do bloco e nunca adiciona padding (CTAP 2.1 §6.5.6/§6.5.7).
-#[allow(clippy::manual_is_multiple_of)]
+/// Implementação manual de CBC para compatibilidade com aes 0.9 + cipher 0.5
+/// (hybrid-array) e aes 0.8 (generic-array) via `cipher::Array`.
+#[allow(unknown_lints)]
+#[allow(clippy::manual_is_multiple_of, clippy::chunks_exact_to_as_chunks)]
 pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
     if key.len() != 32 {
         return Err("AES-256 key must be 32 bytes".into());
@@ -285,19 +331,25 @@ pub fn aes256_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
     if data.len() % AES_BLOCK_LEN != 0 {
         return Err("AES-CBC input must be a multiple of 16 bytes".into());
     }
-    let mut buf = data.to_vec();
-    let mut cipher =
-        Encryptor::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
-    for chunk in buf.chunks_exact_mut(AES_BLOCK_LEN) {
-        let block: &mut GenericArray<u8, U16> = GenericArray::from_mut_slice(chunk);
-        cipher.encrypt_block_mut(block);
+    let cipher = Aes256::new_from_slice(key).map_err(|e| format!("AES-256 key error: {:?}", e))?;
+    let mut prev = Array::<u8, U16>::try_from(iv).unwrap();
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(AES_BLOCK_LEN) {
+        let mut block = Array::<u8, U16>::try_from(chunk).unwrap();
+        for i in 0..AES_BLOCK_LEN {
+            block[i] ^= prev[i];
+        }
+        cipher.encrypt_block(&mut block);
+        out.extend_from_slice(&block);
+        prev = block;
     }
-    Ok(buf)
+    Ok(out)
 }
 
 /// AES-256-CBC bruto (sem padding), decifrando dados de
 /// [`aes256_cbc_encrypt`].
-#[allow(clippy::manual_is_multiple_of)]
+#[allow(unknown_lints)]
+#[allow(clippy::manual_is_multiple_of, clippy::chunks_exact_to_as_chunks)]
 pub fn aes256_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
     if key.len() != 32 {
         return Err("AES-256 key must be 32 bytes".into());
@@ -308,14 +360,20 @@ pub fn aes256_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>,
     if data.len() % AES_BLOCK_LEN != 0 {
         return Err("AES-CBC input must be a multiple of 16 bytes".into());
     }
-    let mut buf = data.to_vec();
-    let mut cipher =
-        Decryptor::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
-    for chunk in buf.chunks_exact_mut(AES_BLOCK_LEN) {
-        let block: &mut GenericArray<u8, U16> = GenericArray::from_mut_slice(chunk);
-        cipher.decrypt_block_mut(block);
+    let cipher = Aes256::new_from_slice(key).map_err(|e| format!("AES-256 key error: {:?}", e))?;
+    let mut prev = Array::<u8, U16>::try_from(iv).unwrap();
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(AES_BLOCK_LEN) {
+        let block = Array::<u8, U16>::try_from(chunk).unwrap();
+        let mut plain = block;
+        cipher.decrypt_block(&mut plain);
+        for i in 0..AES_BLOCK_LEN {
+            plain[i] ^= prev[i];
+        }
+        out.extend_from_slice(&plain);
+        prev = block;
     }
-    Ok(buf)
+    Ok(out)
 }
 
 /// Preenche `data` à direita com zeros até 64 bytes (formato `paddedPin`
@@ -377,6 +435,14 @@ mod tests {
     fn test_v1_kdf_vector() {
         let proto = PinUvProtocol::new(1).unwrap();
         assert_eq!(proto.kdf(&Z).unwrap(), V1_KDF_EXPECTED);
+    }
+
+    /// Chave de 64 bytes do protocolo 2 (HMAC || AES), como nos vetores acima.
+    fn v2_full_key() -> [u8; 64] {
+        let mut key = [0u8; 64];
+        key[..32].copy_from_slice(&V2_HMAC_KEY_EXPECTED);
+        key[32..].copy_from_slice(&V2_AES_KEY_EXPECTED);
+        key
     }
 
     #[test]
@@ -474,6 +540,53 @@ mod tests {
     fn test_encrypt_rejects_non_block_multiple() {
         let proto = PinUvProtocol::new(1).unwrap();
         assert!(proto.encrypt(&V1_KDF_EXPECTED, b"short").is_err());
+    }
+
+    #[test]
+    fn test_decrypt_exact_v1_returns_exact_prefix() {
+        let proto = PinUvProtocol::new(1).unwrap();
+        // pinHashEnc: plaintext de 16 bytes cifrado sem padding adicional.
+        let plaintext = [0x5Au8; PIN_HASH_LEN];
+        let ct = proto.encrypt(&V1_KDF_EXPECTED, &plaintext).unwrap();
+        assert_eq!(ct.len(), AES_BLOCK_LEN);
+        let out = proto
+            .decrypt_exact(&V1_KDF_EXPECTED, &ct, PIN_HASH_LEN)
+            .unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_exact_v2_returns_exact_prefix() {
+        let proto = PinUvProtocol::new(2).unwrap();
+        let key = v2_full_key();
+        let plaintext = [0xA7u8; PIN_HASH_LEN];
+        let ct = proto.encrypt(&key, &plaintext).unwrap();
+        let out = proto.decrypt_exact(&key, &ct, PIN_HASH_LEN).unwrap();
+        assert_eq!(out, plaintext);
+    }
+
+    #[test]
+    fn test_decrypt_exact_rejects_short_plaintext() {
+        let proto = PinUvProtocol::new(1).unwrap();
+        let ct = proto.encrypt(&V1_KDF_EXPECTED, &[0u8; 16]).unwrap();
+        // 16 bytes decifrados não bastam para um pedido de 32.
+        assert!(proto.decrypt_exact(&V1_KDF_EXPECTED, &ct, 32).is_err());
+    }
+
+    #[test]
+    fn test_decrypt_exact_preserves_trailing_zero_byte() {
+        // Cenário do defeito: hash cujo último byte é 0x00 não pode ser
+        // truncado como padding.
+        let mut plaintext = [0x11u8; PIN_HASH_LEN];
+        plaintext[PIN_HASH_LEN - 1] = 0x00;
+        let proto = PinUvProtocol::new(1).unwrap();
+        let ct = proto.encrypt(&V1_KDF_EXPECTED, &plaintext).unwrap();
+        let out = proto
+            .decrypt_exact(&V1_KDF_EXPECTED, &ct, PIN_HASH_LEN)
+            .unwrap();
+        assert_eq!(out, plaintext);
+        // O mesmo plaintext passando por strip_zero_padding perderia o byte:
+        assert_ne!(strip_zero_padding(&out).unwrap().len(), PIN_HASH_LEN);
     }
 
     #[test]

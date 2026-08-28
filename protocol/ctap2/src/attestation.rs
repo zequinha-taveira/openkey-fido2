@@ -1,4 +1,5 @@
 use alloc::collections::BTreeMap;
+use alloc::vec;
 use alloc::vec::Vec;
 use ciborium::value::Integer;
 use ciborium::Value;
@@ -56,10 +57,43 @@ pub struct AttestationCertificate {
 /// is available, or `attStmt = { alg: int, sig: bytes, ecdaaKeyId: bytes }` for
 /// ECDAA. Self-attested variant (no x5c) signs with the credential's own key.
 pub struct PackedAttestation<'a> {
-    /// Algoritmo COSE da assinatura (-7 ES256, -8 EdDSA).
+    /// Algoritmo COSE da assinatura (-7 ES256, -8 EdDSA, -35 ES384, -257 RS256, -37 PS256).
     pub algorithm: i32,
     /// Certificado do lote; `None` produz a variante self-attested.
     pub certificate: Option<&'a AttestationCertificate>,
+}
+
+/// Dispatch de assinatura por algoritmo COSE (-7 ES256, -8 EdDSA, -35 ES384,
+/// -37 PS256, -257 RS256). Centraliza o roteamento para que `Packed` e
+/// `Self` não divirjam.
+fn sign_for_attestation(
+    crypto: &CryptoEngine,
+    algorithm: i32,
+    private_key: &[u8],
+    data: &[u8],
+) -> Result<Vec<u8>, Ctap2Error> {
+    match algorithm {
+        -7 => crypto
+            .sign_p256(private_key, data)
+            .map_err(|_| Ctap2Error::Unknown),
+        -35 => crypto
+            .sign_p384(private_key, data)
+            .map_err(|_| Ctap2Error::Unknown),
+        #[cfg(feature = "rs256")]
+        -257 => crypto
+            .sign_rsa(private_key, data)
+            .map_err(|_| Ctap2Error::Unknown),
+        #[cfg(feature = "rs256")]
+        -37 => crypto
+            .sign_rsa_pss(private_key, data)
+            .map_err(|_| Ctap2Error::Unknown),
+        -8 => crypto
+            .sign(data, private_key)
+            .map_err(|_| Ctap2Error::Unknown),
+        #[cfg(not(feature = "rs256"))]
+        -257 | -37 => Err(Ctap2Error::UnsupportedAlgorithm),
+        _ => Err(Ctap2Error::UnsupportedAlgorithm),
+    }
 }
 
 impl<'a> PackedAttestation<'a> {
@@ -80,24 +114,11 @@ impl<'a> PackedAttestation<'a> {
         credential_key: Option<&[u8]>,
         crypto: &CryptoEngine,
     ) -> Result<BTreeMap<i64, Value>, Ctap2Error> {
-        let signature = match self.certificate {
-            Some(cert) => {
-                if self.algorithm == -7 {
-                    crypto.sign_p256(&cert.private_key, data_to_sign)
-                } else {
-                    crypto.sign(data_to_sign, &cert.private_key)
-                }
-            }
-            None => {
-                let cred_key = credential_key.ok_or(Ctap2Error::InvalidParameter)?;
-                if self.algorithm == -7 {
-                    crypto.sign_p256(cred_key, data_to_sign)
-                } else {
-                    crypto.sign(data_to_sign, cred_key)
-                }
-            }
-        }
-        .map_err(|_| Ctap2Error::InvalidData)?;
+        let private_key = match self.certificate {
+            Some(cert) => &cert.private_key,
+            None => credential_key.ok_or(Ctap2Error::InvalidParameter)?,
+        };
+        let signature = sign_for_attestation(crypto, self.algorithm, private_key, data_to_sign)?;
 
         let mut att_stmt: BTreeMap<i64, Value> = BTreeMap::new();
         att_stmt.insert(3, Value::Integer(Integer::from(self.algorithm)));
@@ -128,12 +149,7 @@ impl SelfAttestation {
         algorithm: i32,
         crypto: &CryptoEngine,
     ) -> Result<BTreeMap<i64, Value>, Ctap2Error> {
-        let signature = if algorithm == -7 {
-            crypto.sign_p256(credential_key, data_to_sign)
-        } else {
-            crypto.sign(data_to_sign, credential_key)
-        }
-        .map_err(|_| Ctap2Error::InvalidData)?;
+        let signature = sign_for_attestation(crypto, algorithm, credential_key, data_to_sign)?;
 
         let mut att_stmt: BTreeMap<i64, Value> = BTreeMap::new();
         att_stmt.insert(3, Value::Integer(Integer::from(algorithm)));
@@ -212,5 +228,123 @@ mod tests {
         cert.zeroize();
 
         assert!(cert.private_key.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn test_self_attestation_es256() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (private_key, _) = crypto.generate_p256_key_pair().unwrap();
+        let data = b"test data es256";
+        let att_stmt = SelfAttestation::generate(data, &private_key, -7, &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-7)));
+        assert!(att_stmt.contains_key(&2));
+    }
+
+    #[test]
+    fn test_self_attestation_es384() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (private_key, _) = crypto.generate_p384_key_pair().unwrap();
+        let data = b"test data es384";
+        let att_stmt = SelfAttestation::generate(data, &private_key, -35, &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-35)));
+        assert!(att_stmt.contains_key(&2));
+    }
+
+    #[test]
+    fn test_packed_attestation_es256_self_attested() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (private_key, _) = crypto.generate_p256_key_pair().unwrap();
+        let data = b"data es256 packed";
+        let packed = PackedAttestation::new(-7, None);
+        let att_stmt = packed.generate(data, Some(&private_key), &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-7)));
+        assert!(att_stmt.contains_key(&2));
+        assert!(!att_stmt.contains_key(&1));
+    }
+
+    #[test]
+    fn test_packed_attestation_es384_self_attested() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (private_key, _) = crypto.generate_p384_key_pair().unwrap();
+        let data = b"data es384 packed";
+        let packed = PackedAttestation::new(-35, None);
+        let att_stmt = packed.generate(data, Some(&private_key), &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-35)));
+        assert!(att_stmt.contains_key(&2));
+    }
+
+    #[test]
+    fn test_packed_attestation_es256_with_cert() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (cert_private_key, _) = crypto.generate_p256_key_pair().unwrap();
+        let cert = AttestationCertificate {
+            cert: vec![0x30, 0x82, 0x01, 0x00],
+            private_key: cert_private_key,
+        };
+        let data = b"data es256 cert";
+        let packed = PackedAttestation::new(-7, Some(&cert));
+        let att_stmt = packed.generate(data, None, &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-7)));
+        assert!(att_stmt.contains_key(&1));
+    }
+
+    #[test]
+    fn test_packed_attestation_es384_with_cert() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (cert_private_key, _) = crypto.generate_p384_key_pair().unwrap();
+        let cert = AttestationCertificate {
+            cert: vec![0x30, 0x82, 0x01, 0x00],
+            private_key: cert_private_key,
+        };
+        let data = b"data es384 cert";
+        let packed = PackedAttestation::new(-35, Some(&cert));
+        let att_stmt = packed.generate(data, None, &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-35)));
+        assert!(att_stmt.contains_key(&1));
+    }
+
+    #[test]
+    #[cfg(feature = "rs256")]
+    fn test_self_attestation_rs256() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (private_key, _, _) = crypto.generate_rsa_key_pair().unwrap();
+        let data = b"test data rs256";
+        let att_stmt = SelfAttestation::generate(data, &private_key, -257, &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-257)));
+    }
+
+    #[test]
+    #[cfg(feature = "rs256")]
+    fn test_self_attestation_ps256() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (private_key, _, _) = crypto.generate_rsa_key_pair().unwrap();
+        let data = b"test data ps256";
+        let att_stmt = SelfAttestation::generate(data, &private_key, -37, &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-37)));
+    }
+
+    #[test]
+    #[cfg(feature = "rs256")]
+    fn test_packed_attestation_rs256_with_cert() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (cert_private_key, _, _) = crypto.generate_rsa_key_pair().unwrap();
+        let cert = AttestationCertificate {
+            cert: vec![0x30, 0x82, 0x01, 0x00],
+            private_key: cert_private_key,
+        };
+        let data = b"data rs256 cert";
+        let packed = PackedAttestation::new(-257, Some(&cert));
+        let att_stmt = packed.generate(data, None, &crypto).unwrap();
+        assert_eq!(att_stmt[&3], Value::Integer(Integer::from(-257)));
+        assert!(att_stmt.contains_key(&1));
+    }
+
+    #[test]
+    fn test_attestation_unsupported_algorithm() {
+        let crypto = CryptoEngine::new().unwrap();
+        let (private_key, _) = crypto.generate_key_pair().unwrap();
+        let data = b"data";
+        let result = SelfAttestation::generate(data, &private_key, -999, &crypto);
+        assert!(matches!(result, Err(Ctap2Error::UnsupportedAlgorithm)));
     }
 }

@@ -1,3 +1,7 @@
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use crypto::CryptoEngine;
 use ctap2::{
     Ctap2Authenticator, Ctap2Error, GetAssertionRequest, GetAssertionResponse,
@@ -53,7 +57,7 @@ impl WebAuthnAuthenticator {
         aaguid: [u8; 16],
         crypto: CryptoEngine,
         storage: storage::StorageEngine,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, Box<dyn core::error::Error>> {
         debug!("WebAuthn authenticator initialized");
         let ctap = Ctap2Authenticator::new(aaguid, crypto, storage)?;
         Ok(Self { ctap })
@@ -64,7 +68,7 @@ impl WebAuthnAuthenticator {
     pub fn make_credential(
         &mut self,
         request: MakeCredentialRequest,
-    ) -> Result<MakeCredentialResponse, Box<dyn std::error::Error>> {
+    ) -> Result<MakeCredentialResponse, Box<dyn core::error::Error>> {
         debug!("Processing WebAuthn MakeCredential request");
         validate_make_credential(&request)?;
         let response = self.ctap.make_credential(request)?;
@@ -76,7 +80,7 @@ impl WebAuthnAuthenticator {
     pub fn get_assertion(
         &mut self,
         request: GetAssertionRequest,
-    ) -> Result<GetAssertionResponse, Box<dyn std::error::Error>> {
+    ) -> Result<GetAssertionResponse, Box<dyn core::error::Error>> {
         debug!("Processing WebAuthn GetAssertion request");
         validate_get_assertion(&request)?;
         let response = self.ctap.get_assertion(request)?;
@@ -84,14 +88,14 @@ impl WebAuthnAuthenticator {
     }
 
     /// Retorna capacidades do autenticador via GetInfo.
-    pub fn get_info(&self) -> Result<ctap2::GetInfoResponse, Box<dyn std::error::Error>> {
+    pub fn get_info(&self) -> Result<ctap2::GetInfoResponse, Box<dyn core::error::Error>> {
         debug!("Processing WebAuthn GetInfo request");
         let response = self.ctap.get_info()?;
         Ok(response)
     }
 
     /// Retorna metadados do firmware via GetVersion.
-    pub fn get_version(&self) -> Result<ctap2::GetVersionResponse, Box<dyn std::error::Error>> {
+    pub fn get_version(&self) -> Result<ctap2::GetVersionResponse, Box<dyn core::error::Error>> {
         debug!("Processing WebAuthn GetVersion request");
         let response = self.ctap.get_version()?;
         Ok(response)

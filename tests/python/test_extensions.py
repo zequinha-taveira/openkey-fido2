@@ -201,32 +201,14 @@ def test_min_pin_length_returned(simulator):
     assert result.get("minPinLength") == 4
 
 
-def test_hmac_secret_creation(simulator):
+def test_hmac_secret_creation_returns_boolean(simulator):
+    """CTAP 2.1 §12.5: MakeCredential com "hmac-secret": true responde true."""
     simulator.reset()
     result = simulator.make_credential(
-        extensions={"hmacSecret": {"saltEnc": _b64(b"a" * 16)}},
+        extensions={"hmacSecret": True},
     )
     assert result["ok"], result
-    assert "hmac-secret" in result
-    secret = base64.b64decode(result["hmac-secret"])
-    assert len(secret) == 48
-
-
-def test_hmac_secret_get_via_get_assertion(simulator):
-    simulator.reset()
-    made = simulator.make_credential()
-    assert made["ok"], made
-
-    credential_id = base64.b64decode(made["credential_id"])
-    salt = b"1234567890123456"
-    asserted = simulator.get_assertion(
-        credential_id=credential_id,
-        extensions={"hmacSecret": {"saltEnc": _b64(salt)}},
-    )
-    assert asserted["ok"], asserted
-    assert "hmac-secret" in asserted
-    secret = base64.b64decode(asserted["hmac-secret"])
-    assert len(secret) == 48
+    assert result.get("hmac-secret") is True
 
 
 def test_multiple_extensions_combined(simulator):

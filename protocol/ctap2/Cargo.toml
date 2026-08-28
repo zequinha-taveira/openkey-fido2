@@ -7,11 +7,21 @@ license = "MIT"
 build = "build.rs"
 
 [dependencies]
-crypto = { path = "../../protocol/crypto" }
-storage = { path = "../../firmware/storage" }
+crypto = { path = "../../protocol/crypto", default-features = false }
+storage = { path = "../../firmware/storage", default-features = false }
 log = "0.4"
-serde = { version = "1.0", features = ["derive"] }
-serde_bytes = "0.11"
-ciborium = "0.2"
+ciborium = { version = "0.2", default-features = false }
+serde_bytes = { version = "0.11", default-features = false, features = ["alloc"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 ring = "0.17"
 zeroize = { workspace = true }
+
+[features]
+default = ["rs256", "std"]
+# Propaga o suporte a RS256 (-257)/PS256 (-37) da crate `crypto`. Sem a
+# feature, a negociação de algoritmos trata os algoritmos RSA como não
+# suportados e GetInfo não os anuncia (ver testes `cfg(not(feature = "rs256"))`).
+rs256 = ["crypto/rs256"]
+# Propaga o modo host (`std`) das dependências internas; alvos bare-metal
+# compilam com `--no-default-features` (`no_std` + `alloc`).
+std = ["crypto/std", "storage/std"]

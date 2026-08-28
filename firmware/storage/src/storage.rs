@@ -1,14 +1,16 @@
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
-use alloc::string::String;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
 use alloc::vec::Vec;
 use crypto::CryptoEngine;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::fs::File;
-use std::path::PathBuf;
 use zeroize::Zeroize;
+
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 
 extern crate alloc;
 
@@ -33,18 +35,31 @@ pub enum StorageError {
     /// Erro de I/O ao acessar o meio persistente.
     #[error("IO error: {0}")]
     IoError(String),
+    /// Parâmetro inválido — usado para validar LargeBlobs e outros limites.
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
 }
 
+#[cfg(feature = "std")]
 impl From<std::io::Error> for StorageError {
     fn from(e: std::io::Error) -> Self {
         StorageError::IoError(e.to_string())
     }
 }
 
-impl From<serde_json::Error> for StorageError {
-    fn from(e: serde_json::Error) -> Self {
-        StorageError::SerializationError(e.to_string())
-    }
+/// Serializa um valor em CBOR — formato compacto usado por todos os caminhos
+/// compartilhados entre host e embarcado (credenciais e snapshot de flash).
+fn cbor_serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, StorageError> {
+    let mut out = Vec::new();
+    ciborium::ser::into_writer(value, &mut out)
+        .map_err(|_| StorageError::SerializationError("cbor serialization failed".into()))?;
+    Ok(out)
+}
+
+/// Desserializa um valor em CBOR a partir de bytes.
+fn cbor_deserialize<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, StorageError> {
+    ciborium::de::from_reader(data)
+        .map_err(|_| StorageError::SerializationError("cbor deserialization failed".into()))
 }
 
 /// Meio de persistência key-value usado pelo [`StorageEngine`].
@@ -62,20 +77,30 @@ pub trait StorageBackend: Send + Sync {
     fn list_keys(&self) -> Result<Vec<String>, StorageError>;
 }
 
+/// Falha de serialização do snapshot JSON convertida para `StorageError`.
+#[cfg(feature = "std")]
+impl From<serde_json::Error> for StorageError {
+    fn from(e: serde_json::Error) -> Self {
+        StorageError::SerializationError(e.to_string())
+    }
+}
+
 /// Backend de arquivo JSON para uso em host (simulador, testes, exemplos).
 ///
 /// Mantém um cache em memória e grava a cada escrita, de forma que uma queda
 /// do processo não perca credenciais já registradas.
+#[cfg(feature = "std")]
 pub struct FileStorageBackend {
-    path: PathBuf,
-    journal_path: PathBuf,
+    path: std::path::PathBuf,
+    journal_path: std::path::PathBuf,
     cache: HashMap<String, Vec<u8>>,
     dirty: bool,
 }
 
+#[cfg(feature = "std")]
 impl FileStorageBackend {
     /// Abre (ou cria) o arquivo em `path` e carrega seu conteúdo no cache.
-    pub fn new(path: PathBuf) -> Result<Self, StorageError> {
+    pub fn new(path: std::path::PathBuf) -> Result<Self, StorageError> {
         let journal_path = path.with_extension("journal");
         let cache = Self::load_snapshot(&path, &journal_path)?;
         Ok(Self {
@@ -87,9 +112,10 @@ impl FileStorageBackend {
     }
 
     fn load_snapshot(
-        path: &PathBuf,
-        journal_path: &PathBuf,
+        path: &std::path::PathBuf,
+        journal_path: &std::path::PathBuf,
     ) -> Result<HashMap<String, Vec<u8>>, StorageError> {
+        use std::fs;
         let snapshot_path = if journal_path.exists() {
             journal_path
         } else {
@@ -110,6 +136,7 @@ impl FileStorageBackend {
 
     /// Grava o cache em disco quando houver alterações pendentes.
     pub fn flush(&mut self) -> Result<(), StorageError> {
+        use std::fs;
         if self.dirty {
             let json = serde_json::to_string_pretty(&self.cache)?;
             if let Some(parent) = self.path.parent() {
@@ -137,15 +164,22 @@ impl FileStorageBackend {
     }
 }
 
-fn write_durable(path: &PathBuf, contents: &[u8]) -> Result<(), StorageError> {
-    let mut file = File::create(path)?;
+#[cfg(feature = "std")]
+fn write_durable(path: &std::path::PathBuf, contents: &[u8]) -> Result<(), StorageError> {
+    use std::fs::File;
     use std::io::Write;
+    let mut file = File::create(path)?;
     file.write_all(contents)?;
     file.sync_all()?;
     Ok(())
 }
 
-fn replace_file(source: &PathBuf, destination: &PathBuf) -> Result<(), StorageError> {
+#[cfg(feature = "std")]
+fn replace_file(
+    source: &std::path::PathBuf,
+    destination: &std::path::PathBuf,
+) -> Result<(), StorageError> {
+    use std::fs;
     // Windows cannot rename over an existing file. The journal still makes
     // this two-step replacement recoverable if power fails between operations.
     if destination.exists() {
@@ -155,6 +189,7 @@ fn replace_file(source: &PathBuf, destination: &PathBuf) -> Result<(), StorageEr
     Ok(())
 }
 
+#[cfg(feature = "std")]
 impl StorageBackend for FileStorageBackend {
     fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(self.cache.get(key).cloned())
@@ -287,12 +322,12 @@ impl FlashDevice for SimulatedFlash {
 
 const FLASH_MAGIC: &[u8; 4] = b"OKF1";
 const FLASH_HEADER_SIZE: usize = 20;
-type FlashSnapshot = (u64, HashMap<String, Vec<u8>>);
+type FlashSnapshot = (u64, BTreeMap<String, Vec<u8>>);
 
 /// Backend crash-safe de dois slots para uma flash NOR adaptada por [`FlashDevice`].
 pub struct FlashStorageBackend<D: FlashDevice> {
     device: D,
-    cache: HashMap<String, Vec<u8>>,
+    cache: BTreeMap<String, Vec<u8>>,
     active_sector: usize,
     generation: u64,
 }
@@ -308,7 +343,7 @@ impl<D: FlashDevice> FlashStorageBackend<D> {
         }
         let mut backend = Self {
             device,
-            cache: HashMap::new(),
+            cache: BTreeMap::new(),
             active_sector: 0,
             generation: 0,
         };
@@ -344,8 +379,7 @@ impl<D: FlashDevice> FlashStorageBackend<D> {
         if Self::checksum(payload) != checksum {
             return Ok(None);
         }
-        let cache = serde_json::from_slice(payload)
-            .map_err(|_| StorageError::BackendError("invalid flash snapshot".into()))?;
+        let cache = cbor_deserialize::<BTreeMap<String, Vec<u8>>>(payload)?;
         Ok(Some((generation, cache)))
     }
 
@@ -362,8 +396,8 @@ impl<D: FlashDevice> FlashStorageBackend<D> {
         Ok(())
     }
 
-    fn commit(&mut self, cache: &HashMap<String, Vec<u8>>) -> Result<(), StorageError> {
-        let payload = serde_json::to_vec(cache)?;
+    fn commit(&mut self, cache: &BTreeMap<String, Vec<u8>>) -> Result<(), StorageError> {
+        let payload = cbor_serialize(cache)?;
         let size = self.device.sector_size();
         if payload.len() > size - FLASH_HEADER_SIZE {
             return Err(StorageError::BackendError(
@@ -393,6 +427,12 @@ impl<D: FlashDevice> StorageBackend for FlashStorageBackend<D> {
     }
 
     fn write(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        // Limitação documentada: clona o cache inteiro (O(n)) a cada write para
+        // garantir atomicidade two-slot com rollback em caso de falha no commit.
+        // Para o número típico de credenciais (<50) o custo é desprezível; para
+        // large blobs o snapshot CBOR pode atingir `sector_size` e o erro
+        // "flash snapshot exceeds sector capacity" é mapeado na fronteira CTAP
+        // para `Ctap2Error::LargeBlobStorageFull` (0x18) em vez de `Unknown`.
         let mut next = self.cache.clone();
         next.insert(key.to_string(), value.to_vec());
         self.commit(&next)?;
@@ -415,6 +455,20 @@ impl<D: FlashDevice> StorageBackend for FlashStorageBackend<D> {
 
 const WEAR_LEVELING_THRESHOLD: u32 = 10_000;
 
+/// Valor da extensão `credProtect` que exige verificação de usuário
+/// (`userVerificationRequired`, nível 3 — CTAP 2.1 §6.8.2). Credenciais com
+/// esta política só podem ser retornadas por GetAssertion com UV válido.
+pub const CRED_PROTECT_UV_REQUIRED: u8 = 0x03;
+
+/// Chave reservada no backend para o array global de large blobs.
+const LARGE_BLOBS_STORAGE_KEY: &str = "sys:large_blobs";
+
+/// Tamanho máximo do array global de large blobs, em bytes (CTAP 2.1 §6.10).
+///
+/// Nenhum caminho de escrita pode crescer o array além desta capacidade:
+/// offsets atacante-controlados são rejeitados antes de qualquer alocação.
+pub const MAX_LARGE_BLOBS_SIZE: usize = 4096;
+
 #[derive(Debug, Clone)]
 struct WearLevelCounter {
     sector: String,
@@ -429,27 +483,38 @@ impl WearLevelCounter {
         }
     }
 
+    #[allow(clippy::manual_is_multiple_of)]
     fn increment(&mut self) -> Result<(), StorageError> {
         self.write_count += 1;
-        if self.write_count >= WEAR_LEVELING_THRESHOLD {
+        if self.write_count == WEAR_LEVELING_THRESHOLD {
             warn!(
-                "Wear leveling threshold reached for sector '{}' (count={})",
+                "Wear leveling threshold reached for sector '{}' (count={}) - wear leveling is warn-only in this backend (no sector rotation)",
                 self.sector, self.write_count
             );
-            return Err(StorageError::WearLevelingThresholdExceeded(
-                self.sector.clone(),
-            ));
+            // Real flash would rotate/erase sectors here. This simulator backend
+            // only warns to avoid failing legitimate storage after 10k writes.
+            // The threshold is informational; operation succeeds.
+        } else if self.write_count > WEAR_LEVELING_THRESHOLD
+            && (self.write_count - WEAR_LEVELING_THRESHOLD) % 1000 == 0
+        {
+            warn!(
+                "Wear leveling still beyond threshold for sector '{}' (count={}) - periodic reminder (every 1000 writes)",
+                self.sector, self.write_count
+            );
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
+#[derive(Clone, Serialize, Deserialize, Zeroize)]
 #[zeroize(drop)]
 /// Credencial FIDO2 de um par (relying party, usuário).
 ///
 /// Implementa `Zeroize` com `drop` para que `private_key` seja apagada da
-/// memória assim que a credencial sai de escopo (ADR-0006).
+/// memória assim que a credencial saia de escopo (ADR-0006).
+///
+/// `Debug` é manual e redigido: `private_key` e os CredRandom da extensão
+/// `hmac-secret` são material criptográfico e nunca aparecem em logs.
 pub struct Credential {
     /// Identificador opaco entregue ao relying party.
     pub credential_id: Vec<u8>,
@@ -484,6 +549,46 @@ pub struct Credential {
     /// Nome amigável do usuário (`user.displayName`).
     #[serde(default)]
     pub user_display_name: Option<String>,
+    /// Política de proteção `credProtect` como byte no wire format
+    /// (0x01/0x02/0x03). `None` em registros antigos equivale à política
+    /// padrão (`userVerificationOptional`) — CTAP 2.1 §6.8.2.
+    #[serde(default)]
+    pub cred_protect: Option<u8>,
+    /// `CredRandomWithUV` da extensão `hmac-secret` (32 bytes aleatórios via
+    /// `SystemRandom`). Usado quando a asserção tem o bit uv=1
+    /// (CTAP 2.1 §12.5). `None` em credenciais criadas sem a extensão.
+    #[serde(default)]
+    pub cred_random_with_uv: Option<Vec<u8>>,
+    /// `CredRandomWithoutUV` da extensão `hmac-secret` (32 bytes aleatórios).
+    /// Usado quando a asserção tem o bit uv=0 (CTAP 2.1 §12.5).
+    #[serde(default)]
+    pub cred_random_without_uv: Option<Vec<u8>>,
+}
+
+impl core::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Credential")
+            .field("credential_id", &self.credential_id)
+            .field("public_key", &self.public_key)
+            .field("private_key", &"[redacted]")
+            .field("sign_count", &self.sign_count)
+            .field("rp_id_hash", &self.rp_id_hash)
+            .field("user_handle", &self.user_handle)
+            .field("cred_blob", &self.cred_blob)
+            .field("created_at", &self.created_at)
+            .field("algorithm", &self.algorithm)
+            .field("rp_id", &self.rp_id)
+            .field("large_blob_key", &self.large_blob_key)
+            .field("user_name", &self.user_name)
+            .field("user_display_name", &self.user_display_name)
+            .field("cred_protect", &self.cred_protect)
+            .field("cred_random_with_uv", &self.cred_random_with_uv.is_some())
+            .field(
+                "cred_random_without_uv",
+                &self.cred_random_without_uv.is_some(),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
@@ -507,18 +612,21 @@ pub struct StorageEngine {
     kv_store: BTreeMap<String, Vec<u8>>,
     large_blobs: Vec<u8>,
     backend: Option<Box<dyn StorageBackend>>,
-    wear_counters: HashMap<String, WearLevelCounter>,
+    wear_counters: BTreeMap<String, WearLevelCounter>,
     max_credential_count: Option<usize>,
 }
 
 impl core::fmt::Debug for StorageEngine {
+    /// Debug redigido: `kv_store` contém o hash do PIN e as credenciais
+    /// material criptográfico — nunca imprimir chaves nem valores, apenas
+    /// contagens (regra de segurança do repositório).
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("StorageEngine")
-            .field("credentials", &self.credentials)
-            .field("kv_store", &self.kv_store)
+            .field("credentials_count", &self.credentials.len())
+            .field("kv_entries", &self.kv_store.len())
             .field("large_blobs_len", &self.large_blobs.len())
             .field("backend", &self.backend.is_some())
-            .field("wear_counters", &self.wear_counters)
+            .field("wear_counters_count", &self.wear_counters.len())
             .field("max_credential_count", &self.max_credential_count)
             .finish()
     }
@@ -526,14 +634,14 @@ impl core::fmt::Debug for StorageEngine {
 
 impl StorageEngine {
     /// Cria um motor somente em memória — credenciais somem ao encerrar.
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new() -> Result<Self, Box<dyn core::error::Error>> {
         info!("Storage engine initialized");
         Ok(Self {
             credentials: BTreeMap::new(),
             kv_store: BTreeMap::new(),
             large_blobs: Vec::new(),
             backend: None,
-            wear_counters: HashMap::new(),
+            wear_counters: BTreeMap::new(),
             max_credential_count: None,
         })
     }
@@ -549,7 +657,7 @@ impl StorageEngine {
             kv_store: BTreeMap::new(),
             large_blobs: Vec::new(),
             backend: Some(backend),
-            wear_counters: HashMap::new(),
+            wear_counters: BTreeMap::new(),
             max_credential_count: None,
         };
         if let Err(e) = engine.load_from_backend() {
@@ -566,8 +674,14 @@ impl StorageEngine {
         };
 
         for key in keys {
+            if key == LARGE_BLOBS_STORAGE_KEY {
+                if let Some(blob_data) = self.backend.as_ref().unwrap().read(&key)? {
+                    self.large_blobs = blob_data;
+                }
+                continue;
+            }
             if let Some(cred_data) = self.backend.as_ref().unwrap().read(&key)? {
-                if let Ok(stored) = serde_json::from_slice::<StoredCredential>(&cred_data) {
+                if let Ok(stored) = cbor_deserialize::<StoredCredential>(&cred_data) {
                     self.credentials
                         .insert(stored.credential.credential_id.clone(), stored);
                 }
@@ -587,7 +701,7 @@ impl StorageEngine {
     }
 
     /// Grava um valor arbitrário no key-value store (estado do ClientPIN, etc.).
-    pub fn store(&mut self, key: &str, value: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn store(&mut self, key: &str, value: Vec<u8>) -> Result<(), Box<dyn core::error::Error>> {
         self.increment_wear_counter("kv")?;
         if let Some(backend) = &mut self.backend {
             backend.write(key, &value)?;
@@ -597,7 +711,7 @@ impl StorageEngine {
     }
 
     /// Recupera um valor do key-value store, consultando o backend primeiro.
-    pub fn retrieve(&self, key: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn retrieve(&self, key: &str) -> Result<Vec<u8>, Box<dyn core::error::Error>> {
         if let Some(backend) = &self.backend {
             if let Some(data) = backend.read(key)? {
                 return Ok(data);
@@ -609,6 +723,15 @@ impl StorageEngine {
             .ok_or_else(|| format!("Key '{}' not found", key).into())
     }
 
+    /// Remove um valor do key-value store (e do backend, se houver).
+    pub fn delete(&mut self, key: &str) -> Result<(), Box<dyn core::error::Error>> {
+        if let Some(backend) = &mut self.backend {
+            let _ = backend.delete(key);
+        }
+        self.kv_store.remove(key);
+        Ok(())
+    }
+
     /// Persiste uma credencial cifrando sua chave privada.
     ///
     /// A `private_key` recebida é limpa antes da gravação: o único material
@@ -617,7 +740,7 @@ impl StorageEngine {
         &mut self,
         credential: Credential,
         crypto: &CryptoEngine,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn core::error::Error>> {
         if let Some(max) = self.max_credential_count {
             if self.credentials.len() >= max {
                 self.prune_oldest_credential()?;
@@ -641,7 +764,7 @@ impl StorageEngine {
         self.increment_wear_counter("credentials")?;
 
         if let Some(backend) = &mut self.backend {
-            let data = serde_json::to_vec(&stored)?;
+            let data = cbor_serialize(&stored)?;
             backend.write(&cred_key, &data)?;
         }
 
@@ -659,7 +782,7 @@ impl StorageEngine {
         &self,
         credential_id: &[u8],
         crypto: &CryptoEngine,
-    ) -> Result<Option<Credential>, Box<dyn std::error::Error>> {
+    ) -> Result<Option<Credential>, Box<dyn core::error::Error>> {
         match self.credentials.get(credential_id) {
             Some(stored) => {
                 let private_key = crypto.decrypt(&stored.encrypted_private_key, &stored.nonce)?;
@@ -678,15 +801,21 @@ impl StorageEngine {
     /// Atualiza o contador de assinaturas após um GetAssertion.
     ///
     /// O contador é o mecanismo do WebAuthn contra clonagem do autenticador,
-    /// portanto precisa ser monotônico por credencial.
+    /// portanto precisa ser monotônico por credencial. O valor é gravado no
+    /// backend para sobreviver a reinícios.
     pub fn update_sign_count(
         &mut self,
         credential_id: &[u8],
         sign_count: u32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn core::error::Error>> {
         match self.credentials.get_mut(credential_id) {
             Some(stored) => {
                 stored.credential.sign_count = sign_count;
+                let cred_key = format!("cred:{}", hex::encode(credential_id));
+                if let Some(backend) = &mut self.backend {
+                    let data = cbor_serialize(&stored)?;
+                    backend.write(&cred_key, &data)?;
+                }
                 debug!("Credential sign count updated");
                 Ok(())
             }
@@ -703,7 +832,7 @@ impl StorageEngine {
     pub fn delete_credential(
         &mut self,
         credential_id: &[u8],
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<bool, Box<dyn core::error::Error>> {
         if self.credentials.remove(credential_id).is_some() {
             let cred_key = format!("cred:{}", hex::encode(credential_id));
             if let Some(backend) = &mut self.backend {
@@ -718,7 +847,16 @@ impl StorageEngine {
     }
 
     /// Apaga todas as credenciais e o key-value store (CTAP2 Reset).
+    ///
+    /// Também remove as chaves do backend, para que um reinício não
+    /// ressuscite credenciais, PIN ou large blobs já apagados pelo Reset.
     pub fn clear(&mut self) {
+        if let Some(backend) = &mut self.backend {
+            let keys = backend.list_keys().unwrap_or_default();
+            for key in keys {
+                let _ = backend.delete(&key);
+            }
+        }
         self.credentials.clear();
         self.kv_store.clear();
         debug!("All credentials cleared");
@@ -805,14 +943,14 @@ impl StorageEngine {
         credential_id: &[u8],
         user_name: Option<String>,
         user_display_name: Option<String>,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<bool, Box<dyn core::error::Error>> {
         if let Some(stored) = self.credentials.get_mut(credential_id) {
             stored.credential.user_name = user_name;
             stored.credential.user_display_name = user_display_name;
 
             let cred_key = format!("cred:{}", hex::encode(credential_id));
             if let Some(backend) = &mut self.backend {
-                let data = serde_json::to_vec(&stored)?;
+                let data = cbor_serialize(&stored)?;
                 backend.write(&cred_key, &data)?;
             }
             Ok(true)
@@ -827,32 +965,70 @@ impl StorageEngine {
         if offset >= len {
             return Vec::new();
         }
-        let end = core::cmp::min(offset + count, len);
+        // saturating_add evita pânico por overflow com `count` enorme.
+        let end = core::cmp::min(offset.saturating_add(count), len);
         self.large_blobs[offset..end].to_vec()
     }
 
     /// Escreve um fragmento no array global de large blobs com redimensionamento se necessário.
+    ///
+    /// A validação de capacidade ocorre **antes** de qualquer redimensionamento:
+    /// um offset/length atacante-controlado não pode inflar o buffer em memória
+    /// (CTAP 2.1 §6.10; limite de [`MAX_LARGE_BLOBS_SIZE`]).
+    ///
+    /// Validações adicionais no StorageEngine (não só no handler CTAP) evitam
+    /// alocação sparse via chamada direta pelo simulador/python:
+    /// - `offset <= current_len` (rejeita buracos esparsos)
+    /// - quando `expected_len` presente: `offset+data.len() <= expected_len` e `expected_len <= MAX`
     pub fn write_large_blobs(
         &mut self,
         offset: usize,
         data: &[u8],
-        expected_len: usize,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if expected_len > 4096 {
-            return Err("Large blob exceeds maximum supported size (4096 bytes)".into());
+        expected_len: Option<usize>,
+    ) -> Result<(), Box<dyn core::error::Error>> {
+        let end = offset.checked_add(data.len()).ok_or_else(|| {
+            Box::new(StorageError::InvalidParameter(
+                "large blobs offset overflow".into(),
+            )) as Box<dyn core::error::Error>
+        })?;
+        if end > MAX_LARGE_BLOBS_SIZE {
+            return Err(Box::new(StorageError::InvalidParameter(
+                "Large blobs write exceeds maximum supported size (4096 bytes)".into(),
+            )));
         }
-        if self.large_blobs.len() < expected_len {
-            self.large_blobs.resize(expected_len, 0);
+        if let Some(exp) = expected_len {
+            if exp > MAX_LARGE_BLOBS_SIZE {
+                return Err(Box::new(StorageError::InvalidParameter(
+                    "Large blob exceeds maximum supported size (4096 bytes)".into(),
+                )));
+            }
+            if end > exp {
+                return Err(Box::new(StorageError::InvalidParameter(format!(
+                    "large blobs write end {} exceeds expected_len {}",
+                    end, exp
+                ))));
+            }
         }
-        let end = offset + data.len();
-        if end > self.large_blobs.len() {
-            self.large_blobs.resize(end, 0);
+        // Rejeita buracos esparsos: offset não pode saltar além do tamanho atual
+        if offset > self.large_blobs.len() {
+            return Err(Box::new(StorageError::InvalidParameter(format!(
+                "sparse hole: offset {} > current_len {}",
+                offset,
+                self.large_blobs.len()
+            ))));
+        }
+        let target = match expected_len {
+            Some(exp) => core::cmp::max(exp, end),
+            None => end,
+        };
+        if target > self.large_blobs.len() {
+            self.large_blobs.resize(target, 0);
         }
         self.large_blobs[offset..end].copy_from_slice(data);
 
         // Se houver backend persistente, salva sob chave reservada "sys:large_blobs"
         if let Some(backend) = &mut self.backend {
-            backend.write("sys:large_blobs", &self.large_blobs)?;
+            backend.write(LARGE_BLOBS_STORAGE_KEY, &self.large_blobs)?;
         }
 
         Ok(())
@@ -862,7 +1038,7 @@ impl StorageEngine {
     pub fn clear_large_blobs(&mut self) {
         self.large_blobs.clear();
         if let Some(backend) = &mut self.backend {
-            let _ = backend.delete("sys:large_blobs");
+            let _ = backend.delete(LARGE_BLOBS_STORAGE_KEY);
         }
     }
 
@@ -879,7 +1055,7 @@ impl StorageEngine {
         crypto.sha256(rp_id.as_bytes())
     }
 
-    fn increment_wear_counter(&mut self, sector: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn increment_wear_counter(&mut self, sector: &str) -> Result<(), Box<dyn core::error::Error>> {
         let counter = self
             .wear_counters
             .entry(sector.to_string())
@@ -888,7 +1064,7 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn prune_oldest_credential(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn prune_oldest_credential(&mut self) -> Result<(), Box<dyn core::error::Error>> {
         let oldest_key = self
             .credentials
             .values()
@@ -912,6 +1088,8 @@ impl StorageEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::fs;
 
     fn make_credential(crypto: &CryptoEngine, rp_id: &str, cred_id: Vec<u8>) -> Credential {
         Credential {
@@ -928,6 +1106,9 @@ mod tests {
             large_blob_key: None,
             user_name: None,
             user_display_name: None,
+            cred_protect: None,
+            cred_random_with_uv: None,
+            cred_random_without_uv: None,
         }
     }
 
@@ -1041,5 +1222,309 @@ mod tests {
         assert!(interrupted.write("state", b"partial").is_err());
         let recovered = FlashStorageBackend::new(interrupted.into_device()).unwrap();
         assert_eq!(recovered.read("state").unwrap(), Some(b"stable".to_vec()));
+    }
+
+    #[test]
+    fn test_clear_persists_to_backend() {
+        let root =
+            std::env::temp_dir().join(format!("openkey-storage-clear-{}", std::process::id()));
+        let path = root.join("store.json");
+        let _ = fs::remove_dir_all(&root);
+
+        let crypto = CryptoEngine::new().unwrap();
+        let backend = FileStorageBackend::new(path.clone()).unwrap();
+        let mut storage = StorageEngine::with_backend(Box::new(backend));
+        storage
+            .store_credential(make_credential(&crypto, "example.com", vec![1; 4]), &crypto)
+            .unwrap();
+        storage.store("pin", b"hash".to_vec()).unwrap();
+
+        storage.clear();
+
+        let backend = FileStorageBackend::new(path.clone()).unwrap();
+        let reopened = StorageEngine::with_backend(Box::new(backend));
+        assert_eq!(reopened.get_credentials_count(), 0);
+        assert!(reopened.retrieve("pin").is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_sign_count_persists_to_backend() {
+        let root =
+            std::env::temp_dir().join(format!("openkey-storage-signcount-{}", std::process::id()));
+        let path = root.join("store.json");
+        let _ = fs::remove_dir_all(&root);
+
+        let crypto = CryptoEngine::new().unwrap();
+        let backend = FileStorageBackend::new(path.clone()).unwrap();
+        let mut storage = StorageEngine::with_backend(Box::new(backend));
+        storage
+            .store_credential(make_credential(&crypto, "example.com", vec![1; 4]), &crypto)
+            .unwrap();
+        storage.update_sign_count(&[1; 4], 7).unwrap();
+
+        let backend = FileStorageBackend::new(path.clone()).unwrap();
+        let reopened = StorageEngine::with_backend(Box::new(backend));
+        let credential = reopened.get_credential(&[1; 4], &crypto).unwrap().unwrap();
+        assert_eq!(credential.sign_count, 7);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_large_blobs_reload_from_backend() {
+        let root =
+            std::env::temp_dir().join(format!("openkey-storage-largeblobs-{}", std::process::id()));
+        let path = root.join("store.json");
+        let _ = fs::remove_dir_all(&root);
+
+        let backend = FileStorageBackend::new(path.clone()).unwrap();
+        let mut storage = StorageEngine::with_backend(Box::new(backend));
+        storage
+            .write_large_blobs(0, b"persisted-blob", Some(14))
+            .unwrap();
+
+        let backend = FileStorageBackend::new(path.clone()).unwrap();
+        let reopened = StorageEngine::with_backend(Box::new(backend));
+        assert_eq!(reopened.read_large_blobs(0, 14), b"persisted-blob");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_debug_output_redacts_sensitive_material() {
+        // 0xAB=171 e 0xCD=205: bytes com representação decimal distinta,
+        // fáceis de detectar (ou não) na saída formatada.
+        let pin_hash = vec![0xABu8; 16];
+        let private_key = vec![0xCDu8; 32];
+
+        let crypto = CryptoEngine::new().unwrap();
+        let mut storage = StorageEngine::new().unwrap();
+        storage.store("client_pin_hash", pin_hash.clone()).unwrap();
+
+        let mut credential = make_credential(&crypto, "example.com", vec![1; 4]);
+        credential.private_key = private_key.clone();
+        credential.public_key = vec![0xCDu8; 32];
+        storage.store_credential(credential, &crypto).unwrap();
+
+        let debug = format!("{:?}", storage);
+
+        assert!(
+            !debug.contains("client_pin_hash"),
+            "Debug must not leak kv keys: {}",
+            debug
+        );
+        assert!(
+            !debug.contains("171"),
+            "Debug must not leak PIN hash bytes: {}",
+            debug
+        );
+        assert!(
+            !debug.contains("205"),
+            "Debug must not leak key material bytes: {}",
+            debug
+        );
+    }
+
+    #[test]
+    fn test_write_large_blobs_rejects_offset_beyond_capacity() {
+        let mut storage = StorageEngine::new().unwrap();
+        storage
+            .write_large_blobs(0, &[0x11u8; 16], Some(16))
+            .unwrap();
+
+        // Offset fora da capacidade deve ser rejeitado sem alterar o array.
+        assert!(storage.write_large_blobs(5000, &[0x22u8; 8], None).is_err());
+        assert_eq!(storage.get_large_blobs_len(), 16);
+        assert_eq!(storage.read_large_blobs(0, 16), vec![0x11u8; 16]);
+    }
+
+    #[test]
+    fn test_write_large_blobs_rejects_length_beyond_capacity() {
+        let mut storage = StorageEngine::new().unwrap();
+
+        assert!(storage
+            .write_large_blobs(0, &[0x33u8; 8], Some(MAX_LARGE_BLOBS_SIZE + 1))
+            .is_err());
+        assert_eq!(storage.get_large_blobs_len(), 0);
+    }
+
+    #[test]
+    fn test_write_large_blobs_boundary_at_capacity_succeeds() {
+        let mut storage = StorageEngine::new().unwrap();
+
+        // Escrita terminando exatamente no limite é permitida via fragmentos contíguos
+        let offset = MAX_LARGE_BLOBS_SIZE - 8;
+        // Primeiro preenche até offset de forma contígua
+        storage
+            .write_large_blobs(0, &vec![0x44u8; offset], Some(MAX_LARGE_BLOBS_SIZE))
+            .unwrap();
+        assert_eq!(storage.get_large_blobs_len(), MAX_LARGE_BLOBS_SIZE);
+        // Sobrescrever os últimos 8 bytes dentro do array já alocado é permitido
+        storage
+            .write_large_blobs(offset, &[0x44u8; 8], Some(MAX_LARGE_BLOBS_SIZE))
+            .unwrap();
+        assert_eq!(storage.read_large_blobs(offset, 8), vec![0x44u8; 8]);
+
+        // Um byte a mais já estoura a capacidade.
+        assert!(storage
+            .write_large_blobs(offset, &[0x55u8; 9], None)
+            .is_err());
+        assert_eq!(storage.get_large_blobs_len(), MAX_LARGE_BLOBS_SIZE);
+    }
+
+    #[test]
+    fn test_write_large_blobs_rejects_sparse_hole() {
+        let mut storage = StorageEngine::new().unwrap();
+        storage
+            .write_large_blobs(0, &[0x11u8; 16], Some(16))
+            .unwrap();
+        // Gap: offset 32 > current_len 16 => rejeita alocação sparse
+        assert!(storage
+            .write_large_blobs(32, &[0x22u8; 8], Some(40))
+            .is_err());
+        assert_eq!(storage.get_large_blobs_len(), 16);
+        // offset+data além de expected_len também rejeita
+        assert!(storage
+            .write_large_blobs(16, &[0x33u8; 8], Some(20))
+            .is_err());
+        assert_eq!(storage.get_large_blobs_len(), 16);
+        // Escrita contígua deve passar
+        storage
+            .write_large_blobs(16, &[0x44u8; 8], Some(24))
+            .unwrap();
+        assert_eq!(storage.get_large_blobs_len(), 24);
+        // Tentativa direta via simulator/python de alocar 4096 zeros sparse a partir do zero
+        let mut sparse = StorageEngine::new().unwrap();
+        // offset 4000 com expected_len 4096 e 8 bytes deveria falhar quando len=0 (gap)
+        assert!(sparse
+            .write_large_blobs(4000, &[0x55u8; 8], Some(4096))
+            .is_err());
+        assert_eq!(sparse.get_large_blobs_len(), 0);
+        // Escrita sequencial até 4096 deve funcionar via fragments contíguos
+        sparse
+            .write_large_blobs(0, &[0xAAu8; 2048], Some(4096))
+            .unwrap();
+        assert_eq!(sparse.get_large_blobs_len(), 4096);
+        sparse
+            .write_large_blobs(2048, &[0xBBu8; 2048], Some(4096))
+            .unwrap();
+        assert_eq!(sparse.read_large_blobs(0, 8), vec![0xAAu8; 8]);
+        assert_eq!(sparse.read_large_blobs(2048, 8), vec![0xBBu8; 8]);
+    }
+
+    #[test]
+    fn test_read_large_blobs_huge_count_does_not_panic() {
+        let mut storage = StorageEngine::new().unwrap();
+        storage
+            .write_large_blobs(0, &[0x66u8; 16], Some(16))
+            .unwrap();
+
+        let huge_count = usize::MAX;
+        assert_eq!(storage.read_large_blobs(4, huge_count), vec![0x66u8; 12]);
+        // Offset além do fim retorna vazio.
+        assert!(storage.read_large_blobs(usize::MAX, 1).is_empty());
+    }
+
+    /// Registro persistido por versões anteriores ao campo `cred_protect`
+    /// deve continuar carregando: a política ausente vira `None` (padrão).
+    #[test]
+    fn test_old_record_without_cred_protect_deserializes_as_none() {
+        let old_record = r#"{
+            "credential": {
+                "credential_id": [1, 2, 3, 4],
+                "public_key": [],
+                "private_key": [],
+                "sign_count": 0,
+                "rp_id_hash": [3, 2],
+                "user_handle": null,
+                "cred_blob": [],
+                "created_at": 0,
+                "algorithm": -8,
+                "rp_id": "example.com",
+                "large_blob_key": null,
+                "user_name": null,
+                "user_display_name": null
+            },
+            "encrypted_private_key": [],
+            "nonce": []
+        }"#;
+
+        let stored: StoredCredential = serde_json::from_str(old_record).unwrap();
+        assert_eq!(stored.credential.cred_protect, None);
+    }
+
+    /// Registro persistido antes dos campos `cred_random_*` da extensão
+    /// `hmac-secret` deve continuar carregando: os segredos ausentes viram
+    /// `None` (CTAP 2.1 §12.5 — a extensão é então ignorada na asserção).
+    #[test]
+    fn test_old_record_without_cred_random_deserializes_as_none() {
+        let old_record = r#"{
+            "credential": {
+                "credential_id": [1, 2, 3, 4],
+                "public_key": [],
+                "private_key": [],
+                "sign_count": 0,
+                "rp_id_hash": [3, 2],
+                "user_handle": null,
+                "cred_blob": [],
+                "created_at": 0,
+                "algorithm": -8,
+                "rp_id": "example.com",
+                "large_blob_key": null,
+                "user_name": null,
+                "user_display_name": null,
+                "cred_protect": 2
+            },
+            "encrypted_private_key": [],
+            "nonce": []
+        }"#;
+
+        let stored: StoredCredential = serde_json::from_str(old_record).unwrap();
+        assert_eq!(stored.credential.cred_random_with_uv, None);
+        assert_eq!(stored.credential.cred_random_without_uv, None);
+    }
+
+    /// A política de proteção persistida sobrevive a um ciclo gravar/ler no
+    /// backend (encryption at rest preserva os metadados da credencial).
+    #[test]
+    fn test_cred_protect_persists_to_backend() {
+        let root = std::env::temp_dir().join(format!(
+            "openkey-storage-credprotect-{}",
+            std::process::id()
+        ));
+        let path = root.join("store.json");
+        let _ = fs::remove_dir_all(&root);
+
+        let crypto = CryptoEngine::new().unwrap();
+        let backend = FileStorageBackend::new(path.clone()).unwrap();
+        let mut storage = StorageEngine::with_backend(Box::new(backend));
+
+        let mut credential = make_credential(&crypto, "example.com", vec![1; 4]);
+        credential.cred_protect = Some(CRED_PROTECT_UV_REQUIRED);
+        storage.store_credential(credential, &crypto).unwrap();
+
+        let backend = FileStorageBackend::new(path.clone()).unwrap();
+        let reopened = StorageEngine::with_backend(Box::new(backend));
+        let credential = reopened.get_credential(&[1; 4], &crypto).unwrap().unwrap();
+        assert_eq!(credential.cred_protect, Some(CRED_PROTECT_UV_REQUIRED));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_wear_leveling_threshold_is_warn_only() {
+        // Após 10k escritas o contador deve apenas avisar, não falhar (warn-only)
+        let mut storage = StorageEngine::new().unwrap();
+        for i in 0..WEAR_LEVELING_THRESHOLD + 5 {
+            let key = format!("key_{}", i % 10);
+            assert!(
+                storage.store(&key, b"value".to_vec()).is_ok(),
+                "store não deve falhar após threshold (warn-only)"
+            );
+        }
+        // Após ultrapassar o limite, operações continuam normais
+        assert_eq!(storage.retrieve("key_0").unwrap(), b"value".to_vec());
     }
 }

@@ -21,7 +21,8 @@ RUN_TIMEOUT_S = 30
 ERR_SUCCESS = 0x00
 ERR_NO_CREDENTIALS = 0x2E
 ERR_UNSUPPORTED_OPTION = 0x2B
-ERR_INVALID_STATE = 0x05
+# CTAP2_ERR_NOT_ALLOWED: comando não permitido no estado atual.
+ERR_INVALID_STATE = 0x30
 
 
 def _b64(data: bytes) -> str:
