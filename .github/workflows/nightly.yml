@@ -76,7 +76,7 @@ jobs:
           workspaces: examples/rp2350-firmware
           key: nightly-${{ matrix.refs }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: steps.branch_check.outputs.exists == 'true'
         with:
           python-version: '3.x'
