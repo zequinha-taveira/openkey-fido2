@@ -43,7 +43,7 @@ serde_bytes = "0.11"
 ciborium = "0.2"
 zeroize = { version = "1.7", features = ["derive"] }
 rand = "0.8"
-x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets", "zeroize"] }
+x25519-dalek = { version = "3.0", default-features = false, features = ["static_secrets", "zeroize"] }
 aes = "0.9"
 cbc = "0.2"
 
