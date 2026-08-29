@@ -14,11 +14,8 @@ REM Uso:
 REM   build_openkey_fido2.bat
 REM   build_openkey_fido2.bat --release
 REM   build_openkey_fido2.bat --sim
-REM   build_openkey_fido2.bat --sim --release
 REM   build_openkey_fido2.bat --rp2350
-REM   build_openkey_fido2.bat --rp2350 --release
 REM   build_openkey_fido2.bat --rp2350-uf2
-REM   build_openkey_fido2.bat --rp2350-uf2 --release
 REM   build_openkey_fido2.bat --nrf52840
 REM   build_openkey_fido2.bat --check
 REM   build_openkey_fido2.bat --test
@@ -37,10 +34,9 @@ set "TARGET_NRF52840=thumbv7em-none-eabihf"
 
 set "MODE=debug"
 set "ACTION=workspace"
-set "HAS_ACTION=0"
 
 REM ============================================================
-REM Parse argumentos - suporta combinação: --rp2350 --release
+REM Parse argumentos
 REM ============================================================
 
 if "%~1"=="" goto :run
@@ -62,126 +58,108 @@ if /I "%~1"=="--release" (
 
 if /I "%~1"=="--sim" (
     set "ACTION=sim"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--simulator" (
     set "ACTION=sim"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--rp2350" (
     set "ACTION=rp2350"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--firmware" (
     set "ACTION=rp2350"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--rp2350-uf2" (
     set "ACTION=rp2350-uf2"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--uf2" (
     set "ACTION=rp2350-uf2"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--nrf52840" (
     set "ACTION=nrf52840"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--nrf" (
     set "ACTION=nrf52840"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--check" (
     set "ACTION=check"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--check-targets" (
     set "ACTION=check"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--test" (
     set "ACTION=test"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--tests" (
     set "ACTION=test"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--clippy" (
     set "ACTION=clippy"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--fmt" (
     set "ACTION=fmt"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--fmt-check" (
     set "ACTION=fmt"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--all" (
     set "ACTION=all"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--ci" (
     set "ACTION=all"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
 
 if /I "%~1"=="--clean" (
     set "ACTION=clean"
-    set "HAS_ACTION=1"
     shift
     goto :parse_args
 )
@@ -192,7 +170,6 @@ if /I "%~1"=="-h" goto :help
 echo [openkey-fido2] ERROR: Opcao desconhecida: %~1
 echo.
 goto :help_error
-
 
 REM ============================================================
 REM Verificações
@@ -378,7 +355,11 @@ echo [openkey-fido2] Build firmware nRF52840.
 
 pushd "%ROOT%\examples\nrf52840-firmware"
 
-cargo build --locked --target "%TARGET_NRF52840%"
+if /I "%MODE%"=="release" (
+    cargo build --release --locked --target "%TARGET_NRF52840%"
+) else (
+    cargo build --locked --target "%TARGET_NRF52840%"
+)
 
 set "RC=%ERRORLEVEL%"
 

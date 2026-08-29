@@ -10,11 +10,8 @@
 #   ./build_openkey_fido2.sh
 #   ./build_openkey_fido2.sh --release
 #   ./build_openkey_fido2.sh --sim
-#   ./build_openkey_fido2.sh --sim --release
 #   ./build_openkey_fido2.sh --rp2350
-#   ./build_openkey_fido2.sh --rp2350 --release
 #   ./build_openkey_fido2.sh --rp2350-uf2
-#   ./build_openkey_fido2.sh --rp2350-uf2 --release
 #   ./build_openkey_fido2.sh --nrf52840
 #   ./build_openkey_fido2.sh --check
 #   ./build_openkey_fido2.sh --test
@@ -321,81 +318,58 @@ clean_all() {
 }
 
 # ------------------------------------------------------------
-# Argumentos - suporta combinação: --rp2350 --release, --sim --release
+# Argumentos
 # ------------------------------------------------------------
-if [[ $# -eq 0 ]]; then
-    MODE="debug"
-    ACTION="workspace"
-else
-    # defaults antes do loop
-    MODE="debug"
-    ACTION="workspace"
-    HAS_ACTION=0
-    for arg in "$@"; do
-        case "$arg" in
-            --debug)
-                MODE="debug"
-                ;;
-            --release)
-                MODE="release"
-                ;;
-            --sim|--simulator)
-                ACTION="sim"
-                HAS_ACTION=1
-                ;;
-            --rp2350|--firmware)
-                ACTION="rp2350"
-                HAS_ACTION=1
-                ;;
-            --rp2350-uf2|--uf2)
-                ACTION="rp2350-uf2"
-                HAS_ACTION=1
-                ;;
-            --nrf52840|--nrf)
-                ACTION="nrf52840"
-                HAS_ACTION=1
-                ;;
-            --check|--check-targets)
-                ACTION="check"
-                HAS_ACTION=1
-                ;;
-            --test|--tests)
-                ACTION="test"
-                HAS_ACTION=1
-                ;;
-            --clippy)
-                ACTION="clippy"
-                HAS_ACTION=1
-                ;;
-            --fmt|--fmt-check)
-                ACTION="fmt"
-                HAS_ACTION=1
-                ;;
-            --all|--ci)
-                ACTION="all"
-                HAS_ACTION=1
-                ;;
-            --clean)
-                ACTION="clean"
-                HAS_ACTION=1
-                ;;
-            --help|-h)
-                usage
-                exit 0
-                ;;
-            *)
-                die "Opção desconhecida: $arg
-
+while (($# > 0)); do
+    case "$1" in
+        --debug)
+            MODE="debug"
+            ;;
+        --release)
+            MODE="release"
+            ;;
+        --sim|--simulator)
+            ACTION="sim"
+            ;;
+        --rp2350|--firmware)
+            ACTION="rp2350"
+            ;;
+        --rp2350-uf2|--uf2)
+            ACTION="rp2350-uf2"
+            ;;
+        --nrf52840|--nrf)
+            ACTION="nrf52840"
+            ;;
+        --check|--check-targets)
+            ACTION="check"
+            ;;
+        --test|--tests)
+            ACTION="test"
+            ;;
+        --clippy)
+            ACTION="clippy"
+            ;;
+        --fmt|--fmt-check)
+            ACTION="fmt"
+            ;;
+        --all|--ci)
+            ACTION="all"
+            ;;
+        --clean)
+            ACTION="clean"
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Opção desconhecida: $1
 Use:
   ./build_openkey_fido2.sh --help"
-                ;;
-        esac
-    done
-    # Se só passou --release/--debug sem ação explícita, mantém workspace
-    if [[ $HAS_ACTION -eq 0 ]]; then
-        ACTION="workspace"
-    fi
-fi
+            ;;
+    esac
+    shift
+done
 
 cd "$ROOT"
 
