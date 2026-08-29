@@ -130,27 +130,15 @@ jobs:
           ls -lh target/thumbv8m.main-none-eabihf/release/rp2350-firmware || true
           arm-none-eabi-size target/thumbv8m.main-none-eabihf/release/rp2350-firmware || true
 
-      - name: Build legacy Pico/ESP32 (if scripts exist)
+      - name: Build legacy ESP32 (if script exists)
         if: steps.branch_check.outputs.exists == 'true'
-        env:
-          PICO_SDK_PATH: ../pico-sdk
-          SECURE_BOOT_PKEY: ${{ env.SIGNING_KEY_PATH }}
         run: |
           set -e
           if [ -f ./workflows/autobuild.sh ]; then
-            echo "Running legacy autobuild for pico"
-            ./workflows/autobuild.sh pico || echo "::warning::autobuild pico failed/skipped"
-          else
-            echo "workflows/autobuild.sh not found — skipping legacy pico build"
-          fi
-          if [ -f ./build_pico_fido.sh ]; then
-            ./build_pico_fido.sh --no-eddsa || echo "::warning::build_pico_fido failed/skipped"
-          else
-            echo "build_pico_fido.sh not found — skipping"
-          fi
-          if [ -f ./workflows/autobuild.sh ]; then
             echo "Running legacy autobuild for esp32"
             ./workflows/autobuild.sh esp32 || echo "::warning::autobuild esp32 failed/skipped"
+          else
+            echo "workflows/autobuild.sh not found — skipping legacy esp32 build"
           fi
 
       - name: Stage release artifacts
