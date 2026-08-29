@@ -17,14 +17,18 @@ concurrency:
 
 jobs:
   nightly:
-    name: Deploy nightly (${{ matrix.refs }})
+    name: Deploy nightly (${{ matrix.tag }})
     runs-on: ubuntu-latest
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
-        refs: [main, development]
+        include:
+          - refs: main
+            tag: nightly-stable
+          - refs: development
+            tag: nightly-development
     env:
       SIGNING_KEY_PATH: ${{ runner.temp }}/private.pem
     steps:
@@ -199,8 +203,8 @@ jobs:
         if: steps.branch_check.outputs.exists == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nightly-${{ matrix.refs }}
-          name: Nightly build (${{ matrix.refs }})
+          tag_name: ${{ matrix.tag }}
+          name: Nightly build (${{ matrix.tag }})
           prerelease: true
           token: ${{ secrets.GITHUB_TOKEN }}
           files: release/*.*
