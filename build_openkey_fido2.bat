@@ -355,7 +355,11 @@ echo [openkey-fido2] Build firmware nRF52840.
 
 pushd "%ROOT%\examples\nrf52840-firmware"
 
-cargo build --locked --target "%TARGET_NRF52840%"
+if /I "%MODE%"=="release" (
+    cargo build --release --locked --target "%TARGET_NRF52840%"
+) else (
+    cargo build --locked --target "%TARGET_NRF52840%"
+)
 
 set "RC=%ERRORLEVEL%"
 

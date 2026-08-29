@@ -320,72 +320,56 @@ clean_all() {
 # ------------------------------------------------------------
 # Argumentos
 # ------------------------------------------------------------
-
-case "${1:---debug}" in
-
-    --debug)
-        MODE="debug"
-        ACTION="workspace"
-        ;;
-
-    --release)
-        MODE="release"
-        ACTION="workspace"
-        ;;
-
-    --sim|--simulator)
-        ACTION="sim"
-        ;;
-
-    --rp2350|--firmware)
-        ACTION="rp2350"
-        ;;
-
-    --rp2350-uf2|--uf2)
-        ACTION="rp2350-uf2"
-        ;;
-
-    --nrf52840|--nrf)
-        ACTION="nrf52840"
-        ;;
-
-    --check|--check-targets)
-        ACTION="check"
-        ;;
-
-    --test|--tests)
-        ACTION="test"
-        ;;
-
-    --clippy)
-        ACTION="clippy"
-        ;;
-
-    --fmt|--fmt-check)
-        ACTION="fmt"
-        ;;
-
-    --all|--ci)
-        ACTION="all"
-        ;;
-
-    --clean)
-        ACTION="clean"
-        ;;
-
-    --help|-h)
-        usage
-        exit 0
-        ;;
-
-    *)
-        die "Opção desconhecida: $1
-
+while (($# > 0)); do
+    case "$1" in
+        --debug)
+            MODE="debug"
+            ;;
+        --release)
+            MODE="release"
+            ;;
+        --sim|--simulator)
+            ACTION="sim"
+            ;;
+        --rp2350|--firmware)
+            ACTION="rp2350"
+            ;;
+        --rp2350-uf2|--uf2)
+            ACTION="rp2350-uf2"
+            ;;
+        --nrf52840|--nrf)
+            ACTION="nrf52840"
+            ;;
+        --check|--check-targets)
+            ACTION="check"
+            ;;
+        --test|--tests)
+            ACTION="test"
+            ;;
+        --clippy)
+            ACTION="clippy"
+            ;;
+        --fmt|--fmt-check)
+            ACTION="fmt"
+            ;;
+        --all|--ci)
+            ACTION="all"
+            ;;
+        --clean)
+            ACTION="clean"
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Opção desconhecida: $1
 Use:
   ./build_openkey_fido2.sh --help"
-        ;;
-
-esac
+            ;;
+    esac
+    shift
+done
 
 cd "$ROOT"
 
