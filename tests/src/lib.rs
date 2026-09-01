@@ -12,6 +12,7 @@ use ctap2::{
     MakeCredentialOptions, MakeCredentialRequest, PublicKeyCredParams, RelyingParty, User,
 };
 use storage::StorageEngine;
+use rand::RngCore;
 
 fn make_request(user_id: &[u8]) -> MakeCredentialRequest {
     MakeCredentialRequest {
@@ -1669,7 +1670,8 @@ fn test_ctaphid_channel_allocation_and_management() {
     use transport::ctaphid::{ctaphid_capabilities, ChannelManager, CTAPHID_BROADCAST_CID};
 
     let mut mgr = ChannelManager::new();
-    let nonce = [10, 20, 30, 40, 50, 60, 70, 80];
+    let mut nonce = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
     let resp = mgr.build_init_response(
         &nonce,
         2,
