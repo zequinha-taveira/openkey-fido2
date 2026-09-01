@@ -29,8 +29,6 @@ jobs:
             tag: nightly-stable
           - refs: development
             tag: nightly-development
-    env:
-      SIGNING_KEY_PATH: ${{ runner.temp }}/private.pem
     steps:
       - name: Check branch exists
         id: branch_check
@@ -60,6 +58,10 @@ jobs:
             echo "has_signing_key=true" >> "$GITHUB_ENV"
             echo "Signing key present."
           fi
+
+      - name: Set signing key path
+        if: steps.branch_check.outputs.exists == 'true'
+        run: echo "SIGNING_KEY_PATH=${RUNNER_TEMP}/private.pem" >> "${GITHUB_ENV}"
 
       - name: Checkout repository
         if: steps.branch_check.outputs.exists == 'true'
