@@ -4,6 +4,11 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to request review for (manual run)"
+        required: false
+        type: number
 
 permissions:
   contents: read
@@ -11,7 +16,7 @@ permissions:
 
 jobs:
   copilot-review:
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.draft == false }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -21,10 +26,22 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          PR="$PR_NUMBER"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            PR="$INPUT_PR_NUMBER"
+          fi
+          if [ -z "$PR" ] || [ "$PR" = "null" ]; then
+            echo "No PR number available (draft check passed but no PR context). Skipping."
+            exit 0
+          fi
+          echo "Requesting Copilot review for PR #$PR"
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            /repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/requested_reviewers \
-            -f "reviewers[]=copilot-pull-request-reviewer" || echo "Copilot review request failed or already requested"
+            "/repos/${{ github.repository }}/pulls/$PR/requested_reviewers" \
+            -f "reviewers[]=copilot-pull-request-reviewer[bot]" || echo "Copilot review request failed or already requested"
