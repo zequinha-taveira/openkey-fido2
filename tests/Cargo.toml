@@ -16,3 +16,4 @@ device-profile = { path = "../firmware/device-profile" }
 transport = { path = "../firmware/transport", features = ["embedded"] }
 embedded-hal = "1.0"
 ciborium = "0.2"
+rand = { workspace = true }

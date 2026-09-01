@@ -1166,6 +1166,7 @@ dependencies = [
  "ctap2",
  "device-profile",
  "embedded-hal 1.0.0",
+ "rand",
  "storage",
  "transport",
  "webauthn",
