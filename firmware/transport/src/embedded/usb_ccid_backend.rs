@@ -836,7 +836,9 @@ impl<B: UsbBus> UsbClass<B> for CcidClass<'_, B> {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> UsbResult<()> {
         // Interface smart card (bInterfaceClass 0x0B), sem subclass/protocol.
         writer.interface(self.iface, 0x0B, 0x00, 0x00)?;
-        writer.write(0x21, &CCID_CLASS_DESCRIPTOR)?;
+        // DescriptorWriter::write já prefixa bLength (54) e bDescriptorType (0x21);
+        // passa apenas o corpo de 52 bytes sem duplicar o cabeçalho.
+        writer.write(0x21, &CCID_CLASS_DESCRIPTOR[2..])?;
         writer.endpoint(&self.ep_in)?;
         writer.endpoint(&self.ep_out)?;
         Ok(())

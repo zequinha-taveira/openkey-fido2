@@ -131,7 +131,9 @@ impl<'a, B: UsbBus> CtapHidClass<'a, B> {
 impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> UsbResult<()> {
         writer.interface(self.iface, 0x03, 0x00, 0x00)?;
-        writer.write(0x21, &self.hid_descriptor())?;
+        // DescriptorWriter::write já prefixa bLength (9) e bDescriptorType (0x21);
+        // passa apenas o corpo de 7 bytes sem duplicar o cabeçalho.
+        writer.write(0x21, &self.hid_descriptor()[2..])?;
         writer.endpoint(&self.ep_in)?;
         writer.endpoint(&self.ep_out)?;
         Ok(())
@@ -149,15 +151,24 @@ impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
     fn control_in(&mut self, xfer: ControlIn<B>) {
         let req = *xfer.request();
 
-        // GET_DESCRIPTOR (HID Report, tipo 0x22) — requisitado pelo host
-        // (navegador / FIDO Conformance Tool) durante a enumeração.
+        // GET_DESCRIPTOR (HID Descriptor 0x21 ou HID Report 0x22) — requisitado
+        // pelo host durante a enumeração.
         if req.request_type == control::RequestType::Standard
             && req.recipient == control::Recipient::Interface
             && req.request == control::Request::GET_DESCRIPTOR
-            && (req.value >> 8) == 0x22
         {
-            let _ = xfer.accept_with(CTAPHID_REPORT_DESCRIPTOR);
-            return;
+            match (req.value >> 8) as u8 {
+                0x21 => {
+                    let desc = self.hid_descriptor();
+                    let _ = xfer.accept_with(&desc);
+                    return;
+                }
+                0x22 => {
+                    let _ = xfer.accept_with(CTAPHID_REPORT_DESCRIPTOR);
+                    return;
+                }
+                _ => {}
+            }
         }
 
         // HID class requests IN que o driver Windows envia durante o start
@@ -504,5 +515,20 @@ mod tests {
             result,
             Err(EmbeddedTransportError::NotInitialized)
         ));
+    }
+
+    #[test]
+    fn test_hid_descriptor_layout() {
+        let (backend, _state) = make_backend();
+        let desc = backend.hid.hid_descriptor();
+        assert_eq!(desc.len(), 9);
+        assert_eq!(desc[0], 0x09); // bLength
+        assert_eq!(desc[1], 0x21); // bDescriptorType (HID)
+        assert_eq!(&desc[2..4], &[0x11, 0x01]); // bcdHID 1.11
+        assert_eq!(desc[6], 0x22); // Report descriptor type
+        let rpt_len = u16::from_le_bytes([desc[7], desc[8]]) as usize;
+        assert_eq!(rpt_len, CTAPHID_REPORT_DESCRIPTOR.len());
+        // O corpo passado ao DescriptorWriter::write tem 7 bytes (sem bLength/bDescriptorType):
+        assert_eq!(&desc[2..], &[0x11, 0x01, 0x00, 0x01, 0x22, 0x22, 0x00]);
     }
 }

@@ -51,6 +51,7 @@ device-profile = { path = "../../firmware/device-profile", default-features = fa
 # Stack do autenticador: applets Yubico (OATH/Management) para o roteador
 # CCID. Sem `rs256` (RSA exige rand/std) e sem `std` — alvo bare-metal.
 authenticator = { path = "../../firmware/authenticator", default-features = false }
+ctap2 = { path = "../../protocol/ctap2", default-features = false }
 crypto = { path = "../../protocol/crypto", default-features = false }
 storage = { path = "../../firmware/storage", default-features = false }
 cortex-m = "0.7"
