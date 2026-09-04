@@ -134,6 +134,7 @@ mod tests {
         in_packets: Vec<[u8; 64]>,
         out_packets: VecDeque<[u8; 64]>,
         initialized: bool,
+        fail_init: bool,
     }
 
     impl MockUsbHid {
@@ -142,6 +143,16 @@ mod tests {
                 in_packets: Vec::new(),
                 out_packets: VecDeque::new(),
                 initialized: false,
+                fail_init: false,
+            }
+        }
+
+        fn failing_init() -> Self {
+            Self {
+                in_packets: Vec::new(),
+                out_packets: VecDeque::new(),
+                initialized: false,
+                fail_init: true,
             }
         }
 
@@ -152,6 +163,9 @@ mod tests {
 
     impl UsbHidDevice for MockUsbHid {
         fn init(&mut self) -> Result<(), EmbeddedTransportError> {
+            if self.fail_init {
+                return Err(EmbeddedTransportError::SendFailed);
+            }
             self.initialized = true;
             Ok(())
         }
@@ -230,5 +244,76 @@ mod tests {
 
         assert_eq!(transport.recv().unwrap(), payload);
         assert_eq!(transport.cid(), 0x11223344);
+    }
+
+    #[test]
+    fn test_framed_usb_hid_io_before_init_returns_not_initialized() {
+        let mut transport = FramedUsbHidTransport::new(MockUsbHid::new());
+        assert!(matches!(
+            transport.send(b"x"),
+            Err(TransportError::NotInitialized)
+        ));
+        assert!(matches!(
+            transport.recv(),
+            Err(TransportError::NotInitialized)
+        ));
+    }
+
+    #[test]
+    fn test_framed_usb_hid_init_failure_propagates() {
+        let mut transport = FramedUsbHidTransport::new(MockUsbHid::failing_init());
+        assert!(matches!(
+            transport.init(),
+            Err(TransportError::SendError(_))
+        ));
+        // Falha no init não pode marcar o transporte como inicializado.
+        assert!(matches!(
+            transport.send(b"x"),
+            Err(TransportError::NotInitialized)
+        ));
+        assert!(matches!(
+            transport.recv(),
+            Err(TransportError::NotInitialized)
+        ));
+    }
+
+    #[test]
+    fn test_framed_usb_hid_empty_recv_returns_timeout() {
+        let mut transport = FramedUsbHidTransport::new(MockUsbHid::new());
+        transport.init().unwrap();
+        match transport.recv() {
+            Err(TransportError::RecvError(msg)) => assert!(msg.contains("timeout")),
+            other => panic!("expected timeout RecvError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_framed_usb_hid_close_resets_and_reinit_roundtrips() {
+        let mut mock = MockUsbHid::new();
+        let payload = vec![9, 8, 7, 6];
+        let pkts = CtaphidFragmenter::fragment(0x55667788, CtaphidCommand::Cbor, &payload).unwrap();
+        for pkt in pkts {
+            mock.queue_packet(pkt);
+        }
+        let mut transport = FramedUsbHidTransport::new(mock);
+        transport.init().unwrap();
+        assert_eq!(transport.recv().unwrap(), payload);
+
+        assert!(transport.close().is_ok());
+        assert!(matches!(
+            transport.send(b"x"),
+            Err(TransportError::NotInitialized)
+        ));
+        assert!(matches!(
+            transport.recv(),
+            Err(TransportError::NotInitialized)
+        ));
+
+        // Após re-init, send volta a enquadrar e set_cid/cid seguem ativos.
+        transport.init().unwrap();
+        transport.set_cid(0x55667788);
+        assert_eq!(transport.cid(), 0x55667788);
+        transport.send(&payload).unwrap();
+        assert!(!transport.device().in_packets.is_empty());
     }
 }

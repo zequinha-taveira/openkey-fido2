@@ -9,17 +9,19 @@
 //!
 //! # Comandos suportados
 //!
-//! Apenas leitura de identidade — o objetivo desta fase é descoberta pelo
-//! host, não configuração:
+//! Descoberta pelo host mais escrita de configuração (aba Interfaces do
+//! Yubico Authenticator / `ykman config usb`), sem código de bloqueio por
+//! padrão:
 //!
-//! | Comando    | INS    | P1                | Resposta                          |
-//! |------------|--------|-------------------|-----------------------------------|
-//! | SELECT AID | `0xA4` | `0x04` (roteador) | ASCII da versão, ex. `"5.4.0"`    |
-//! | READ CONFIG| `0x1D` | página (`0x00`)   | `[len][TLVs…]` (DeviceInfo)       |
+//! | Comando     | INS    | P1                | Resposta / efeito                 |
+//! |-------------|--------|-------------------|-----------------------------------|
+//! | SELECT AID  | `0xA4` | `0x04` (roteador) | ASCII da versão, ex. `"5.4.0"`    |
+//! | READ CONFIG | `0x1D` | página (`0x00`)   | `[len][TLVs…]` (DeviceInfo)       |
+//! | SET MODE    | `0x16` | `0x11`            | persiste `usb_enabled` + timeouts |
+//! | WRITE CONFIG| `0x1C` | `0x00`            | persiste `DeviceConfig` TLVs        |
 //!
-//! `SET MODE` (`0x16`), `WRITE CONFIG` (`0x1C`) e `DEVICE RESET` (`0x1F`)
-//! existem no protocolo mas não são implementados: qualquer INS desconhecido
-//! responde `6D00`.
+//! `DEVICE RESET` (`0x1F`) não é implementado (só existe no YubiKey Bio):
+//! responde `6D00`, como qualquer outro INS desconhecido.
 //!
 //! # Layout da resposta de READ CONFIG
 //!
@@ -63,11 +65,12 @@
 //!   alvo (dongle USB-A); qualquer código 0–7 é aceito pela enum
 //!   `FORM_FACTOR` do python-yubikit, e o nibble alto fica limpo (sem flags
 //!   FIPS/SKY). Placeholder até wiring de identidade de produto.
-//! - **Capacidades `0x0624`**: `OATH (0x20) | FIDO2 (0x200) | Management
-//!   sobre CCID (0x400) | CCID geral (0x04)` — os dois últimos bits não têm
-//!   nome na enum `CAPABILITY`, mas entram no cálculo de `usb_interfaces`
-//!   do yubikit (interface CCID anunciada corretamente). Não anunciamos OTP,
-//!   PIV, OpenPGP ou HSMAUTH: não os implementamos.
+//! - **Capacidades `0x062E`**: `OATH (0x20) | PIV (0x02) | OpenPGP (0x08) |
+//!   FIDO2 (0x200) | Management sobre CCID (0x400) | CCID geral (0x04)` — os
+//!   dois últimos bits não têm nome na enum `CAPABILITY`, mas entram no
+//!   cálculo de `usb_interfaces` do yubikit (interface CCID anunciada
+//!   corretamente). PIV (F2a) e OpenPGP SIG (F2b) têm chaves reais, por isso
+//!   são anunciados; OTP e HSMAUTH seguem fora.
 //! - **Página única**: `P1 != 0` responde `6B00`; o ykman só pagina quando
 //!   encontra `TAG_MORE_DATA`, que nunca emitimos, logo o caminho é apenas
 //!   defensivo.
@@ -77,7 +80,7 @@ use alloc::format;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::fmt;
-use crypto::CryptoEngine;
+use crypto::{constant_time_eq, CryptoEngine};
 use log::warn;
 use storage::StorageEngine;
 use transport::iso7816::{Apdu, Applet, CardRouter, ResponseData};
@@ -90,14 +93,17 @@ pub const AID_YUBICO_MANAGEMENT: &[u8] = &[0xA0, 0x00, 0x00, 0x05, 0x27, 0x47, 0
 /// Chave reservada no [`StorageEngine`] para o estado cifrado do applet.
 const STORAGE_KEY: &str = "sys:mgmt";
 
-/// Versão do formato de serialização do estado.
-const STATE_FORMAT_VERSION: u8 = 1;
+/// Versão do formato de serialização do estado (`v1` = só serial,
+/// migrado para `v2` com `usb_enabled` + lock + timeouts/flags).
+const STATE_FORMAT_VERSION: u8 = 2;
+/// Versão legada aceita na leitura (migração sem perda do serial).
+const STATE_FORMAT_VERSION_V1: u8 = 1;
 
 /// Versão reportada no SELECT e no TLV `0x05` — ver decisão no topo.
 const REPORTED_VERSION: [u8; 3] = [0x05, 0x04, 0x00];
 
 /// Bits CAPABILITY anunciados em USB supported/enabled (big-endian, 2 bytes).
-const SUPPORTED_CAPABILITIES: u16 = 0x0624;
+const SUPPORTED_CAPABILITIES: u16 = 0x062E;
 
 /// Form factor reportado (`FORM_FACTOR.USB_A_KEYCHAIN`) — ver decisão no topo.
 const FORM_FACTOR_CODE: u8 = 0x01;
@@ -109,45 +115,136 @@ const TAG_SERIAL: u8 = 0x02;
 const TAG_USB_ENABLED: u8 = 0x03;
 const TAG_FORM_FACTOR: u8 = 0x04;
 const TAG_VERSION: u8 = 0x05;
+const TAG_AUTO_EJECT_TIMEOUT: u8 = 0x06;
+const TAG_CHALRESP_TIMEOUT: u8 = 0x07;
+const TAG_DEVICE_FLAGS: u8 = 0x08;
+const TAG_CONFIG_LOCK: u8 = 0x0A;
+const TAG_UNLOCK: u8 = 0x0B;
+const TAG_REBOOT: u8 = 0x0C;
+const TAG_NFC_ENABLED: u8 = 0x0E;
 
 // --- Instruções (`_ManagementSmartCardBackend`) ---------------------------------
 
 /// READ CONFIG: leitura do DeviceInfo paginado por P1.
 const INS_READ_CONFIG: u8 = 0x1D;
+/// SET MODE legado (YubiKey NEO/4; no 5.x o host traduz para WRITE CONFIG).
+const INS_SET_MODE: u8 = 0x16;
+/// WRITE CONFIG (`DeviceConfig::get_bytes` do yubikit, exige versão ≥ 5.0).
+const INS_WRITE_CONFIG: u8 = 0x1C;
+/// P1 do SET MODE sobre CCID (`P1_DEVICE_CONFIG` do yubikit).
+const P1_DEVICE_CONFIG: u8 = 0x11;
+/// Tamanho do código de bloqueio de configuração (16 bytes).
+const LOCK_CODE_LEN: usize = 16;
 
 // --- Status Words ----------------------------------------------------------------
 
 /// CLA diferente de `0x00` (mesma política do applet OATH).
 const SW_CLASS_NOT_SUPPORTED: u16 = 0x6E00;
+/// Dado malformado ou fora do suportado (`6A80`, convenção dos applets PIV/OpenPGP/OATH).
+const SW_WRONG_SYNTAX: u16 = 0x6A80;
 
 // --- Estado ------------------------------------------------------------------------
 
-/// Estado do applet: identidade estável do dispositivo.
+/// Estado do applet: identidade estável + configuração gravável.
 ///
-/// Não contém material sensível (o serial é informação pública), por isso
-/// dispensa zeroize — ver decisão no topo do módulo.
+/// O serial é informação pública (o ykman imprime); o código de bloqueio,
+/// quando definido, é sensível e por isso é redigido no `Debug` do applet
+/// (que só mostra `loaded`/`serial`) e nunca entra em logs.
 struct ManagementState {
     serial: u32,
+    usb_enabled: u16,
+    nfc_enabled: u16,
+    auto_eject_timeout: u16,
+    chalresp_timeout: u8,
+    device_flags: u8,
+    lock_code: Option<[u8; LOCK_CODE_LEN]>,
 }
 
+impl ManagementState {
+    fn factory(serial: u32) -> Self {
+        Self {
+            serial,
+            usb_enabled: SUPPORTED_CAPABILITIES,
+            nfc_enabled: 0,
+            auto_eject_timeout: 0,
+            chalresp_timeout: 0,
+            device_flags: 0,
+            lock_code: None,
+        }
+    }
+}
+
+/// Layout `v2` (30 bytes): `[ver][serial 4][usb 2][nfc 2][eject 2]
+/// [chalresp 1][flags 1][has_lock 1][lock 16]`.
 fn serialize_state(state: &ManagementState) -> Vec<u8> {
-    let mut out = Vec::with_capacity(5);
+    let mut out = Vec::with_capacity(30);
     out.push(STATE_FORMAT_VERSION);
     out.extend_from_slice(&state.serial.to_be_bytes());
+    out.extend_from_slice(&state.usb_enabled.to_be_bytes());
+    out.extend_from_slice(&state.nfc_enabled.to_be_bytes());
+    out.extend_from_slice(&state.auto_eject_timeout.to_be_bytes());
+    out.push(state.chalresp_timeout);
+    out.push(state.device_flags);
+    match &state.lock_code {
+        None => {
+            out.push(0);
+            out.extend_from_slice(&[0u8; LOCK_CODE_LEN]);
+        }
+        Some(code) => {
+            out.push(1);
+            out.extend_from_slice(code);
+        }
+    }
     out
 }
 
-/// Rejeita blobs com formato desconhecido ou serial nulo (inválido para o
+/// Aceita `v2` e migra `v1` (só serial, demais campos com defaults);
+/// rejeita blobs com formato desconhecido ou serial nulo (inválido para o
 /// parser do yubikit, que trata serial 0 como ausente).
 fn parse_state(blob: &[u8]) -> Option<ManagementState> {
-    if blob.len() != 5 || blob[0] != STATE_FORMAT_VERSION {
+    if blob.is_empty() {
         return None;
     }
-    let serial = u32::from_be_bytes([blob[1], blob[2], blob[3], blob[4]]);
-    if serial == 0 {
-        return None;
+    match blob[0] {
+        STATE_FORMAT_VERSION_V1 => {
+            if blob.len() != 5 {
+                return None;
+            }
+            let serial = u32::from_be_bytes([blob[1], blob[2], blob[3], blob[4]]);
+            if serial == 0 {
+                return None;
+            }
+            Some(ManagementState::factory(serial))
+        }
+        STATE_FORMAT_VERSION => {
+            if blob.len() != 30 {
+                return None;
+            }
+            let serial = u32::from_be_bytes([blob[1], blob[2], blob[3], blob[4]]);
+            if serial == 0 {
+                return None;
+            }
+            let lock_code = match blob[13] {
+                0 => None,
+                1 => {
+                    let mut code = [0u8; LOCK_CODE_LEN];
+                    code.copy_from_slice(&blob[14..30]);
+                    Some(code)
+                }
+                _ => return None,
+            };
+            Some(ManagementState {
+                serial,
+                usb_enabled: u16::from_be_bytes([blob[5], blob[6]]),
+                nfc_enabled: u16::from_be_bytes([blob[7], blob[8]]),
+                auto_eject_timeout: u16::from_be_bytes([blob[9], blob[10]]),
+                chalresp_timeout: blob[11],
+                device_flags: blob[12],
+                lock_code,
+            })
+        }
+        _ => None,
     }
-    Some(ManagementState { serial })
 }
 
 // --- Applet -------------------------------------------------------------------------
@@ -234,14 +331,15 @@ impl<'a> ManagementApplet<'a> {
         }
     }
 
-    /// Estado de fábrica: serial aleatório não nulo (SystemRandom).
+    /// Estado de fábrica: serial aleatório não nulo (SystemRandom) com
+    /// configuração default (tudo suportado habilitado, sem bloqueio).
     fn factory_state(&self) -> ManagementState {
         loop {
             let bytes = self.crypto.random_bytes(4);
             let serial = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             // Serial 0 significa "sem serial" para o yubikit; sorteia de novo.
             if serial != 0 {
-                break ManagementState { serial };
+                break ManagementState::factory(serial);
             }
         }
     }
@@ -270,24 +368,42 @@ impl<'a> ManagementApplet<'a> {
     }
 
     /// Monta a resposta de READ CONFIG: `[len][TLVs…]` na ordem do yubikit.
-    fn read_config_payload(serial: u32) -> Vec<u8> {
+    ///
+    /// Os 5 TLVs base são sempre emitidos (mesmo layout das chaves físicas);
+    /// timeouts/flags só entram quando não-default para não quebrar o
+    /// layout de 22 bytes do estado de fábrica; `TAG_NFC_ENABLED` é ecoado
+    /// quando já foi gravado via WRITE CONFIG (sem `TAG_NFC_SUPPORTED`, o
+    /// yubikit continua sem anunciar transporte NFC).
+    fn read_config_payload(state: &ManagementState) -> Vec<u8> {
         let mut tlvs = Vec::new();
         push_tlv(
             &mut tlvs,
             TAG_USB_SUPPORTED,
             &SUPPORTED_CAPABILITIES.to_be_bytes(),
         );
-        push_tlv(&mut tlvs, TAG_SERIAL, &serial.to_be_bytes());
-        push_tlv(
-            &mut tlvs,
-            TAG_USB_ENABLED,
-            &SUPPORTED_CAPABILITIES.to_be_bytes(),
-        );
+        push_tlv(&mut tlvs, TAG_SERIAL, &state.serial.to_be_bytes());
+        push_tlv(&mut tlvs, TAG_USB_ENABLED, &state.usb_enabled.to_be_bytes());
         push_tlv(&mut tlvs, TAG_FORM_FACTOR, &[FORM_FACTOR_CODE]);
         push_tlv(&mut tlvs, TAG_VERSION, &REPORTED_VERSION);
+        if state.auto_eject_timeout != 0 {
+            push_tlv(
+                &mut tlvs,
+                TAG_AUTO_EJECT_TIMEOUT,
+                &state.auto_eject_timeout.to_be_bytes(),
+            );
+        }
+        if state.chalresp_timeout != 0 {
+            push_tlv(&mut tlvs, TAG_CHALRESP_TIMEOUT, &[state.chalresp_timeout]);
+        }
+        if state.device_flags != 0 {
+            push_tlv(&mut tlvs, TAG_DEVICE_FLAGS, &[state.device_flags]);
+        }
+        if state.nfc_enabled != 0 {
+            push_tlv(&mut tlvs, TAG_NFC_ENABLED, &state.nfc_enabled.to_be_bytes());
+        }
 
         // Prefixo de comprimento exigido pelo parser (`len(encoded)-1 ==
-        // encoded[0]`); payload fixo cabe folgado em um byte.
+        // encoded[0]`); payload cabe folgado em um byte.
         debug_assert!(tlvs.len() <= 255, "DeviceInfo TLVs exceed short length");
         let mut out = Vec::with_capacity(tlvs.len() + 1);
         out.push(tlvs.len() as u8);
@@ -301,8 +417,146 @@ impl<'a> ManagementApplet<'a> {
             return Err(transport::iso7816::SW_WRONG_P1_P2);
         }
         self.ensure_loaded()?;
-        let serial = self.state.as_ref().expect("loaded by ensure_loaded").serial;
-        Ok(ResponseData::ok(Self::read_config_payload(serial)))
+        let state = self.state.as_ref().expect("loaded by ensure_loaded");
+        Ok(ResponseData::ok(Self::read_config_payload(state)))
+    }
+
+    /// WRITE CONFIG (`0x1C`): aplica um `DeviceConfig::get_bytes` do yubikit.
+    ///
+    /// Formato: `[len][TLVs…]` com o comprimento cobrindo exatamente os TLVs
+    /// (mesma regra do READ CONFIG). Tags honradas: `TAG_USB_ENABLED` (2B,
+    /// deve ser subconjunto de `SUPPORTED_CAPABILITIES`, senão `6A80`),
+    /// `TAG_NFC_ENABLED` (2B, persistido para eco), timeouts/flags,
+    /// `TAG_REBOOT` (aceito como no-op — sem reboot físico no host),
+    /// `TAG_UNLOCK`/`TAG_CONFIG_LOCK` (16B; sem bloqueio configurado,
+    /// `TAG_UNLOCK` é ignorado; com bloqueio, divergência dá `6982`).
+    /// Tags desconhecidas são ignoradas (compatibilidade futura).
+    fn cmd_write_config(&mut self, data: &[u8]) -> Result<ResponseData, u16> {
+        let tlvs = parse_config_payload(data)?;
+        self.ensure_loaded()?;
+        let state = self.state.as_mut().expect("loaded by ensure_loaded");
+
+        // Bloqueio de configuração: valida antes de qualquer mutação.
+        if let Some(cur) = tlv_get(&tlvs, TAG_UNLOCK) {
+            if cur.len() != LOCK_CODE_LEN {
+                return Err(SW_WRONG_SYNTAX);
+            }
+            // Sem bloqueio configurado, `TAG_UNLOCK` é ignorado (como na
+            // chave física); com bloqueio, divergência dá `6982`.
+            match &state.lock_code {
+                Some(expected) if !constant_time_eq(cur, expected) => {
+                    return Err(transport::iso7816::SW_SECURITY_STATUS);
+                }
+                _ => {}
+            }
+        }
+
+        // Valida USB antes de mutar (tudo-ou-nada como na chave física).
+        if let Some(value) = tlv_get(&tlvs, TAG_USB_ENABLED) {
+            if value.len() != 2 {
+                return Err(SW_WRONG_SYNTAX);
+            }
+            let caps = u16::from_be_bytes([value[0], value[1]]);
+            if caps & !SUPPORTED_CAPABILITIES != 0 {
+                return Err(SW_WRONG_SYNTAX);
+            }
+        }
+        if let Some(value) = tlv_get(&tlvs, TAG_NFC_ENABLED) {
+            if value.len() != 2 {
+                return Err(SW_WRONG_SYNTAX);
+            }
+        }
+        for (tag, value) in &tlvs {
+            match *tag {
+                TAG_AUTO_EJECT_TIMEOUT => {
+                    if value.len() != 2 {
+                        return Err(SW_WRONG_SYNTAX);
+                    }
+                }
+                TAG_CHALRESP_TIMEOUT | TAG_DEVICE_FLAGS => {
+                    if value.len() != 1 {
+                        return Err(SW_WRONG_SYNTAX);
+                    }
+                }
+                TAG_CONFIG_LOCK => {
+                    if value.len() != LOCK_CODE_LEN {
+                        return Err(SW_WRONG_SYNTAX);
+                    }
+                }
+                TAG_REBOOT | TAG_UNLOCK | TAG_USB_ENABLED | TAG_NFC_ENABLED => {}
+                _ => {} // tags futuras: ignoradas
+            }
+        }
+
+        // Aplica na ordem do `DeviceConfig::get_bytes` (reboot/unlock sem efeito
+        // persistente; capacidades, timeouts, flags e lock novo persistem).
+        if let Some(value) = tlv_get(&tlvs, TAG_USB_ENABLED) {
+            state.usb_enabled = u16::from_be_bytes([value[0], value[1]]);
+        }
+        if let Some(value) = tlv_get(&tlvs, TAG_NFC_ENABLED) {
+            state.nfc_enabled = u16::from_be_bytes([value[0], value[1]]);
+        }
+        if let Some(value) = tlv_get(&tlvs, TAG_AUTO_EJECT_TIMEOUT) {
+            state.auto_eject_timeout = u16::from_be_bytes([value[0], value[1]]);
+        }
+        if let Some(value) = tlv_get(&tlvs, TAG_CHALRESP_TIMEOUT) {
+            state.chalresp_timeout = value[0];
+        }
+        if let Some(value) = tlv_get(&tlvs, TAG_DEVICE_FLAGS) {
+            state.device_flags = value[0];
+        }
+        if let Some(value) = tlv_get(&tlvs, TAG_CONFIG_LOCK) {
+            let mut code = [0u8; LOCK_CODE_LEN];
+            code.copy_from_slice(value);
+            if code == [0u8; LOCK_CODE_LEN] {
+                state.lock_code = None; // all-zero remove o bloqueio
+            } else {
+                state.lock_code = Some(code);
+            }
+        }
+
+        self.persist_state()?;
+        Ok(ResponseData::ok(Vec::new()))
+    }
+
+    /// SET MODE legado (`0x16`, `P1 = 0x11`): traduz o código de modo
+    /// (`_MODES` do yubikit, 3 bits baixos) em capacidades USB, com máscara
+    /// em `SUPPORTED_CAPABILITIES`, e persiste timeouts. Na versão reportada
+    /// (`5.4.0`) o host oficial prefere WRITE CONFIG; este caminho existe
+    /// para compatibilidade com APDUs diretas e ferramentas antigas.
+    fn cmd_set_mode(&mut self, p1: u8, data: &[u8]) -> Result<ResponseData, u16> {
+        if p1 != P1_DEVICE_CONFIG {
+            return Err(transport::iso7816::SW_WRONG_P1_P2);
+        }
+        if data.len() != 4 {
+            return Err(transport::iso7816::SW_WRONG_LENGTH);
+        }
+        let code = data[0] & 0x07;
+        let chalresp_timeout = data[1];
+        let auto_eject_timeout = u16::from_le_bytes([data[2], data[3]]);
+
+        // `_MODES = [OTP, CCID, OTP|CCID, FIDO, OTP|FIDO, FIDO|CCID, OTP|FIDO|CCID]`
+        // com bits CAPABILITY do backend (OTP→0x01, CCID→OATH|PIV|OPENPGP|
+        // HSMAUTH|0x400, FIDO→U2F|FIDO2). OTP/U2F/HSMAUTH caem na máscara de
+        // suportados — o host oficial já faz esse overlay antes de enviar.
+        const MODE_CAPS: [u16; 7] = [
+            0x0001, // OTP
+            0x0438, // CCID: OATH|PIV|OPENPGP|HSMAUTH|mgmt-CCID
+            0x0439, // OTP|CCID
+            0x0202, // FIDO: U2F|FIDO2
+            0x0203, // OTP|FIDO
+            0x063A, // FIDO|CCID
+            0x063B, // OTP|FIDO|CCID
+        ];
+        let caps = MODE_CAPS[usize::from(code)] & SUPPORTED_CAPABILITIES;
+
+        self.ensure_loaded()?;
+        let state = self.state.as_mut().expect("loaded by ensure_loaded");
+        state.usb_enabled = caps;
+        state.chalresp_timeout = chalresp_timeout;
+        state.auto_eject_timeout = auto_eject_timeout;
+        self.persist_state()?;
+        Ok(ResponseData::ok(Vec::new()))
     }
 }
 
@@ -335,8 +589,15 @@ impl Applet for ManagementApplet<'_> {
         }
         match apdu.ins {
             INS_READ_CONFIG => self.cmd_read_config(apdu.p1),
-            // SET MODE (0x16), WRITE CONFIG (0x1C), DEVICE RESET (0x1F) e
-            // qualquer outro INS: não implementado nesta fase.
+            INS_WRITE_CONFIG => {
+                if apdu.p1 != 0x00 || apdu.p2 != 0x00 {
+                    return Err(transport::iso7816::SW_WRONG_P1_P2);
+                }
+                self.cmd_write_config(apdu.data)
+            }
+            INS_SET_MODE => self.cmd_set_mode(apdu.p1, apdu.data),
+            // DEVICE RESET (0x1F, só YubiKey Bio) e qualquer outro INS:
+            // não implementado.
             _ => Err(transport::iso7816::SW_INS_NOT_SUPPORTED),
         }
     }
@@ -348,6 +609,45 @@ fn push_tlv(out: &mut Vec<u8>, tag: u8, value: &[u8]) {
     out.push(tag);
     out.push(value.len() as u8);
     out.extend_from_slice(value);
+}
+
+/// Busca o valor de uma tag no dicionário TLV (última ocorrência vence,
+/// como no `Tlv.parse_dict` do yubikit).
+fn tlv_get(tlvs: &[(u8, Vec<u8>)], tag: u8) -> Option<&Vec<u8>> {
+    tlvs.iter().find(|(t, _)| *t == tag).map(|(_, v)| v)
+}
+
+/// Decodifica um payload de WRITE CONFIG (`DeviceConfig::get_bytes`):
+/// `[len][TLVs…]` com o comprimento cobrindo exatamente os TLVs (mesma
+/// regra que o parser do yubikit aplica no READ CONFIG). Comprimento
+/// divergente dá `6700`; TLV truncado ou tag sem comprimento dá `6A80`.
+/// Tags repetidas: vence a última (como no `Tlv.parse_dict` do yubikit).
+fn parse_config_payload(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, u16> {
+    use transport::iso7816::SW_WRONG_LENGTH;
+    if data.is_empty() || data.len() - 1 != usize::from(data[0]) {
+        return Err(SW_WRONG_LENGTH);
+    }
+    let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut pos = 1usize;
+    while pos < data.len() {
+        if data.len() - pos < 2 {
+            return Err(SW_WRONG_SYNTAX);
+        }
+        let tag = data[pos];
+        let len = usize::from(data[pos + 1]);
+        let end = pos + 2 + len;
+        if end > data.len() {
+            return Err(SW_WRONG_SYNTAX);
+        }
+        let value = data[pos + 2..end].to_vec();
+        if let Some(slot) = out.iter_mut().find(|(t, _)| *t == tag) {
+            slot.1 = value;
+        } else {
+            out.push((tag, value));
+        }
+        pos = end;
+    }
+    Ok(out)
 }
 
 // --- Integração ----------------------------------------------------------------------
@@ -515,13 +815,13 @@ mod tests {
 
         // Layout montado à mão a partir da semântica do python-yubikit:
         // [len][01 02 caps][02 04 serial][03 02 caps][04 01 ff][05 03 vvv].
-        let mut expected = vec![22, TAG_USB_SUPPORTED, 0x02, 0x06, 0x24, TAG_SERIAL, 0x04];
+        let mut expected = vec![22, TAG_USB_SUPPORTED, 0x02, 0x06, 0x2E, TAG_SERIAL, 0x04];
         expected.extend_from_slice(&serial.to_be_bytes());
         expected.extend_from_slice(&[
             TAG_USB_ENABLED,
             0x02,
             0x06,
-            0x24,
+            0x2E,
             TAG_FORM_FACTOR,
             0x01,
             FORM_FACTOR_CODE,
@@ -545,9 +845,9 @@ mod tests {
         assert_eq!(response.sw, None);
 
         let info = parse_like_yubikit(&response.data).expect("parser do yubikit deve aceitar");
-        // CAPABILITY: OATH | FIDO2 | mgmt-CCID | CCID geral.
-        assert_eq!(info.usb_supported, 0x0624);
-        assert_eq!(info.usb_enabled, Some(0x0624));
+        // CAPABILITY: OATH | PIV | OpenPGP | FIDO2 | mgmt-CCID | CCID geral.
+        assert_eq!(info.usb_supported, 0x062E);
+        assert_eq!(info.usb_enabled, Some(0x062E));
         // USB interfaces computadas pelo yubikit devem incluir CCID.
         let ccid_mask = 0x0004u16 | 0x0400 | 0x0020;
         assert_ne!(
@@ -617,14 +917,11 @@ mod tests {
     fn test_unknown_ins_returns_ins_not_supported() {
         let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
         let mut applet = make_applet(&storage);
-        // INS definidos no protocolo mas não implementados...
-        for ins in [0x16u8, 0x1Cu8, 0x1Fu8] {
-            let raw = vec![0x00, ins, 0x00, 0x00];
-            assert_eq!(
-                run(&mut applet, &raw).sw,
-                Some(transport::iso7816::SW_INS_NOT_SUPPORTED)
-            );
-        }
+        // DEVICE RESET (0x1F, só YubiKey Bio) continua não implementado...
+        assert_eq!(
+            run(&mut applet, &[0x00, 0x1F, 0x00, 0x00]).sw,
+            Some(transport::iso7816::SW_INS_NOT_SUPPORTED)
+        );
         // ...e qualquer INS arbitrário.
         assert_eq!(
             run(&mut applet, &[0x00, 0x42, 0x00, 0x00]).sw,
@@ -646,6 +943,234 @@ mod tests {
         let mut applet = make_applet(&storage);
         let raw = vec![0x80, INS_READ_CONFIG, 0x00, 0x00];
         assert_eq!(run(&mut applet, &raw).sw, Some(SW_CLASS_NOT_SUPPORTED));
+    }
+
+    // --- WRITE CONFIG / SET MODE --------------------------------------------------
+
+    /// Monta um frame curto (`00 1C 00 00 Lc data`) como o `DeviceConfig`
+    /// do yubikit: `data = [len][TLVs…]`.
+    fn write_config_frame(entries: &[(u8, &[u8])]) -> Vec<u8> {
+        let mut inner = Vec::new();
+        for (tag, value) in entries {
+            push_tlv(&mut inner, *tag, value);
+        }
+        let mut data = Vec::with_capacity(inner.len() + 1);
+        data.push(inner.len() as u8);
+        data.extend_from_slice(&inner);
+        let mut frame = vec![0x00, INS_WRITE_CONFIG, 0x00, 0x00, data.len() as u8];
+        frame.extend_from_slice(&data);
+        frame
+    }
+
+    fn read_usb_enabled(applet: &mut ManagementApplet) -> u16 {
+        let resp = run(applet, &read_config_short(0));
+        assert_eq!(resp.sw, None);
+        let info = parse_like_yubikit(&resp.data).expect("READ deve parsear");
+        info.usb_enabled.expect("usb_enabled presente")
+    }
+
+    #[test]
+    fn test_write_config_usb_subset_roundtrips_in_read_config() {
+        let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
+        let mut applet = make_applet(&storage);
+        // Desliga o OpenPGP (0x08) mantendo o restante: subconjunto válido.
+        let subset = SUPPORTED_CAPABILITIES & !0x08u16;
+        let frame = write_config_frame(&[(TAG_USB_ENABLED, &subset.to_be_bytes())]);
+        assert_eq!(run(&mut applet, &frame).sw, None);
+        assert_eq!(read_usb_enabled(&mut applet), subset);
+        // READ continua parseável pelo yubikit (layout + comprimento).
+        let resp = run(&mut applet, &read_config_short(0));
+        assert_eq!(usize::from(resp.data[0]), resp.data.len() - 1);
+    }
+
+    #[test]
+    fn test_write_config_rejects_capabilities_outside_supported() {
+        let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
+        let mut applet = make_applet(&storage);
+        // OTP (0x01) não está em SUPPORTED_CAPABILITIES.
+        let bad = SUPPORTED_CAPABILITIES | 0x0001u16;
+        let frame = write_config_frame(&[(TAG_USB_ENABLED, &bad.to_be_bytes())]);
+        assert_eq!(run(&mut applet, &frame).sw, Some(SW_WRONG_SYNTAX));
+        // Estado intocado.
+        assert_eq!(read_usb_enabled(&mut applet), SUPPORTED_CAPABILITIES);
+    }
+
+    #[test]
+    fn test_write_config_framing_errors() {
+        let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
+        let mut applet = make_applet(&storage);
+        // Comprimento externo divergente → 6700.
+        let mut inner = Vec::new();
+        push_tlv(
+            &mut inner,
+            TAG_USB_ENABLED,
+            &SUPPORTED_CAPABILITIES.to_be_bytes(),
+        );
+        let mut bad_len = vec![0x00, INS_WRITE_CONFIG, 0x00, 0x00, (inner.len() + 1) as u8];
+        bad_len.push((inner.len() + 9) as u8);
+        bad_len.extend_from_slice(&inner);
+        assert_eq!(
+            run(&mut applet, &bad_len).sw,
+            Some(transport::iso7816::SW_WRONG_LENGTH)
+        );
+        // TLV truncado → 6A80.
+        let truncated = vec![0x00, INS_WRITE_CONFIG, 0x00, 0x00, 0x03, 0x02, 0x03, 0x02];
+        assert_eq!(run(&mut applet, &truncated).sw, Some(SW_WRONG_SYNTAX));
+        // usb_enabled com 1 byte → 6A80.
+        let frame = write_config_frame(&[(TAG_USB_ENABLED, &[0x06])]);
+        assert_eq!(run(&mut applet, &frame).sw, Some(SW_WRONG_SYNTAX));
+        // P1/P2 != 0 → 6B00.
+        let mut frame =
+            write_config_frame(&[(TAG_USB_ENABLED, &SUPPORTED_CAPABILITIES.to_be_bytes())]);
+        frame[2] = 0x01;
+        assert_eq!(
+            run(&mut applet, &frame).sw,
+            Some(transport::iso7816::SW_WRONG_P1_P2)
+        );
+    }
+
+    #[test]
+    fn test_set_mode_legacy_maps_code_and_persists_timeouts() {
+        let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
+        let mut applet = make_applet(&storage);
+        // Código 6 = OTP+FIDO+CCID, com timeouts; P1_DEVICE_CONFIG exigido.
+        let frame = vec![
+            0x00,
+            INS_SET_MODE,
+            P1_DEVICE_CONFIG,
+            0x00,
+            0x04,
+            0x06,
+            0x05,
+            0x10,
+            0x00,
+        ];
+        assert_eq!(run(&mut applet, &frame).sw, None);
+        assert_eq!(read_usb_enabled(&mut applet), 0x062Au16);
+        let resp = run(&mut applet, &read_config_short(0));
+        let info = parse_like_yubikit(&resp.data).expect("READ deve parsear");
+        assert_eq!(info.usb_enabled, Some(0x062Au16));
+        // P1 errado → 6B00; dados curtos → 6700 (roteador).
+        assert_eq!(
+            run(
+                &mut applet,
+                &[0x00, INS_SET_MODE, 0x00, 0x00, 0x04, 0x06, 0x00, 0x00, 0x00]
+            )
+            .sw,
+            Some(transport::iso7816::SW_WRONG_P1_P2)
+        );
+    }
+
+    #[test]
+    fn test_config_lock_flow() {
+        let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
+        let mut applet = make_applet(&storage);
+        let lock = [0xA5u8; LOCK_CODE_LEN];
+        let wrong = [0x5Au8; LOCK_CODE_LEN];
+        let subset = SUPPORTED_CAPABILITIES & !0x08u16;
+
+        // Define o bloqueio.
+        let frame = write_config_frame(&[(TAG_CONFIG_LOCK, &lock)]);
+        assert_eq!(run(&mut applet, &frame).sw, None);
+
+        // Unlock errado bloqueia a escrita (6982) sem mutar estado.
+        let frame = write_config_frame(&[
+            (TAG_UNLOCK, &wrong),
+            (TAG_USB_ENABLED, &subset.to_be_bytes()),
+        ]);
+        assert_eq!(
+            run(&mut applet, &frame).sw,
+            Some(transport::iso7816::SW_SECURITY_STATUS)
+        );
+        assert_eq!(read_usb_enabled(&mut applet), SUPPORTED_CAPABILITIES);
+
+        // Unlock correto aplica.
+        let frame = write_config_frame(&[
+            (TAG_UNLOCK, &lock),
+            (TAG_USB_ENABLED, &subset.to_be_bytes()),
+        ]);
+        assert_eq!(run(&mut applet, &frame).sw, None);
+        assert_eq!(read_usb_enabled(&mut applet), subset);
+
+        // All-zero com unlock correto remove o bloqueio: escrita aberta volta.
+        let frame = write_config_frame(&[
+            (TAG_UNLOCK, &lock),
+            (TAG_CONFIG_LOCK, &[0u8; LOCK_CODE_LEN]),
+        ]);
+        assert_eq!(run(&mut applet, &frame).sw, None);
+        let frame = write_config_frame(&[(TAG_USB_ENABLED, &SUPPORTED_CAPABILITIES.to_be_bytes())]);
+        assert_eq!(run(&mut applet, &frame).sw, None);
+        assert_eq!(read_usb_enabled(&mut applet), SUPPORTED_CAPABILITIES);
+    }
+
+    #[test]
+    fn test_write_config_persists_across_restart_with_stable_serial() {
+        let root = temp_root("mgmt-write-persist");
+        let path = root.join("store.json");
+        let subset = SUPPORTED_CAPABILITIES & !0x08u16;
+
+        let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
+        let mut first = open_persistent(&storage, &path, MASTER_KEY);
+        let serial = first.serial().expect("serial gerado");
+        let frame = write_config_frame(&[(TAG_USB_ENABLED, &subset.to_be_bytes())]);
+        assert_eq!(run(&mut first, &frame).sw, None);
+        drop(first);
+
+        let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
+        let mut second = open_persistent(&storage, &path, MASTER_KEY);
+        assert_eq!(second.serial(), Some(serial), "serial estável");
+        let resp = run(&mut second, &read_config_short(0));
+        let info = parse_like_yubikit(&resp.data).expect("READ deve parsear");
+        assert_eq!(info.usb_enabled, Some(subset), "usb_enabled sobrevive");
+    }
+
+    #[test]
+    fn test_v1_state_migrates_preserving_serial() {
+        // Blob v1 = [0x01][serial 4]: migrate deve adotar defaults e aceitar
+        // escrita em seguida.
+        let serial = 0x12345678u32;
+        let mut blob = vec![STATE_FORMAT_VERSION_V1];
+        blob.extend_from_slice(&serial.to_be_bytes());
+        assert!(parse_state(&blob).is_some());
+        let migrated = parse_state(&blob).unwrap();
+        assert_eq!(migrated.serial, serial);
+        assert_eq!(migrated.usb_enabled, SUPPORTED_CAPABILITIES);
+        assert!(migrated.lock_code.is_none());
+    }
+
+    #[test]
+    fn test_read_config_echoes_timeouts_flags_and_nfc_when_set() {
+        let storage = core::cell::RefCell::new(StorageEngine::new().unwrap());
+        let mut applet = make_applet(&storage);
+        let frame = write_config_frame(&[
+            (TAG_AUTO_EJECT_TIMEOUT, &0x001Eu16.to_be_bytes()),
+            (TAG_CHALRESP_TIMEOUT, &[0x0A]),
+            (TAG_DEVICE_FLAGS, &[0x40]),
+            (TAG_NFC_ENABLED, &0x0020u16.to_be_bytes()),
+        ]);
+        assert_eq!(run(&mut applet, &frame).sw, None);
+        let resp = run(&mut applet, &read_config_short(0));
+        let info = parse_like_yubikit(&resp.data).expect("READ deve parsear");
+        // Layout continua válido e usb_enabled intocado.
+        assert_eq!(info.usb_enabled, Some(SUPPORTED_CAPABILITIES));
+        assert_eq!(usize::from(resp.data[0]), resp.data.len() - 1);
+        // TLVs condicionais presentes no payload bruto.
+        let has = |tag: u8| {
+            let mut pos = 1usize;
+            while pos + 1 < resp.data.len() {
+                let t = resp.data[pos];
+                let l = usize::from(resp.data[pos + 1]);
+                if t == tag {
+                    return true;
+                }
+                pos += 2 + l;
+            }
+            false
+        };
+        assert!(has(TAG_AUTO_EJECT_TIMEOUT));
+        assert!(has(TAG_CHALRESP_TIMEOUT));
+        assert!(has(TAG_DEVICE_FLAGS));
+        assert!(has(TAG_NFC_ENABLED));
     }
 
     // --- integração com o roteador ----------------------------------------------------
@@ -692,7 +1217,7 @@ mod tests {
         let resp = router.process(&vec![0x00, INS_GET_RESPONSE, 0x00, 0x00][..]);
         assert_eq!(resp.sw, Some(SW_NO_ERROR));
         let parsed = parse_like_yubikit(&resp.data).expect("payload encadeado deve parsear");
-        assert_eq!(parsed.usb_supported, 0x0624);
+        assert_eq!(parsed.usb_supported, 0x062E);
     }
 
     #[test]

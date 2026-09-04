@@ -116,6 +116,15 @@ impl WebAuthnAuthenticator {
         self.ctap.set_user_presence(presence);
     }
 
+    /// Define a verificação de usuário embutida (mock de host) no CTAP2
+    /// subjacente, usada pelo ClientPIN 0x06/0x07.
+    pub fn set_user_verification(
+        &mut self,
+        verification: Option<Box<dyn ctap2::UserVerification>>,
+    ) {
+        self.ctap.set_user_verification(verification);
+    }
+
     /// Retorna referência imutável às capacidades configuradas.
     pub fn capabilities(&self) -> &ctap2::Ctap2Capabilities {
         self.ctap.capabilities()

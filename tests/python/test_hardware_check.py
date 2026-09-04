@@ -35,8 +35,13 @@ def test_json_structure_without_hardware():
 
 
 def test_cli_json_passes_no_hardware():
-    out = subprocess.check_output([sys.executable, str(TOOLS_DIR / "hardware_check.py"), "--json"])
-    data = json.loads(out)
+    proc = subprocess.run(
+        [sys.executable, str(TOOLS_DIR / "hardware_check.py"), "--json"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
     assert "hid" in data and "ccid" in data
     assert "hid_devices" in data["hid"]
     assert "readers" in data["ccid"]
@@ -77,12 +82,14 @@ def test_hid_mock_device_ping_and_getinfo():
 
 
 def test_ccid_mock_pcsclite_ykman_compatible_and_select():
-    # Simula lib PC/SC com 2 leitores, um compatível ykman
+    # Simula lib PC/SC com 3 leitores: nome real YubiKey (tokens de
+    # interface), nome com marca mas sem tokens (derruba o ykman com
+    # KeyError 'YK4_' em _pid_from_name) e genérico.
     fake_sc = mock.Mock()
     fake_sc.SCardEstablishContext.return_value = hc.SCARD_S_SUCCESS
 
     # SCardListReaders: primeiro chama para tamanho, segundo para buffer
-    readers_raw = b"Yubico Yubikey 5 0\x00Generic Reader 0\x00\x00"
+    readers_raw = b"Yubico YubiKey OTP+FIDO+CCID 0\x00Yubico Yubikey 5 0\x00Generic Reader 0\x00\x00"
     def list_readers(ctx, _a, _b, plen):
         if _b is None:  # query tamanho
             plen._obj.value = len(readers_raw)
@@ -112,12 +119,14 @@ def test_ccid_mock_pcsclite_ykman_compatible_and_select():
 
     with mock.patch.object(hc, "_load_pcsc", return_value=fake_sc):
         ccid = hc.check_ccid(apdu_checks=True)
-        assert len(ccid["readers"]) == 2
-        # ykman compatível detectado pelo nome
-        assert ccid["readers"][0]["Yubico Yubikey 5 0"]["ykman_compatible"] is True
-        assert ccid["readers"][1]["Generic Reader 0"]["ykman_compatible"] is False
+        assert len(ccid["readers"]) == 3
+        # ykman compatível: marca + tokens de interface em maiúsculas
+        assert ccid["readers"][0]["Yubico YubiKey OTP+FIDO+CCID 0"]["ykman_compatible"] is True
+        # marca sem tokens: ykman levantaria KeyError 'YK4_' → incompatível
+        assert ccid["readers"][1]["Yubico Yubikey 5 0"]["ykman_compatible"] is False
+        assert ccid["readers"][2]["Generic Reader 0"]["ykman_compatible"] is False
         # SELECT applets retornou 9000
-        oat = ccid["readers"][0]["Yubico Yubikey 5 0"]["select_oath"]
+        oat = ccid["readers"][0]["Yubico YubiKey OTP+FIDO+CCID 0"]["select_oath"]
         assert oat["sw"] == "9000"
 
 
@@ -131,5 +140,89 @@ def test_ccid_linux_fallback_when_lib_missing():
 def test_applet_aids_constants():
     assert hc.OATH_AID == bytes.fromhex("A0000005272101")
     assert hc.MGMT_AID == bytes.fromhex("A000000527471117")
+    assert hc.PIV_AID == bytes.fromhex("A000000308000010000100")
+    assert hc.OPENPGP_AID == bytes.fromhex("D27600012401")
     assert len(hc.OATH_AID) == 7
     assert len(hc.MGMT_AID) == 8
+
+
+def test_identity_note_constant():
+    assert "0x1209:0x0001" in hc.IDENTITY_NOTE
+    assert "0x1050:0x0407" in hc.IDENTITY_NOTE
+    assert "not for distribution" in hc.IDENTITY_NOTE
+
+
+def test_fido2_lib_present():
+    out = hc.check_fido2_lib()
+    assert isinstance(out, dict)
+    assert "present" in out
+    assert "version" in out
+    # fido2 está instalado no ambiente de teste
+    assert out["present"] is True
+
+
+def test_opensc_present_mocked():
+    fake = mock.Mock(returncode=0, stdout="OpenSC 0.23.0 [enabled features: ...]\n", stderr="")
+    with mock.patch.object(hc.subprocess, "run", return_value=fake) as m:
+        out = hc.check_opensc()
+        assert out["present"] is True
+        assert "OpenSC 0.23.0" in out["version"]
+        m.assert_called_once_with(
+            ["opensc-tool", "--version"], capture_output=True, text=True, timeout=10.0
+        )
+    json.dumps(out)
+
+
+def test_opensc_absent_mocked():
+    with mock.patch.object(hc.subprocess, "run", side_effect=FileNotFoundError("opensc-tool")):
+        out = hc.check_opensc()
+        assert out == {"present": False, "version": None}
+    with mock.patch.object(
+        hc.subprocess, "run", side_effect=hc.subprocess.TimeoutExpired("opensc-tool", 10.0)
+    ):
+        out = hc.check_opensc(timeout=10.0)
+        assert out == {"present": False, "version": None}
+
+
+def test_ykman_present_mocked():
+    fake = mock.Mock(returncode=0, stdout="5.4.0\n", stderr="")
+    with mock.patch.object(hc.subprocess, "run", return_value=fake) as m:
+        out = hc.check_ykman()
+        assert out == {"present": True, "version": "5.4.0"}
+        m.assert_called_once_with(
+            ["ykman", "--version"], capture_output=True, text=True, timeout=10.0
+        )
+    json.dumps(out)
+
+
+def test_ykman_absent_mocked():
+    # ykman não instalado — reportado, nunca levanta
+    with mock.patch.object(hc.subprocess, "run", side_effect=FileNotFoundError("ykman")):
+        out = hc.check_ykman()
+        assert out == {"present": False, "version": None}
+    # timeout também conta como ausente
+    with mock.patch.object(
+        hc.subprocess, "run", side_effect=hc.subprocess.TimeoutExpired("ykman", 10.0)
+    ):
+        out = hc.check_ykman(timeout=10.0)
+        assert out == {"present": False, "version": None}
+
+
+def test_cli_json_includes_neutral_tools_and_identity_note():
+    proc = subprocess.run(
+        [sys.executable, str(TOOLS_DIR / "hardware_check.py"), "--json"],
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert "identity_note" in data
+    assert "0x1209:0x0001" in data["identity_note"]
+    assert "0x1050:0x0407" in data["identity_note"]
+    assert "fido2" in data
+    assert "opensc" in data
+    assert "ykman" in data
+    assert isinstance(data["fido2"]["present"], bool)
+    assert isinstance(data["opensc"]["present"], bool)
+    assert isinstance(data["ykman"]["present"], bool)
+

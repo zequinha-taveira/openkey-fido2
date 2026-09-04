@@ -38,7 +38,8 @@ pub use ctap2::{
     Ctap2Command, Ctap2Error, CtapCommand, CtapResponse, EnumerateRPsResponse, ExtensionOutputs,
     Extensions, GetAssertionOptions, GetAssertionRequest, GetAssertionResponse, GetInfoResponse,
     GetVersionResponse, MakeCredentialOptions, MakeCredentialRequest, MakeCredentialResponse,
-    PublicKeyCredParams, RelyingParty, SecurityFeatures, User, UserPresence, AAGUID,
+    PublicKeyCredParams, RelyingParty, SecurityFeatures, User, UserPresence, UserVerification,
+    AAGUID,
 };
 pub use large_blobs::{LargeBlobsRequest, LargeBlobsResponse};
 

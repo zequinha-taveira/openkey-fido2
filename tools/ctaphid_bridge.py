@@ -522,7 +522,7 @@ def self_test(simulator_path: str | None) -> int:
         assert assigned not in (0x00000000, CTAPHID_BROADCAST_CID), "CID inválido"
         assert init_resp[12] == 2, "versão do protocolo CTAPHID deve ser 2"
         assert init_resp[16] & 0x04, "CAPABILITY_CBOR ausente"
-        print(f"[ok] CTAPHID_INIT → CID 0x{assigned:08x}, caps 0x{init_resp[16]:02x}")
+        print(f"[ok] CTAPHID_INIT -> CID 0x{assigned:08x}, caps 0x{init_resp[16]:02x}")
 
         # CBOR GetInfo (opcode 0x04, sem parâmetros).
         getinfo = cbor.encode({1: 0x04})
@@ -532,7 +532,7 @@ def self_test(simulator_path: str | None) -> int:
         assert status == 0x00, f"GetInfo retornou status 0x{status:02x}"
         decoded = cbor.decode(ctap2_response_encode(status, resp_data))
         assert isinstance(decoded.get(1), dict), "GetInfo não retornou um mapa CBOR"
-        print(f"[ok] CTAPHID_CBOR GetInfo → status 0x00, {len(resp_data)} bytes de CBOR")
+        print(f"[ok] CTAPHID_CBOR GetInfo -> status 0x00, {len(resp_data)} bytes de CBOR")
 
         # 3. Dispatch de ponta a ponta via UHID falso (handle_packet).
         uhid = RecordingUhid()
@@ -557,7 +557,7 @@ def self_test(simulator_path: str | None) -> int:
         assert (cid, cmd) == (0x11223344, CMD_CBOR), "dispatch CBOR falhou"
         decoded = cbor.decode(getinfo_resp)
         assert isinstance(decoded.get(1), dict), "GetInfo via dispatch não retornou mapa CBOR"
-        print("[ok] dispatch CTAPHID_CBOR GetInfo via handle_packet → simulador")
+        print("[ok] dispatch CTAPHID_CBOR GetInfo via handle_packet -> simulador")
     finally:
         sim.close()
 

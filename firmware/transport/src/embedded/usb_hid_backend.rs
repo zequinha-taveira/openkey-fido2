@@ -161,22 +161,34 @@ impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
         }
 
         // HID class requests IN que o driver Windows envia durante o start
-        // (GET_REPORT 0x01, GET_IDLE 0x02, GET_PROTOCOL 0x03). Stall aqui
-        // faz CM_PROB_FAILED_START 10 no composto; CTAPHID não usa essas
-        // features, então responde com payload zero.
+        // (GET_REPORT 0x01, GET_IDLE 0x02, GET_PROTOCOL 0x03). Responder com
+        // comprimento errado (ex.: ZLP onde o host espera 1..64 bytes) faz
+        // CM_PROB_FAILED_START 10 no composto; CTAPHID não usa essas
+        // features, então responde com payload zero NO comprimento esperado:
+        // GET_REPORT → zeros até wLength (máx. 64), GET_IDLE → 1 byte 0
+        // (idle indefinido), GET_PROTOCOL → 1 byte 1 (report protocol).
         if req.request_type == control::RequestType::Class
             && req.recipient == control::Recipient::Interface
         {
             match req.request {
-                0x01 | 0x02 | 0x03 => {
-                    let _ = xfer.accept(|_| Ok(0));
-                    return;
+                0x01 => {
+                    // GET_REPORT (Input): zeros; nunca expõe estado interno.
+                    static ZEROS: [u8; PACKET_SIZE] = [0u8; PACKET_SIZE];
+                    let n = core::cmp::min(req.length as usize, PACKET_SIZE);
+                    let _ = xfer.accept_with(&ZEROS[..n]);
+                }
+                0x02 => {
+                    // GET_IDLE: 1 byte.
+                    let _ = xfer.accept_with(&[0u8][..core::cmp::min(req.length as usize, 1)]);
+                }
+                0x03 => {
+                    // GET_PROTOCOL: 1 byte, 1 = report protocol.
+                    let _ = xfer.accept_with(&[1u8][..core::cmp::min(req.length as usize, 1)]);
                 }
                 // SET_* via IN com wLength=0 chegam aqui em alguns stacks;
                 // aceitar também para não travar enumeração.
-                0x09 | 0x0A | 0x0B => {
+                0x09..=0x0B => {
                     let _ = xfer.accept(|_| Ok(0));
-                    return;
                 }
                 _ => {}
             }
@@ -194,15 +206,13 @@ impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
                 // apenas consome o estágio de dados.
                 // SET_IDLE (0x0A) / SET_PROTOCOL (0x0B) — sem payload, mas
                 // Windows os envia no barramento de controle durante o start.
-                0x09 | 0x0A | 0x0B => {
+                0x09..=0x0B => {
                     let _ = xfer.accept();
-                    return;
                 }
                 // GET_* que por algum motivo cheguem como OUT (wLength=0):
                 // aceitar para não stallar.
-                0x01 | 0x02 | 0x03 => {
+                0x01..=0x03 => {
                     let _ = xfer.accept();
-                    return;
                 }
                 _ => {}
             }

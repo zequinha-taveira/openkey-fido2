@@ -341,8 +341,6 @@ pub struct GetAssertionResponse {
     /// Total de credenciais encontradas (multi-assertion).
     #[serde(rename = "numberOfCredentials")]
     pub number_of_credentials: Option<u16>,
-    /// Indica se há mais credenciais (GetNextAssertion).
-    pub next: Option<bool>,
     /// Saídas das extensões ativas, se houver.
     #[serde(rename = "extensions", skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionOutputs>,
@@ -1220,6 +1218,23 @@ pub trait UserPresence: core::fmt::Debug + Send + Sync {
     fn is_present(&mut self) -> bool;
 }
 
+/// Verificação de usuário embutida (ponto de injeção de mock de host).
+///
+/// Espelha [`UserPresence`]: o firmware de produção não tem hardware de
+/// biometria/PIN-pad, então `user_verification` permanece `None` por padrão
+/// e os subcomandos ClientPIN que exigem UV embutida continuam retornando
+/// `UvBlocked`/`UnsupportedOption`. Hosts e testes podem injetar um mock via
+/// [`Ctap2Authenticator::set_user_verification`]; o anúncio da option `uv` no
+/// GetInfo exige adicionalmente a capability `uv`
+/// (ver [`Ctap2Authenticator::get_info`]).
+pub trait UserVerification: core::fmt::Debug + Send + Sync {
+    /// Executa a verificação de usuário embutida; `Err` indica que o
+    /// usuário não foi verificado (ex.: tentativas esgotadas).
+    fn verify(&mut self) -> Result<(), Ctap2Error>;
+    /// Tentativas restantes de UV embutida, reportadas pelo `getUVRetries` (0x07).
+    fn retries(&self) -> u8;
+}
+
 #[derive(Debug)]
 pub struct Ctap2Authenticator {
     crypto: CryptoEngine,
@@ -1233,6 +1248,7 @@ pub struct Ctap2Authenticator {
     cred_mgmt_creds_state: Option<EnumerateCredentialsState>,
     get_next_assertion_state: Option<GetNextAssertionState>,
     user_presence: Option<Box<dyn UserPresence>>,
+    user_verification: Option<Box<dyn UserVerification>>,
     pin_uv_auth_token: Option<client_pin::PinUvAuthTokenState>,
     pin_agreement_key: Option<crypto::pin_protocol::PinAgreementKey>,
     pin_shared_secret: Option<(crypto::pin_protocol::Zeroizing<Vec<u8>>, u8)>,
@@ -1315,6 +1331,7 @@ impl Ctap2Authenticator {
             cred_mgmt_creds_state: None,
             get_next_assertion_state: None,
             user_presence: None,
+            user_verification: None,
             pin_uv_auth_token: None,
             pin_agreement_key: None,
             pin_shared_secret: None,
@@ -1352,6 +1369,84 @@ impl Ctap2Authenticator {
     /// usado em simulação e testes sem botão físico.
     pub fn set_user_presence(&mut self, presence: Option<Box<dyn UserPresence>>) {
         self.user_presence = presence;
+    }
+
+    /// Define a verificação de usuário embutida (mock de host) usada pelo
+    /// ClientPIN 0x06/0x07.
+    ///
+    /// Quando `None` (padrão), o comportamento é o atual sem hardware:
+    /// 0x06 retorna `UvBlocked`, 0x07 retorna `UnsupportedOption` e o GetInfo
+    /// não anuncia `uv`.
+    pub fn set_user_verification(&mut self, verification: Option<Box<dyn UserVerification>>) {
+        self.user_verification = verification;
+    }
+
+    /// Tentativas restantes de UV embutida quando há mock injetado **e** a
+    /// capability `uv` está habilitada; `None` preserva o padrão (sem UV).
+    ///
+    /// O contador é persistente (`sys:uv_retries`), espelhando o de PIN —
+    /// sobrevive a reboots; o valor volátil do mock serve apenas para semear
+    /// o storage nos testes.
+    pub(crate) fn builtin_uv_retries(&self) -> Option<u8> {
+        self.user_verification.as_ref()?;
+        if !self.capabilities.options.contains(&"uv".to_string()) {
+            return None;
+        }
+        Some(self.get_uv_retries())
+    }
+
+    /// Contador persistente de tentativas de UV embutida.
+    pub(crate) fn get_uv_retries(&self) -> u8 {
+        client_pin::read_uv_retries(&self.storage)
+    }
+
+    /// Restaura o contador persistente de UV após verificação bem-sucedida.
+    pub(crate) fn reset_uv_retries(&mut self) {
+        let _ = self.storage.store(
+            client_pin::UV_RETRIES_KEY,
+            client_pin::UV_MAX_RETRIES.to_string().into_bytes(),
+        );
+    }
+
+    /// Consome uma tentativa de UV embutida (persistente).
+    pub(crate) fn decrement_uv_retries(&mut self) {
+        let current = self.get_uv_retries();
+        let new = current.saturating_sub(1);
+        let _ = self
+            .storage
+            .store(client_pin::UV_RETRIES_KEY, new.to_string().into_bytes());
+    }
+
+    /// Executa a UV embutida para o `getPinUvAuthTokenUsingUvWithPermissions`
+    /// (0x06). Sem mock injetado ou sem a capability `uv`, retorna
+    /// `UvBlocked` (comportamento atual, CTAP 2.1 §6.5.5.7.3). Com contador
+    /// zerado, bloqueia sem chamar o verificador; falha decrementa, sucesso
+    /// reseta o contador persistente.
+    pub(crate) fn perform_builtin_uv(&mut self) -> Result<(), Ctap2Error> {
+        if !self.capabilities.options.contains(&"uv".to_string()) {
+            return Err(Ctap2Error::UvBlocked);
+        }
+        if self.user_verification.is_none() {
+            return Err(Ctap2Error::UvBlocked);
+        }
+        if self.get_uv_retries() == 0 {
+            return Err(Ctap2Error::UvBlocked);
+        }
+        let result = self
+            .user_verification
+            .as_mut()
+            .ok_or(Ctap2Error::UvBlocked)?
+            .verify();
+        match result {
+            Ok(()) => {
+                self.reset_uv_retries();
+                Ok(())
+            }
+            Err(e) => {
+                self.decrement_uv_retries();
+                Err(e)
+            }
+        }
     }
 
     /// Define a lista de RP IDs autorizados para Enterprise Attestation.
@@ -1846,11 +1941,6 @@ impl Ctap2Authenticator {
                 icon_url: None,
             }),
             number_of_credentials: if total > 1 { Some(total as u16) } else { None },
-            next: if total > 1 && current_index + 1 < total {
-                Some(true)
-            } else {
-                None
-            },
             extensions: if has_ext { Some(ext_outputs) } else { None },
         })
     }
@@ -1866,8 +1956,14 @@ impl Ctap2Authenticator {
 
         // Opções dinâmicas: `clientPin` indica o *suporte* à funcionalidade
         // (obrigatório para que plataformas possam definir o PIN inicial) e
-        // `pinUvAuthToken` o suporte a tokens. `uv` permanece ausente.
+        // `pinUvAuthToken` o suporte a tokens.
         let mut options = self.capabilities.options.clone();
+        // Mock de UV embutida restrito a host: `uv` só é anunciado com um
+        // verificador injetado; sem ele, a option é removida para que hosts
+        // não tentem 0x06/0x07 (comportamento padrão, sem hardware).
+        if self.user_verification.is_none() {
+            options.retain(|option| option != "uv");
+        }
         if !self.capabilities.pin_uv_auth_protocols.is_empty() {
             if !options.contains(&"pinUvAuthToken".to_string()) {
                 options.push("pinUvAuthToken".to_string());
@@ -2108,7 +2204,6 @@ impl Ctap2Authenticator {
             .build_get_assertion_response(
                 &credential,
                 matching.len(),
-                next_index,
                 &client_data_hash,
                 flags,
                 chained_hmac,
@@ -2577,7 +2672,6 @@ impl Ctap2Authenticator {
         &mut self,
         credential: &Credential,
         total: usize,
-        current_index: usize,
         client_data_hash: &[u8],
         flags: u8,
         chained_hmac: Option<Value>,
@@ -2624,8 +2718,6 @@ impl Ctap2Authenticator {
             _ => self.crypto.sign(&data_to_sign, &credential.private_key)?,
         };
 
-        let has_more = current_index + 1 < total;
-
         Ok(GetAssertionResponse {
             credential: Some(CredentialDescriptor {
                 r#type: "public-key".to_string(),
@@ -2634,9 +2726,15 @@ impl Ctap2Authenticator {
             }),
             auth_data,
             signature,
-            user: None,
+            // CTAP 2.1 §6.2: a asserção encadeada carrega a mesma entidade
+            // `user` (0x04) da asserção inicial — antes omitida aqui.
+            user: Some(User {
+                id: credential.user_handle.clone().unwrap_or_default(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            }),
             number_of_credentials: Some(total as u16),
-            next: Some(has_more),
             extensions: chained_hmac.map(|output| ExtensionOutputs {
                 hmac_secret: Some(output),
                 ..Default::default()
@@ -5572,6 +5670,97 @@ mod tests {
 
         let result = authenticator.process_command(0x08, vec![]);
         assert!(matches!(result, Err(Ctap2Error::NoCredentials)));
+    }
+
+    /// GetNextAssertion inclui a entidade `user` (0x04) de cada asserção
+    /// encadeada (CTAP 2.1 §6.2) e não emite a chave extra `next` no wire.
+    #[test]
+    fn test_get_next_assertion_includes_user_and_no_next_key() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        for i in 0..2u8 {
+            authenticator
+                .make_credential(MakeCredentialRequest {
+                    client_data_hash: vec![i; 32],
+                    rp: RelyingParty {
+                        id: "example.com".to_string(),
+                        name: None,
+                        icon: None,
+                    },
+                    user: User {
+                        id: vec![i; 8],
+                        name: None,
+                        display_name: None,
+                        icon_url: None,
+                    },
+                    pub_key_cred_params: vec![PublicKeyCredParams {
+                        r#type: "public-key".to_string(),
+                        algorithms: -8,
+                    }],
+                    exclude_list: vec![],
+                    extensions: None,
+                    options: MakeCredentialOptions {
+                        rk: false,
+                        uv: true,
+                        up: true,
+                        extended: false,
+                    },
+                    pin_uv_auth_param: None,
+                    pin_protocol: None,
+                    enterprise_protections: None,
+                })
+                .unwrap();
+        }
+
+        let get_assertion_req = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: b"test".to_vec(),
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: true,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            uv: None,
+        };
+
+        let encoded = encode_cbor(&get_assertion_req).unwrap();
+        let first_raw = authenticator.process_command(0x02, encoded).unwrap();
+        let first: GetAssertionResponse = decode_cbor(&first_raw).unwrap();
+        let first_user_id = first.user.map(|u| u.id).unwrap_or_default();
+        assert!(!first_user_id.is_empty());
+
+        let next_raw = authenticator.process_command(0x08, vec![]).unwrap();
+        let next_response: GetAssertionResponse = decode_cbor(&next_raw).unwrap();
+        let next_user_id = next_response.user.map(|u| u.id).unwrap_or_default();
+        assert!(!next_user_id.is_empty());
+        assert_ne!(next_user_id, first_user_id);
+        assert_eq!(next_response.number_of_credentials, Some(2));
+
+        // Wire: chave inteira 0x04 presente, nenhuma chave de texto `next`.
+        let wire: Value = decode_cbor(&next_raw).unwrap();
+        let Value::Map(entries) = &wire else {
+            panic!("resposta GetNextAssertion não é um mapa CBOR");
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|(k, _)| matches!(k, Value::Integer(n) if *n == 4.into())),
+            "wire sem a entidade user (0x04): {:?}",
+            wire
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(k, _)| !matches!(k, Value::Text(t) if t == "next")),
+            "wire com chave extra `next`: {:?}",
+            wire
+        );
     }
 
     /// Localiza um campo em um mapa CBOR decodificado. No wire format, as

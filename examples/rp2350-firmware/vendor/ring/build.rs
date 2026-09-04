@@ -653,7 +653,7 @@ fn run_command(mut cmd: Command) {
 }
 
 fn sources_for_arch(arch: &str) -> Vec<PathBuf> {
-    RING_SRCS
+    let mut srcs = RING_SRCS
         .iter()
         .filter(|&&(archs, _)| archs.is_empty() || archs.contains(&arch))
         // [patch openkey-fido2] Alvo thumbv8m.main-none-eabihf: as fontes
@@ -686,7 +686,19 @@ fn sources_for_arch(arch: &str) -> Vec<PathBuf> {
             }
         })
         .map(|&(_, p)| PathBuf::from(p))
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+    // [patch openkey-fido2] `armv4-mont.pl` excluído acima é a ÚNICA definição
+    // de `bn_mul_mont_nohw`/`bn_mul8x_mont_neon` para OPENSSL_ARM (sem ele o
+    // link falha em gfp_p256.o/gfp_p384.o). O fallback C puro
+    // `montgomery_nohw_arm.c` repõe os dois símbolos (neon como wrapper do
+    // nohw — correto, é a mesma operação). Escopo: este ring vendido é
+    // consumido SOMENTE pelo firmware thumbv8m via [patch.crates-io].
+    if arch == "arm" {
+        srcs.push(PathBuf::from(
+            "crypto/fipsmodule/bn/montgomery_nohw_arm.c",
+        ));
+    }
+    srcs
 }
 
 fn perlasm_src_dsts(out_dir: &Path, asm_target: &AsmTarget) -> Vec<(PathBuf, PathBuf)> {

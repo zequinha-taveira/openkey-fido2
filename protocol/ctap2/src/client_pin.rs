@@ -34,6 +34,8 @@ pub(crate) const PIN_MAX_RETRIES: u8 = 8;
 pub(crate) const PIN_BLOCK_THRESHOLD: u8 = 3;
 pub(crate) const PIN_STORAGE_KEY: &str = "client_pin_hash";
 pub(crate) const PIN_RETRIES_KEY: &str = "client_pin_retries";
+pub(crate) const UV_RETRIES_KEY: &str = "sys:uv_retries";
+pub(crate) const UV_MAX_RETRIES: u8 = 8;
 
 /// Permissões de pinUvAuthToken (CTAP 2.1 §6.5.5.7).
 pub(crate) const PERMISSION_MC: u8 = 0x01;
@@ -305,6 +307,17 @@ pub(crate) fn read_retries(storage: &storage::StorageEngine) -> u8 {
         .unwrap_or(PIN_MAX_RETRIES)
 }
 
+/// Lê o contador persistente de tentativas de UV embutida
+/// (`sys:uv_retries`); ausente ⇒ [`UV_MAX_RETRIES`].
+pub(crate) fn read_uv_retries(storage: &storage::StorageEngine) -> u8 {
+    storage
+        .retrieve(UV_RETRIES_KEY)
+        .ok()
+        .and_then(|data| String::from_utf8(data).ok())
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(UV_MAX_RETRIES)
+}
+
 /// Indica se já existe um PIN configurado no storage.
 pub fn is_pin_set(storage: &storage::StorageEngine) -> bool {
     storage.retrieve(PIN_STORAGE_KEY).is_ok()
@@ -338,7 +351,7 @@ pub(crate) fn handle_client_pin(
         ClientPinSubCommand::GetPinUvAuthTokenUsingUvWithPermissions => {
             handle_get_uv_token(authenticator, &request)
         }
-        ClientPinSubCommand::GetUVRetries => Err(Ctap2Error::UnsupportedOption),
+        ClientPinSubCommand::GetUVRetries => handle_get_uv_retries(authenticator),
         ClientPinSubCommand::GetPinUvAuthTokenUsingPinWithPermissions => {
             handle_get_pin_token_with_permissions(authenticator, &request)
         }
@@ -731,17 +744,60 @@ fn handle_get_pin_token_common(
     })
 }
 
-/// Sem verificação de usuário embutida (`uv` ausente no GetInfo), o
-/// subcomando getPinUvAuthTokenUsingUvWithPermissions falha com
-/// `CTAP2_ERR_UV_BLOCKED` (CTAP 2.1 §6.5.5.7.3).
+/// Reporta as tentativas restantes de UV embutida quando há mock injetado
+/// e a capability `uv` habilitada; caso contrário `UnsupportedOption`
+/// (padrão, sem hardware de verificação embutida).
+fn handle_get_uv_retries(
+    authenticator: &Ctap2Authenticator,
+) -> Result<ClientPinResponse, Ctap2Error> {
+    match authenticator.builtin_uv_retries() {
+        Some(retries) => Ok(ClientPinResponse {
+            uv_retries: Some(retries),
+            ..Default::default()
+        }),
+        None => Err(Ctap2Error::UnsupportedOption),
+    }
+}
+
+/// Emite um pinUvAuthToken via verificação de usuário embutida
+/// (CTAP 2.1 §6.5.5.7.3).
+///
+/// Sem mock de [`crate::ctap2::UserVerification`] injetado ou sem a
+/// capability `uv`, falha com `CTAP2_ERR_UV_BLOCKED` (sem hardware embutido).
+/// Com o mock, verifica o usuário e emite um token com as `permissions`/`rpId`
+/// solicitadas, como o fluxo 0x09 baseado em PIN. O token resultante
+/// autentica MakeCredential/GetAssertion e seta o bit UV (0x04) do authData.
 fn handle_get_uv_token(
     authenticator: &mut Ctap2Authenticator,
     request: &ClientPinRequest,
 ) -> Result<ClientPinResponse, Ctap2Error> {
-    let _protocol = validate_protocol(request.pin_protocol)?;
+    let protocol = validate_protocol(request.pin_protocol)?;
     let permissions = request.permissions.ok_or(Ctap2Error::MissingParameter)?;
     validate_permissions(authenticator, permissions)?;
-    Err(Ctap2Error::UvBlocked)
+    // Gate de UV antes das demais validações de parâmetro, para que o
+    // comportamento padrão (sem mock) siga retornando `UvBlocked`.
+    authenticator.perform_builtin_uv()?;
+    // Tokens com escopo mc|ga vinculam-se a um RP: sem rpId valeriam para
+    // qualquer RP (mesma regra do 0x09, CTAP 2.1 §6.5.5.7).
+    if permissions & (PERMISSION_MC | PERMISSION_GA) != 0 && request.rp_id.is_none() {
+        return Err(Ctap2Error::MissingParameter);
+    }
+    let peer_cose = request
+        .key_agreement
+        .as_ref()
+        .ok_or(Ctap2Error::MissingParameter)?;
+    let secret = perform_key_agreement(authenticator, &protocol, peer_cose)?;
+    let token_enc = issue_pin_uv_auth_token(
+        authenticator,
+        &protocol,
+        &secret,
+        permissions,
+        request.rp_id.clone(),
+    )?;
+    Ok(ClientPinResponse {
+        pin_uv_auth_token: Some(token_enc),
+        ..Default::default()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,7 +1095,11 @@ pub(crate) fn encode_client_pin_request_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ctap2::{Ctap2Authenticator, AAGUID};
+    use crate::ctap2::{
+        CredProtectPolicy, Ctap2Authenticator, Extensions, GetAssertionOptions,
+        GetAssertionRequest, MakeCredentialOptions, MakeCredentialRequest, PublicKeyCredParams,
+        RelyingParty, User, UserVerification, AAGUID,
+    };
     use crypto::pin_protocol::{zero_pad_to_64, PinUvProtocol};
     use crypto::CryptoEngine;
     use std::collections::HashMap;
@@ -1176,6 +1236,24 @@ mod tests {
                 ClientPinSubCommand::GetPinUvAuthTokenUsingPinWithPermissions as u8,
             );
             request.pin_hash_enc = Some(self.encrypt(&hash_pin(pin)));
+            request.permissions = Some(permissions);
+            request.rp_id = rp_id.map(|s| s.to_string());
+            let response = send(authenticator, &request)?;
+            response
+                .pin_uv_auth_token
+                .ok_or(Ctap2Error::InvalidParameter)
+        }
+
+        fn get_uv_token(
+            &mut self,
+            authenticator: &mut Ctap2Authenticator,
+            permissions: u8,
+            rp_id: Option<&str>,
+        ) -> Result<Vec<u8>, Ctap2Error> {
+            self.refresh_agreement(authenticator);
+            let mut request = self.request_with_key(
+                ClientPinSubCommand::GetPinUvAuthTokenUsingUvWithPermissions as u8,
+            );
             request.permissions = Some(permissions);
             request.rp_id = rp_id.map(|s| s.to_string());
             let response = send(authenticator, &request)?;
@@ -1707,6 +1785,481 @@ mod tests {
             },
         );
         assert_eq!(result.unwrap_err(), Ctap2Error::UnsupportedOption);
+    }
+
+    /// Mock de UV embutida restrito a host: sem alegações de hardware, apenas
+    /// um verificador configurável para testes.
+    #[derive(Debug)]
+    struct MockUserVerification {
+        succeed: bool,
+        retries: u8,
+    }
+
+    impl UserVerification for MockUserVerification {
+        fn verify(&mut self) -> Result<(), Ctap2Error> {
+            if self.succeed {
+                Ok(())
+            } else {
+                Err(Ctap2Error::UvBlocked)
+            }
+        }
+
+        fn retries(&self) -> u8 {
+            self.retries
+        }
+    }
+
+    /// Autenticador com capability `uv` e mock injetado.
+    fn authenticator_with_uv_mock(succeed: bool, retries: u8) -> Ctap2Authenticator {
+        let mut authenticator = create_authenticator();
+        let mut caps = authenticator.capabilities().clone();
+        if !caps.options.contains(&"uv".to_string()) {
+            caps.options.push("uv".to_string());
+        }
+        authenticator.set_capabilities(caps);
+        // Semeia o contador persistente com o valor passado, para preservar
+        // os testes existentes que liam o valor volátil do mock.
+        let _ = authenticator
+            .get_storage_mut()
+            .store(UV_RETRIES_KEY, retries.to_string().into_bytes());
+        authenticator
+            .set_user_verification(Some(Box::new(MockUserVerification { succeed, retries })));
+        authenticator
+    }
+
+    fn make_credential_with_uv_token(
+        client_data_hash: Vec<u8>,
+        token: &[u8],
+        protocol_version: u8,
+    ) -> MakeCredentialRequest {
+        let protocol = PinUvProtocol::new(protocol_version).unwrap();
+        MakeCredentialRequest {
+            client_data_hash: client_data_hash.clone(),
+            rp: RelyingParty {
+                id: "example.com".to_string(),
+                name: None,
+                icon: None,
+            },
+            user: User {
+                id: b"user123".to_vec(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            },
+            pub_key_cred_params: vec![PublicKeyCredParams {
+                r#type: "public-key".to_string(),
+                algorithms: -8,
+            }],
+            exclude_list: vec![],
+            extensions: None,
+            options: MakeCredentialOptions {
+                rk: false,
+                uv: true,
+                up: false,
+                extended: false,
+            },
+            pin_uv_auth_param: Some(protocol.authenticate(token, &client_data_hash).unwrap()),
+            pin_protocol: Some(protocol_version),
+            enterprise_protections: None,
+        }
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_get_uv_retries_success() {
+        let mut authenticator = authenticator_with_uv_mock(true, 5);
+        let response = send(
+            &mut authenticator,
+            &ClientPinRequest {
+                pin_protocol: Some(2),
+                sub_command: ClientPinSubCommand::GetUVRetries as u8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.uv_retries, Some(5));
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_get_uv_token_success() {
+        let mut authenticator = authenticator_with_uv_mock(true, 5);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let token_enc = platform
+            .get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"))
+            .unwrap();
+        let token = platform.decrypt(&token_enc);
+        assert_eq!(token.len(), 32);
+
+        // O token autentica operações com escopo mc.
+        let client_data_hash = [0xAAu8; 32];
+        let param = platform
+            .protocol
+            .authenticate(&token, &client_data_hash)
+            .unwrap();
+        authenticator
+            .verify_pin_uv_auth_param(2, &param, &client_data_hash)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_get_uv_token_failure() {
+        let mut authenticator = authenticator_with_uv_mock(false, 0);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let result =
+            platform.get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"));
+        assert_eq!(result.unwrap_err(), Ctap2Error::UvBlocked);
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_flag_set() {
+        let mut authenticator = authenticator_with_uv_mock(true, 5);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let token_enc = platform
+            .get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"))
+            .unwrap();
+        let token = platform.decrypt(&token_enc);
+
+        // MakeCredential com `uv` e token UV autenticado seta o bit 0x04.
+        let client_data_hash = vec![0x41u8; 32];
+        let request = make_credential_with_uv_token(client_data_hash, &token, 2);
+        let response = authenticator.make_credential(request).unwrap();
+        assert_ne!(response.auth_data[32] & 0x04, 0);
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_get_assertion_flag_set() {
+        let mut authenticator = authenticator_with_uv_mock(true, 5);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let token_enc = platform
+            .get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"))
+            .unwrap();
+        let token = platform.decrypt(&token_enc);
+
+        // Credencial criada com o token UV (permissão mc).
+        let mc_cdh = vec![0x41u8; 32];
+        let mc = make_credential_with_uv_token(mc_cdh, &token, 2);
+        authenticator.make_credential(mc).unwrap();
+
+        // GetAssertion com `uv` e token UV autenticado (permissão ga) seta 0x04.
+        let ga_cdh = vec![0x42u8; 32];
+        let param = platform.protocol.authenticate(&token, &ga_cdh).unwrap();
+        let ga = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: ga_cdh,
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: true,
+            },
+            pin_uv_auth_param: Some(param),
+            pin_protocol: Some(2),
+            uv: None,
+        };
+        let response = authenticator.get_assertion(ga).unwrap();
+        assert_ne!(response.auth_data[32] & 0x04, 0);
+
+        // Sem token, o bit UV permanece apagado.
+        let plain = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: vec![0x43u8; 32],
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: false,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            uv: None,
+        };
+        let response = authenticator.get_assertion(plain).unwrap();
+        assert_eq!(response.auth_data[32] & 0x04, 0);
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_satisfies_always_uv() {
+        let mut authenticator = authenticator_with_uv_mock(true, 5);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let token_enc = platform
+            .get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"))
+            .unwrap();
+        let token = platform.decrypt(&token_enc);
+
+        // Credencial pré-existente criada antes de ativar o alwaysUv.
+        let mc_cdh = vec![0x41u8; 32];
+        let mc = make_credential_with_uv_token(mc_cdh, &token, 2);
+        authenticator.make_credential(mc).unwrap();
+
+        // Ativa alwaysUv diretamente no storage (mesma chave do authnr_config).
+        authenticator
+            .get_storage_mut()
+            .store("sys:cfg_always_uv", b"1".to_vec())
+            .unwrap();
+
+        // MakeCredential sem `uv` é negado com alwaysUv ativo.
+        let mut plain_mc = make_credential_with_uv_token(vec![0x44u8; 32], &token, 2);
+        plain_mc.options.uv = false;
+        plain_mc.pin_uv_auth_param = None;
+        plain_mc.pin_protocol = None;
+        let error = authenticator.make_credential(plain_mc).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::PinRequired)
+        );
+
+        // MakeCredential com `uv` + token UV é aceito.
+        let mc_cdh = vec![0x45u8; 32];
+        let mc = make_credential_with_uv_token(mc_cdh, &token, 2);
+        authenticator.make_credential(mc).unwrap();
+
+        // GetAssertion sem `uv` é negado com alwaysUv ativo.
+        let plain_ga = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: vec![0x46u8; 32],
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: false,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            uv: None,
+        };
+        let error = authenticator.get_assertion(plain_ga).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::PinRequired)
+        );
+
+        // GetAssertion com `uv` + token UV é aceito e seta 0x04.
+        let ga_cdh = vec![0x47u8; 32];
+        let param = platform.protocol.authenticate(&token, &ga_cdh).unwrap();
+        let ga = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: ga_cdh,
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: true,
+            },
+            pin_uv_auth_param: Some(param),
+            pin_protocol: Some(2),
+            uv: None,
+        };
+        let response = authenticator.get_assertion(ga).unwrap();
+        assert_ne!(response.auth_data[32] & 0x04, 0);
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_satisfies_cred_protect_l3() {
+        let mut authenticator = authenticator_with_uv_mock(true, 5);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let token_enc = platform
+            .get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"))
+            .unwrap();
+        let token = platform.decrypt(&token_enc);
+
+        // Credencial credProtect=3 (userVerificationRequired).
+        let mc_cdh = vec![0x41u8; 32];
+        let mut mc = make_credential_with_uv_token(mc_cdh, &token, 2);
+        mc.extensions = Some(Extensions {
+            cred_protect: Some(CredProtectPolicy::UserVerificationRequired.into()),
+            ..Default::default()
+        });
+        authenticator.make_credential(mc).unwrap();
+
+        // Sem token: a credencial é silenciosamente ignorada (descoberta por RP).
+        let plain = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: vec![0x42u8; 32],
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: false,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            uv: None,
+        };
+        let error = authenticator.get_assertion(plain).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<Ctap2Error>(),
+            Some(&Ctap2Error::NoCredentials)
+        );
+
+        // Com token UV (permissão ga): a credencial é retornada com bit UV.
+        let ga_cdh = vec![0x43u8; 32];
+        let param = platform.protocol.authenticate(&token, &ga_cdh).unwrap();
+        let ga = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: ga_cdh,
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: true,
+            },
+            pin_uv_auth_param: Some(param),
+            pin_protocol: Some(2),
+            uv: None,
+        };
+        let response = authenticator.get_assertion(ga).unwrap();
+        assert!(response.credential.is_some());
+        assert_ne!(response.auth_data[32] & 0x04, 0);
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_get_info_gate() {
+        // Mock + capability `uv` ⇒ anunciado.
+        let authenticator = authenticator_with_uv_mock(true, 5);
+        let info = authenticator.get_info().unwrap();
+        assert!(info.options.contains(&"uv".to_string()));
+
+        // Capability `uv` sem mock ⇒ removido (padrão, sem hardware).
+        let mut authenticator = create_authenticator();
+        let mut caps = authenticator.capabilities().clone();
+        caps.options.push("uv".to_string());
+        authenticator.set_capabilities(caps);
+        let info = authenticator.get_info().unwrap();
+        assert!(!info.options.contains(&"uv".to_string()));
+
+        // Padrão (sem mock, sem capability) ⇒ ausente.
+        let authenticator = create_authenticator();
+        let info = authenticator.get_info().unwrap();
+        assert!(!info.options.contains(&"uv".to_string()));
+    }
+
+    #[test]
+    fn test_builtin_uv_mock_default_none_preserves_errors() {
+        let mut authenticator = create_authenticator();
+        // getUVRetries sem mock ⇒ UnsupportedOption.
+        let result = send(
+            &mut authenticator,
+            &ClientPinRequest {
+                pin_protocol: Some(1),
+                sub_command: ClientPinSubCommand::GetUVRetries as u8,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.unwrap_err(), Ctap2Error::UnsupportedOption);
+
+        // 0x06 sem mock ⇒ UvBlocked, mesmo com a capability `uv` presente.
+        let mut caps = authenticator.capabilities().clone();
+        caps.options.push("uv".to_string());
+        authenticator.set_capabilities(caps);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let result =
+            platform.get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"));
+        assert_eq!(result.unwrap_err(), Ctap2Error::UvBlocked);
+    }
+
+    #[test]
+    fn test_uv_failure_decrements_retries() {
+        let mut authenticator = authenticator_with_uv_mock(false, 5);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let result =
+            platform.get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"));
+        assert_eq!(result.unwrap_err(), Ctap2Error::UvBlocked);
+        assert_eq!(authenticator.get_uv_retries(), 4);
+        let response = send(
+            &mut authenticator,
+            &ClientPinRequest {
+                pin_protocol: Some(2),
+                sub_command: ClientPinSubCommand::GetUVRetries as u8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.uv_retries, Some(4));
+    }
+
+    #[test]
+    fn test_uv_success_resets_retries() {
+        let mut authenticator = authenticator_with_uv_mock(true, 5);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        platform
+            .get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"))
+            .unwrap();
+        assert_eq!(authenticator.get_uv_retries(), UV_MAX_RETRIES);
+    }
+
+    #[test]
+    fn test_uv_blocked_at_zero() {
+        let mut authenticator = authenticator_with_uv_mock(true, 0);
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        let result =
+            platform.get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"));
+        assert_eq!(result.unwrap_err(), Ctap2Error::UvBlocked);
+        assert_eq!(authenticator.get_uv_retries(), 0);
+        let response = send(
+            &mut authenticator,
+            &ClientPinRequest {
+                pin_protocol: Some(2),
+                sub_command: ClientPinSubCommand::GetUVRetries as u8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(response.uv_retries, Some(0));
+    }
+
+    #[test]
+    fn test_uv_retries_persist_across_reboot() {
+        let backend = SharedMemoryBackend::default();
+        let storage = StorageEngine::with_backend(Box::new(backend.clone()));
+        let crypto = CryptoEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let mut caps = authenticator.capabilities().clone();
+        if !caps.options.contains(&"uv".to_string()) {
+            caps.options.push("uv".to_string());
+        }
+        authenticator.set_capabilities(caps);
+        let _ = authenticator
+            .get_storage_mut()
+            .store(UV_RETRIES_KEY, 5u8.to_string().into_bytes());
+        authenticator.set_user_verification(Some(Box::new(MockUserVerification {
+            succeed: false,
+            retries: 5,
+        })));
+        let (mut platform, _cose) = TestPlatform::start(&mut authenticator, 2);
+        assert_eq!(
+            platform
+                .get_uv_token(&mut authenticator, PERMISSION_MC_GA, Some("example.com"))
+                .unwrap_err(),
+            Ctap2Error::UvBlocked
+        );
+        assert_eq!(authenticator.get_uv_retries(), 4);
+
+        drop(platform);
+        drop(authenticator);
+        let storage = StorageEngine::with_backend(Box::new(backend));
+        let crypto = CryptoEngine::new().unwrap();
+        let mut rebooted = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let mut caps = rebooted.capabilities().clone();
+        if !caps.options.contains(&"uv".to_string()) {
+            caps.options.push("uv".to_string());
+        }
+        rebooted.set_capabilities(caps);
+        rebooted.set_user_verification(Some(Box::new(MockUserVerification {
+            succeed: true,
+            retries: 0,
+        })));
+        // Contador persistiu o reboot; o valor volátil do novo mock é ignorado.
+        assert_eq!(rebooted.get_uv_retries(), 4);
+        let (mut platform_after, _cose) = TestPlatform::start(&mut rebooted, 2);
+        platform_after
+            .get_uv_token(&mut rebooted, PERMISSION_MC_GA, Some("example.com"))
+            .unwrap();
+        assert_eq!(rebooted.get_uv_retries(), UV_MAX_RETRIES);
     }
 
     #[test]

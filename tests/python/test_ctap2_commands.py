@@ -189,22 +189,30 @@ def test_reset_clears_get_next_assertion_state(simulator):
 
 def test_get_next_assertion_flow(simulator):
     simulator.reset()
+    user_ids = []
     for i in range(3):
+        user_id = f"user{i}".encode()
+        user_ids.append(user_id)
         result = simulator.make_credential(
             rp_id="example.com",
-            user_id=f"user{i}".encode(),
+            user_id=user_id,
         )
         assert result["ok"], result
 
     result = simulator.get_assertion(rp_id="example.com")
     assert result["ok"], result
 
-    result = simulator.get_next_assertion()
-    assert result["ok"], result
-    assert result.get("next") is True
+    # A cadeia termina por NO_CREDENTIALS (CTAP 2.1 §6.2) — sem flag `next`
+    # no wire. Cada asserção encadeada carrega o `user_handle` próprio.
+    seen_handles = set()
+    for _ in range(2):
+        result = simulator.get_next_assertion()
+        assert result["ok"], result
+        assert result.get("credential_id"), result
+        assert result.get("user_handle"), result
+        seen_handles.add(result["user_handle"])
 
-    result = simulator.get_next_assertion()
-    assert result["ok"], result
+    assert len(seen_handles) == 2
 
     result = simulator.get_next_assertion()
     assert not result["ok"]

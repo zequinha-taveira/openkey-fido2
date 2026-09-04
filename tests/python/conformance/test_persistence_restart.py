@@ -5,14 +5,42 @@ large blobs sobrevivem (ou são corretamente apagados) entre reinícios
 do processo do simulador.
 """
 
+import contextlib
 import hashlib
+import shutil
 import struct
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
 from .ctap2_transport import CtapCmd, CtapError, SimulatorClient
+
+
+@contextlib.contextmanager
+def _storage_tmpdir():
+    """TemporaryDirectory com remoção resiliente no Windows.
+
+    O processo do simulador pode reter o handle do arquivo de storage
+    por alguns ms após o exit; sem retry, o `shutil.rmtree` do
+    `TemporaryDirectory` falha intermitentemente com WinError 145.
+    O `SimulatorClient` já garante exit (wait + kill) antes da saída
+    deste contexto; o retry cobre apenas a latência residual de
+    liberação do handle. Semântica idêntica ao TemporaryDirectory.
+    """
+    tmpdir = tempfile.mkdtemp()
+    try:
+        yield tmpdir
+    finally:
+        for attempt in range(5):
+            try:
+                shutil.rmtree(tmpdir)
+                break
+            except OSError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
 
 def _make_credential(client, rp_id="persist.example.com", user_id=b"persist_user"):
@@ -60,7 +88,7 @@ def _config_field(resp):
 
 
 def test_credentials_survive_restart_wire():
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with _storage_tmpdir() as tmpdir:
         storage_path = Path(tmpdir) / "creds_persist.json"
 
         with SimulatorClient(storage_path=storage_path) as client:
@@ -73,7 +101,7 @@ def test_credentials_survive_restart_wire():
 
 
 def test_reset_clears_credentials_across_restart_wire():
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with _storage_tmpdir() as tmpdir:
         storage_path = Path(tmpdir) / "reset_persist.json"
 
         with SimulatorClient(storage_path=storage_path) as client:
@@ -92,7 +120,7 @@ def test_reset_clears_credentials_across_restart_wire():
 
 
 def test_sign_counter_monotonic_across_restart_wire():
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with _storage_tmpdir() as tmpdir:
         storage_path = Path(tmpdir) / "sign_count_persist.json"
 
         with SimulatorClient(storage_path=storage_path) as client:
@@ -109,7 +137,7 @@ def test_sign_counter_monotonic_across_restart_wire():
 
 def test_large_blobs_survive_restart():
     blob = b"large-blob-persistence-check"
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with _storage_tmpdir() as tmpdir:
         storage_path = Path(tmpdir) / "large_blobs_persist.json"
 
         with SimulatorClient(storage_path=storage_path) as client:
@@ -127,7 +155,7 @@ def test_large_blobs_survive_restart():
 
 def test_reset_clears_large_blobs_across_restart():
     blob = b"large-blob-to-be-reset"
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with _storage_tmpdir() as tmpdir:
         storage_path = Path(tmpdir) / "large_blobs_reset.json"
 
         with SimulatorClient(storage_path=storage_path) as client:

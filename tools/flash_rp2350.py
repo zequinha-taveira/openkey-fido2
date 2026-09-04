@@ -10,6 +10,7 @@ Fluxo:
 Uso sem HW:
   python tools/flash_rp2350.py --dry-run
   python tools/flash_rp2350.py --dry-run --yubikey5-identity --release
+  python tools/flash_rp2350.py --dry-run --yubikey4-identity --release
   python tools/flash_rp2350.py --dry-run --method picotool --elf path/to.elf
 
 Com HW:
@@ -31,6 +32,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHIP = "RP235x"
+# The default USB identity pid.codes is 0x1209:0x0001; the YubiKey USB identity
+# that ykman / Yubico Authenticator auto-recognize is the opt-in VID:PID=Yubikey5
+# build, not for distribution.
 DEFAULT_VID_PID = (0x1209, 0x0001)  # pid.codes openkey
 YUBIKEY_VID_PID = (0x1050, 0x0407)
 

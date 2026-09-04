@@ -32,6 +32,21 @@ def test_dry_run_yubikey_identity():
     assert data["vid"] == "0x1050" and data["pid"] == "0x407"
 
 
+def test_dry_run_yubikey4_alias_matches_yubikey5():
+    out4 = run_flash("--dry-run", "--yubikey4-identity", "--json")
+    out5 = run_flash("--dry-run", "--yubikey5-identity", "--json")
+    data4 = json.loads(out4)
+    data5 = json.loads(out5)
+    assert data4["vid"] == data5["vid"] == "0x1050"
+    assert data4["pid"] == data5["pid"] == "0x407"
+
+
+def test_dry_run_vid_pid_override():
+    out = run_flash("--dry-run", "--vid", "0x1209", "--pid", "0x0001", "--json")
+    data = json.loads(out)
+    assert data["vid"] == "0x1209" and data["pid"] == "0x1"
+
+
 def test_dry_run_release_elf():
     out = run_flash("--dry-run", "--release", "--json")
     data = json.loads(out)

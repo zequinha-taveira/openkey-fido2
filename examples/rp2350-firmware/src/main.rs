@@ -206,9 +206,10 @@ fn main() -> ! {
     let storage = core::cell::RefCell::new(StorageEngine::with_backend(Box::new(backend)));
     let crypto = CryptoEngine::new().expect("crypto engine");
     let mut oath = OathApplet::new(&storage, crypto.clone()).expect("applet OATH");
-    let mut management = ManagementApplet::new(&storage, crypto).expect("applet Management");
-    let mut piv = PivApplet::default();
-    let mut openpgp = OpenPgpApplet::default();
+    let mut management =
+        ManagementApplet::new(&storage, crypto.clone()).expect("applet Management");
+    let mut piv = PivApplet::new(&storage, crypto.clone()).expect("applet PIV");
+    let mut openpgp = OpenPgpApplet::new(&storage, crypto).expect("applet OpenPGP");
     let mut router = CardRouter::new();
     register_multiprotocol_applets(
         &mut router,

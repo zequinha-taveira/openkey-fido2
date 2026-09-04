@@ -22,14 +22,14 @@
 use usb_device::bus::{UsbBus, UsbBusAllocator};
 use usb_device::device::{StringDescriptors, UsbDevice, UsbDeviceBuilder, UsbVidPid};
 
+use device_profile::{UsbIdentity as DeviceUsbIdentity, UsbVendorPreset};
 use transport::embedded::{CcidClass, CtapHidClass};
 
 /// Identidade USB completa do dispositivo composto (VID/PID + strings).
 ///
-/// O flavor `yubikey5-identity` troca TODA a identidade — números e strings —
-/// para que ferramentas da Yubico apresentem o dispositivo exatamente como
-/// um YubiKey 5. **NÃO PARA DISTRIBUIÇÃO** (VID/PID/strings de terceiro);
-/// builds publicados usam [`OPENKEY_IDENTITY`].
+/// Valores derivados dos presets de `device_profile::UsbIdentity` (fonte
+/// única de verdade); este struct apenas acrescenta o serial honesto
+/// (`openkey`) para o builder do `usb-device`.
 pub struct UsbIdentity {
     pub vid: u16,
     pub pid: u16,
@@ -38,34 +38,44 @@ pub struct UsbIdentity {
     pub serial: &'static str,
 }
 
-/// Identidade própria do projeto (pid.codes) — padrão dos builds distribuídos.
-pub const OPENKEY_IDENTITY: UsbIdentity = UsbIdentity {
-    vid: 0x1209,
-    pid: 0x0001,
-    manufacturer: "openkey-fido2",
-    product: "FIDO2 Authenticator",
-    serial: "openkey",
-};
+impl UsbIdentity {
+    /// Deriva a identidade USB do preset de fornecedor (VID/PID +
+    /// manufacturer/product de `device_profile`; serial `openkey`).
+    pub const fn from_preset(preset: UsbVendorPreset) -> Self {
+        let id = DeviceUsbIdentity::preset(preset);
+        Self {
+            vid: id.vid,
+            pid: id.pid,
+            manufacturer: id.manufacturer,
+            product: id.product,
+            serial: "openkey",
+        }
+    }
+}
 
-/// Identidade opt-in YubiKey 4/5 — VID:PID `1050:0407` + `Yubico YubiKey 5`.
+/// Identidade própria do projeto (pid.codes) — padrão dos builds distribuídos.
+/// The default USB identity pid.codes is 0x1209:0x0001.
+pub const OPENKEY_IDENTITY: UsbIdentity =
+    UsbIdentity::from_preset(UsbVendorPreset::OpenKey);
+
+/// Identidade opt-in YubiKey 5 — VID:PID `1050:0407` + strings do preset
+/// `device_profile::UsbIdentity::yubikey()`.
 ///
-/// Família YubiKey 4/5 no modo OTP+FIDO+CCID (`0407`) — literature Yubico
-/// lista `1050:0407` para YK4 e YK5 no mesmo modo composto. Product literal
-/// `YubiKey 5` com manufacturer `Yubico` → PCSC forma `Yubico YubiKey 5 0`
-/// (ykman `_pid_from_name` compatível, case-insensitive `yubico`+`yubikey`;
-/// substring `yubikey 4`/`yubikey 5` casa — `tools/hardware_check.py:250`);
-/// Vendor configurável do profile é `Yubikey 4/5` (`board_generic::YUBIKEY_4_5`,
+/// The default USB identity pid.codes is 0x1209:0x0001; the YubiKey USB identity
+/// that ykman / Yubico Authenticator auto-recognize is the opt-in VID:PID=Yubikey5
+/// build, not for distribution.
+///
+/// O flavor `yubikey5-identity` troca TODA a identidade — números e strings —
+/// para reconhecimento automático por ykman/Yubico Authenticator (casamento
+/// por VID/PID + substring `yubico`+`yubikey` no nome do reader PCSC).
+/// Família YubiKey 4/5 no modo OTP+FIDO+CCID (`0407`; `board_generic::YUBIKEY_4_5`,
 /// `device_profile::UsbIdentity::yubikey()`). Feature `yubikey4-identity` é
 /// alias de `yubikey5-identity` (ADR-0025). VID:PID de terceiro — **NÃO PARA
-/// DISTRIBUIÇÃO**. Serial permanece honesto (`openkey`).
+/// DISTRIBUIÇÃO**; builds publicados usam [`OPENKEY_IDENTITY`]. Serial
+/// permanece honesto (`openkey`).
 #[cfg(feature = "yubikey5-identity")]
-pub const ACTIVE_IDENTITY: UsbIdentity = UsbIdentity {
-    vid: 0x1050,
-    pid: 0x0407,
-    manufacturer: "Yubico",
-    product: "YubiKey 5",
-    serial: "openkey",
-};
+pub const ACTIVE_IDENTITY: UsbIdentity =
+    UsbIdentity::from_preset(UsbVendorPreset::YubiKey5);
 
 /// Identidade ativa sem o flavor opt-in.
 #[cfg(not(feature = "yubikey5-identity"))]

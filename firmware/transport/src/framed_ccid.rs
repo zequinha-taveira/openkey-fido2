@@ -85,6 +85,7 @@ mod tests {
         sent_blocks: Vec<Vec<u8>>,
         recv_data: Vec<u8>,
         initialized: bool,
+        fail_init: bool,
     }
 
     impl MockCcid {
@@ -93,12 +94,25 @@ mod tests {
                 sent_blocks: Vec::new(),
                 recv_data,
                 initialized: false,
+                fail_init: false,
+            }
+        }
+
+        fn failing_init() -> Self {
+            Self {
+                sent_blocks: Vec::new(),
+                recv_data: Vec::new(),
+                initialized: false,
+                fail_init: true,
             }
         }
     }
 
     impl UsbCcidDevice for MockCcid {
         fn init(&mut self) -> Result<(), EmbeddedTransportError> {
+            if self.fail_init {
+                return Err(EmbeddedTransportError::SendFailed);
+            }
             self.initialized = true;
             Ok(())
         }
@@ -139,5 +153,71 @@ mod tests {
         let sent = &transport.device().sent_blocks[0];
         // Expect data + SW1(0x90) + SW2(0x00)
         assert_eq!(sent, &vec![4, 5, 6, 0x90, 0x00]);
+    }
+
+    #[test]
+    fn test_framed_ccid_io_before_init_returns_not_initialized() {
+        let raw_apdu = vec![0x00, 0x10, 0x00, 0x00, 0x03, 1, 2, 3];
+        let mut transport = FramedCcidTransport::new(MockCcid::new(raw_apdu));
+        assert!(matches!(
+            transport.send(b"x"),
+            Err(TransportError::NotInitialized)
+        ));
+        assert!(matches!(
+            transport.recv(),
+            Err(TransportError::NotInitialized)
+        ));
+    }
+
+    #[test]
+    fn test_framed_ccid_init_failure_propagates() {
+        let mut transport = FramedCcidTransport::new(MockCcid::failing_init());
+        assert!(matches!(
+            transport.init(),
+            Err(TransportError::SendError(_))
+        ));
+        // Falha no init não pode marcar o transporte como inicializado.
+        assert!(matches!(
+            transport.send(b"x"),
+            Err(TransportError::NotInitialized)
+        ));
+        assert!(matches!(
+            transport.recv(),
+            Err(TransportError::NotInitialized)
+        ));
+    }
+
+    #[test]
+    fn test_framed_ccid_empty_recv_returns_timeout() {
+        let mut transport = FramedCcidTransport::new(MockCcid::new(Vec::new()));
+        transport.init().unwrap();
+        match transport.recv() {
+            Err(TransportError::RecvError(msg)) => assert!(msg.contains("timeout")),
+            other => panic!("expected timeout RecvError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_framed_ccid_close_resets_and_reinit_roundtrips() {
+        let raw_apdu = vec![0x00, 0x10, 0x00, 0x00, 0x03, 1, 2, 3];
+        let mut transport = FramedCcidTransport::new(MockCcid::new(raw_apdu));
+        transport.init().unwrap();
+        assert_eq!(transport.recv().unwrap(), vec![1, 2, 3]);
+
+        assert!(transport.close().is_ok());
+        assert!(matches!(
+            transport.send(b"x"),
+            Err(TransportError::NotInitialized)
+        ));
+        assert!(matches!(
+            transport.recv(),
+            Err(TransportError::NotInitialized)
+        ));
+
+        transport.init().unwrap();
+        assert_eq!(transport.recv().unwrap(), vec![1, 2, 3]);
+        transport.send(&[7, 8]).unwrap();
+        let sent = transport.device().sent_blocks.last().unwrap();
+        assert_eq!(sent, &vec![7, 8, 0x90, 0x00]);
     }
 }

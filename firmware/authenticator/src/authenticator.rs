@@ -265,6 +265,19 @@ impl EmbeddedAuthenticator {
         self.webauthn.set_user_presence(presence);
     }
 
+    /// Define a verificação de usuário embutida (mock de host) aplicada ao
+    /// ClientPIN 0x06/0x07 e anunciada no GetInfo quando `uv` está habilitado
+    /// no perfil (`DeviceProfileBuilder::uv_support`).
+    ///
+    /// `None` (padrão) preserva o comportamento sem hardware: 0x06 retorna
+    /// `UvBlocked`, 0x07 retorna `UnsupportedOption` e `uv` não é anunciado.
+    pub fn set_user_verification(
+        &mut self,
+        verification: Option<Box<dyn ctap2::UserVerification>>,
+    ) {
+        self.webauthn.set_user_verification(verification);
+    }
+
     /// Injeta um botão de user presence do board (ex.: BOOTSEL do RP2350).
     pub fn set_user_presence_button<B>(&mut self, button: B)
     where
@@ -548,6 +561,33 @@ mod tests {
         let mut auth = EmbeddedAuthenticator::new_with_board(&board_generic::GENERIC).unwrap();
         // Sem fonte automática => user presence ausente => up satisfeito.
         assert!(auth.make_credential(request_with_up(true)).is_ok());
+    }
+
+    /// Mock de UV embutida restrito a host (sem alegações de hardware).
+    #[derive(Debug)]
+    struct MockUserVerification {
+        retries: u8,
+    }
+
+    impl ctap2::UserVerification for MockUserVerification {
+        fn verify(&mut self) -> Result<(), ctap2::Ctap2Error> {
+            Ok(())
+        }
+
+        fn retries(&self) -> u8 {
+            self.retries
+        }
+    }
+
+    #[test]
+    fn test_uv_mock_wiring_advertises_uv_with_profile_cap() {
+        let profile = DeviceProfileBuilder::new().uv_support(true).build();
+        let mut auth = EmbeddedAuthenticator::new_with_profile(profile).unwrap();
+        // Capability `uv` sem mock => não anunciado (padrão, sem hardware).
+        assert!(!auth.get_info().unwrap().options.contains(&"uv".to_string()));
+        // Com mock injetado => anunciado.
+        auth.set_user_verification(Some(Box::new(MockUserVerification { retries: 3 })));
+        assert!(auth.get_info().unwrap().options.contains(&"uv".to_string()));
     }
 
     fn resident_request() -> ctap2::MakeCredentialRequest {
