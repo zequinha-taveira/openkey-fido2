@@ -283,8 +283,8 @@ fn test_ctap2_get_info() {
     let authenticator = Ctap2Authenticator::new(ctap2::AAGUID, crypto, storage).unwrap();
 
     let info = authenticator.get_info().unwrap();
-    assert!(info.versions.contains(&"2.0".to_string()));
-    assert!(info.versions.contains(&"2.1".to_string()));
+    assert!(info.versions.contains(&"FIDO_2_0".to_string()));
+    assert!(info.versions.contains(&"FIDO_2_1".to_string()));
     assert_eq!(info.aaguid, vec![0u8; 16]);
     assert!(info.options.contains(&"rk".to_string()));
     assert!(info.options.contains(&"up".to_string()));
@@ -390,7 +390,7 @@ fn test_ctap2_process_command_get_info() {
         Some(ciborium::Value::Integer(1_000.into()))
     );
     let response: ctap2::GetInfoResponse = ctap2::decode_cbor(&response_data).unwrap();
-    assert!(response.versions.contains(&"2.0".to_string()));
+    assert!(response.versions.contains(&"FIDO_2_0".to_string()));
 }
 
 #[test]
@@ -695,7 +695,11 @@ fn test_embedded_authenticator_capabilities_drive_get_info() {
     let info = authenticator.get_info().unwrap();
     assert_eq!(info.firmware_version, 3_001_000);
     assert!(info.options.contains(&"rk".to_string()));
-    assert!(info.options.contains(&"clientPin".to_string()));
+    // CTAP 2.0/2.1 §6.4: sem PIN configurado, `clientPin` não é anunciado
+    // como presente na struct (no fio CBOR é emitido como false);
+    // `pinUvAuthToken` indica a capacidade de definir PIN.
+    assert!(!info.options.contains(&"clientPin".to_string()));
+    assert!(info.options.contains(&"pinUvAuthToken".to_string()));
     assert_eq!(info.max_credential_id_length, 128);
 }
 
