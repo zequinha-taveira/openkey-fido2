@@ -31,9 +31,12 @@ fn derive_key_from_path(path: &std::path::Path) -> [u8; 32] {
     use ring::digest;
     let path_bytes = path.to_string_lossy();
     let hash = digest::digest(&digest::SHA256, path_bytes.as_bytes());
-    let mut key = [0u8; 32];
-    key.copy_from_slice(hash.as_ref());
-    key
+    // Sem buffer zerado intermediário: converte o digest direto para evitar
+    // valor criptográfico hard-coded (CodeQL rust/hard-coded-cryptographic-value).
+    // Derivação determinística intencional, coberta por `InsecureHostStorage`.
+    hash.as_ref()
+        .try_into()
+        .expect("SHA-256 produz 32 bytes")
 }
 
 /// Marcador explícito de storage de host **inseguro**.

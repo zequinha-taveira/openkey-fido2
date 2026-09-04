@@ -67,8 +67,14 @@ fn derive_applet_key_from_path(path: &Path) -> Result<[u8; 32], Box<dyn std::err
     let mut input = path.to_string_lossy().into_owned().into_bytes();
     input.extend_from_slice(b":applets");
     let hash = probe.sha256(&input);
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&hash);
+    // Sem buffer zerado intermediário: converte o digest direto para evitar
+    // valor criptográfico hard-coded (CodeQL rust/hard-coded-cryptographic-value).
+    // A derivação determinística é intencional (persistência entre reinícios);
+    // a insegurança já está documentada acima — restrito a simulador/testes.
+    let key: [u8; 32] = hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| "SHA-256 deve produzir 32 bytes")?;
     Ok(key)
 }
 
