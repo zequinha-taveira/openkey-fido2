@@ -382,4 +382,5 @@ Estado em 2026-09-03 (toolchain `1.98.0-x86_64-pc-windows-gnu`): 502 testes Rust
     - O leitor CCID aparece, mas a interface CCID precisa:
       - Responder ao ICC Power On com um ATR válido (ex.: `3B 8D 80 01...`)
       - Processar APDU SELECT dos applets (OATH, Management, etc.)
+    - A interface USB-HID FIDO precisa enumerar e responder ao CTAPHID ping.
   - Falta: flash nova + confirmação (ATR, `ykman info`, HID OK).

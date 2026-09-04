@@ -267,6 +267,18 @@ Dispositivo composto esperado (HID `0xF1D0` + CCID `0x0B`):
   (`3B FA ... 6F 70 65 6E...`), `select_oath` e `select_management` com
   `sw=9000` (ou payload de versão/desafio no SELECT).
 
+  > **Diagnóstico medido em hardware real (placa física RP2350-Zero):**
+  >
+  > | Parâmetro | Valor Medido | Diagnóstico Técnico |
+  > | :--- | :--- | :--- |
+  > | `ykman_compatible` | `true` | Nome casa com substring esperada (`Yubico YubiKey OTP+FIDO+CCID`) |
+  > | `is_yubikey_optin` | `true` | É o build opt-in `1050:0407` |
+  > | `connect_error` | `0x80100066` | `SCARD_W_REMOVED_CARD` (slot CCID sem resposta de ATR ao Power On) |
+  > | `HID FIDO` | `nenhum enumerado` | CTAPHID ping falhou / sem descritor HID FIDO ativo |
+  > | `ATR` | `null` | Sem resposta de power-on (`PC_to_RDR_IccPowerOn`) |
+  >
+  > Para o checklist exato do que implementar no firmware, consulte [O que falta no firmware](#o-que-falta-no-firmware).
+
 - [ ] Validação neutra com **`opensc-tool`** (ferramenta padrão aberta ISO 7816-4):
 
   ```powershell
@@ -387,6 +399,9 @@ O leitor CCID aparece (`Yubico YubiKey OTP+FIDO+CCID 0`), mas a interface CCID p
      - **PIV Applet**: AID `A0 00 00 03 08`
      - **OpenPGP Applet**: AID `D2 76 00 01 24 01`
    - O firmware deve responder com o status word `90 00` e o payload TLV esperado pelos clientes (ex.: YubiKey Manager, Yubico Authenticator, OpenSC).
+
+3. **Enumeração e resposta CTAPHID da Interface USB-HID FIDO**:
+   - A Interface 0 do descritor USB composto precisa expor a classe HID com usage page `0xF1D0` e responder ao pacote `CTAPHID_INIT` / `CTAPHID_PING`. Se o endpoint de interrupção não processar os relatórios ou houver conflito de endpoint/descritor no USB stack, o host relatará "nenhum HID FIDO enumerado" e o CTAPHID ping falhará.
 
 ---
 
