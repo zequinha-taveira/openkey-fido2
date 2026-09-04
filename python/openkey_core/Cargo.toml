@@ -17,4 +17,4 @@ crate-type = ["cdylib"]
 authenticator = { path = "../../firmware/authenticator" }
 board-generic = { path = "../../firmware/board-generic" }
 ctap2 = { path = "../../protocol/ctap2" }
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
