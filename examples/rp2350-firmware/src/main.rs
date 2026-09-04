@@ -42,20 +42,23 @@ use crypto::CryptoEngine;
 use storage::StorageEngine;
 use transport::iso7816::CardRouter;
 
+use ctap2::{Ctap2Authenticator, Ctap2Error};
 use transport::ctaphid::{
     ctaphid_capabilities, ChannelManager, CtaphidAssembler, CtaphidCommand, CtaphidErrorCode,
     CtaphidFragmenter, CtaphidMessage, CTAPHID_PACKET_SIZE,
 };
 use transport::embedded::usb_ccid_backend::MAX_PAYLOAD_LEN;
 
+mod bootsel_presence;
 mod composite;
 mod qspi_flash;
 
+use bootsel_presence::Rp2350UserPresence;
 use composite::CompositeUsbDevice;
 use storage::FlashStorageBackend;
 
-/// Tamanho do heap em bytes (para `Vec` e estruturas alocadas do CTAPHID).
-const HEAP_SIZE: usize = 8192;
+/// Tamanho do heap em bytes (para `Vec` e estruturas alocadas do CTAPHID e CBOR).
+const HEAP_SIZE: usize = 65536;
 
 /// Cristal externo de 12 MHz (Raspberry Pi Pico 2). Ajuste conforme a placa.
 const XTAL_FREQ_HZ: u32 = 12_000_000u32;
@@ -206,9 +209,10 @@ fn main() -> ! {
     let storage = core::cell::RefCell::new(StorageEngine::with_backend(Box::new(backend)));
     let crypto = CryptoEngine::new().expect("crypto engine");
     let mut oath = OathApplet::new(&storage, crypto.clone()).expect("applet OATH");
-    let mut management = ManagementApplet::new(&storage, crypto).expect("applet Management");
-    let mut piv = PivApplet::default();
-    let mut openpgp = OpenPgpApplet::default();
+    let mut management =
+        ManagementApplet::new(&storage, crypto.clone()).expect("applet Management");
+    let mut piv = PivApplet::new(&storage, crypto.clone()).expect("applet PIV");
+    let mut openpgp = OpenPgpApplet::new(&storage, crypto.clone()).expect("applet OpenPGP");
     let mut router = CardRouter::new();
     register_multiprotocol_applets(
         &mut router,
@@ -217,6 +221,17 @@ fn main() -> ! {
         &mut piv,
         &mut openpgp,
     );
+
+    // 1d. Autenticador CTAP2 para FIDO2/WebAuthn via USB-HID.
+    #[cfg(feature = "yubikey5-identity")]
+    let aaguid = board_generic::profiles::YUBIKEY_4_5.aaguid;
+    #[cfg(not(feature = "yubikey5-identity"))]
+    let aaguid = board_generic::profiles::RP2350_ZERO.aaguid;
+
+    let ctap_storage = StorageEngine::new().expect("ctap storage");
+    let mut ctap2_auth = Ctap2Authenticator::new(aaguid, crypto.clone(), ctap_storage)
+        .expect("ctap2 authenticator");
+    ctap2_auth.set_user_presence(Some(Box::new(Rp2350UserPresence::new())));
 
     // 2. Periféricos singleton.
     let mut pac = hal::pac::Peripherals::take().unwrap();
@@ -292,7 +307,7 @@ fn main() -> ! {
             Some(_) => match assembler.process_packet(&buf) {
                 Ok(Some(msg)) => {
                     let cmd = msg.cmd;
-                    let (cid, resp_cmd, payload) = dispatch(&mut channels, msg);
+                    let (cid, resp_cmd, payload) = dispatch(&mut channels, &mut ctap2_auth, msg);
 
                     if cmd == CtaphidCommand::Wink {
                         // Sinal visual de presença (WS2812B em GPIO16 na
@@ -303,9 +318,7 @@ fn main() -> ! {
                     }
 
                     if let Ok(packets) = CtaphidFragmenter::fragment(cid, resp_cmd, &payload) {
-                        for packet in packets {
-                            let _ = device.hid.send_report(&packet);
-                        }
+                        send_hid_packets(&mut device, &mut router, &packets);
                     }
                 }
                 Ok(None) => {
@@ -316,9 +329,7 @@ fn main() -> ! {
                     if let Ok(packets) =
                         CtaphidFragmenter::fragment(cid, CtaphidCommand::Error, &payload)
                     {
-                        for packet in packets {
-                            let _ = device.hid.send_report(&packet);
-                        }
+                        send_hid_packets(&mut device, &mut router, &packets);
                     }
                 }
             },
@@ -330,9 +341,42 @@ fn main() -> ! {
     }
 }
 
+/// Envia todos os pacotes de uma mensagem CTAPHID fragmentada, realizando polling
+/// no barramento USB até que cada pacote seja aceito pelo endpoint IN de hardware.
+fn send_hid_packets<B: usb_device::bus::UsbBus>(
+    device: &mut CompositeUsbDevice<'_, B>,
+    router: &mut CardRouter,
+    packets: &[[u8; CTAPHID_PACKET_SIZE]],
+) {
+    for packet in packets {
+        let mut sent = false;
+        for _ in 0..500_000 {
+            device.poll();
+            if device.ccid.is_pending() {
+                let mut apdu_scratch = [0u8; MAX_PAYLOAD_LEN];
+                if let Some(len) = device.ccid.take_pending_request(&mut apdu_scratch) {
+                    let response = router.process(&apdu_scratch[..len]);
+                    let _ = device.ccid.send_response(&response.to_bytes());
+                }
+            }
+            if device.hid.send_report(packet).is_ok() {
+                sent = true;
+                break;
+            }
+        }
+        if !sent {
+            break;
+        }
+    }
+}
+
 /// Despacha uma mensagem CTAPHID completa e produz a resposta
 /// `(cid, comando, payload)`.
-fn dispatch(channels: &mut ChannelManager, msg: CtaphidMessage) -> (u32, CtaphidCommand, Vec<u8>) {
+fn dispatch(
+    channels: &mut ChannelManager,
+    ctap2_auth: &mut Ctap2Authenticator,
+    msg: CtaphidMessage,
+) -> (u32, CtaphidCommand, Vec<u8>) {
     match msg.cmd {
         CtaphidCommand::Init => {
             let capabilities = ctaphid_capabilities::CAPABILITY_CBOR
@@ -353,12 +397,29 @@ fn dispatch(channels: &mut ChannelManager, msg: CtaphidMessage) -> (u32, Ctaphid
         CtaphidCommand::Cancel => (msg.cid, CtaphidCommand::Cancel, Vec::new()),
         CtaphidCommand::Keepalive => (msg.cid, CtaphidCommand::Keepalive, msg.payload),
         CtaphidCommand::Error => (msg.cid, CtaphidCommand::Error, msg.payload),
-        // O despacho do payload CTAP2 (CBOR) em si é integrado no próximo
-        // incremento; por ora responde com erro "não especificado".
-        CtaphidCommand::Cbor | CtaphidCommand::Msg => (
+        CtaphidCommand::Cbor => {
+            if msg.payload.is_empty() {
+                let payload = alloc::vec![Ctap2Error::InvalidLength.as_u8()];
+                (msg.cid, CtaphidCommand::Cbor, payload)
+            } else {
+                let cmd_byte = msg.payload[0];
+                let cbor_data = msg.payload[1..].to_vec();
+                let mut payload = alloc::vec![0u8]; // Byte 0 = CTAP2_OK (0x00)
+                match ctap2_auth.process_command(cmd_byte, cbor_data) {
+                    Ok(mut resp_bytes) => {
+                        payload.append(&mut resp_bytes);
+                        (msg.cid, CtaphidCommand::Cbor, payload)
+                    }
+                    Err(err) => {
+                        (msg.cid, CtaphidCommand::Cbor, alloc::vec![err.as_u8()])
+                    }
+                }
+            }
+        }
+        CtaphidCommand::Msg => (
             msg.cid,
             CtaphidCommand::Error,
-            alloc::vec![CtaphidErrorCode::Other.as_u8()],
+            alloc::vec![CtaphidErrorCode::InvalidCmd.as_u8()],
         ),
         CtaphidCommand::Vendor(_) => (
             msg.cid,

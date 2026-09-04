@@ -56,9 +56,10 @@ pub struct MakeCredentialRequest {
     pub user: User,
     #[serde(rename = "pubKeyCredParams")]
     pub pub_key_cred_params: Vec<PublicKeyCredParams>,
-    #[serde(rename = "excludeList")]
+    #[serde(rename = "excludeList", default)]
     pub exclude_list: Vec<CredentialDescriptor>,
     pub extensions: Option<Extensions>,
+    #[serde(default)]
     pub options: MakeCredentialOptions,
     /// MAC do `clientDataHash` produzido pelo `pinUvAuthToken`.
     #[serde(
@@ -85,10 +86,11 @@ pub struct RelyingParty {
 pub struct User {
     #[serde(with = "serde_bytes")]
     pub id: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(rename = "displayName")]
+    #[serde(rename = "displayName", skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    #[serde(rename = "icon")]
+    #[serde(rename = "icon", skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
 }
 
@@ -104,6 +106,7 @@ pub struct CredentialDescriptor {
     pub r#type: String,
     #[serde(with = "serde_bytes")]
     pub id: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub transports: Option<Vec<String>>,
 }
 
@@ -186,12 +189,23 @@ pub struct MakeCredentialOptions {
     /// User verification — exigir PIN/biometria.
     #[serde(default)]
     pub uv: bool,
-    /// User presence — exigir toque físico.
-    #[serde(default)]
+    /// User presence — exigir toque físico. Ausente ⇒ verdadeiro (CTAP 2.0 §5.1).
+    #[serde(default = "default_true")]
     pub up: bool,
     /// Estendido — inclui dados adicionais no authData.
     #[serde(rename = "att", default)]
     pub extended: bool,
+}
+
+impl Default for MakeCredentialOptions {
+    fn default() -> Self {
+        Self {
+            rk: false,
+            uv: false,
+            up: true,
+            extended: false,
+        }
+    }
 }
 
 /// Resposta do comando MakeCredential.
@@ -328,7 +342,7 @@ impl Default for GetAssertionOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetAssertionResponse {
     /// Credencial utilizada na assertion.
-    #[serde(rename = "credential")]
+    #[serde(rename = "credential", skip_serializing_if = "Option::is_none")]
     pub credential: Option<CredentialDescriptor>,
     /// Authenticator Data CBOR serializado.
     #[serde(with = "serde_bytes", rename = "authData")]
@@ -337,12 +351,11 @@ pub struct GetAssertionResponse {
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
     /// Dados do usuário (quando credencial é discoverable).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<User>,
     /// Total de credenciais encontradas (multi-assertion).
-    #[serde(rename = "numberOfCredentials")]
+    #[serde(rename = "numberOfCredentials", skip_serializing_if = "Option::is_none")]
     pub number_of_credentials: Option<u16>,
-    /// Indica se há mais credenciais (GetNextAssertion).
-    pub next: Option<bool>,
     /// Saídas das extensões ativas, se houver.
     #[serde(rename = "extensions", skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionOutputs>,
@@ -784,17 +797,32 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
                             Value::Array(names)
                                 if names.iter().all(|v| matches!(v, Value::Text(_))) =>
                             {
-                                Value::Map(
-                                    names
-                                        .into_iter()
-                                        .filter_map(|name| match name {
-                                            Value::Text(name) => {
-                                                Some((Value::Text(name), Value::Bool(true)))
-                                            }
-                                            _ => None,
-                                        })
-                                        .collect(),
-                                )
+                                let mut entries: Vec<(Value, Value)> = names
+                                    .into_iter()
+                                    .filter_map(|name| match name {
+                                        Value::Text(name) => {
+                                            Some((Value::Text(name), Value::Bool(true)))
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                // CTAP 2.0 / 2.1 §6.4: se clientPin não foi incluído como true
+                                // (porque nenhum PIN está configurado), deve ser emitido como false
+                                // para anunciar a capacidade do dispositivo de receber um PIN quando
+                                // pinUvAuthToken está habilitado.
+                                if entries
+                                    .iter()
+                                    .any(|(k, _)| matches!(k, Value::Text(name) if name == "pinUvAuthToken"))
+                                    && !entries
+                                        .iter()
+                                        .any(|(k, _)| matches!(k, Value::Text(name) if name == "clientPin"))
+                                {
+                                    entries.push((
+                                        Value::Text("clientPin".to_string()),
+                                        Value::Bool(false),
+                                    ));
+                                }
+                                Value::Map(entries)
                             }
                             other => other,
                         }
@@ -817,6 +845,58 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
                             }
                             other => other,
                         }
+                    }
+                } else {
+                    val
+                }
+            } else if type_name.contains("CredentialManagementRequest") {
+                let is_params = if encode {
+                    matches!(&key, Value::Text(name) if name == "subCommandParams")
+                } else {
+                    matches!(&key, Value::Integer(n) if *n == 2.into())
+                };
+                if is_params {
+                    if let Value::Map(params) = val {
+                        Value::Map(
+                            params
+                                .into_iter()
+                                .map(|(pk, pv)| {
+                                    if encode {
+                                        if let Value::Text(pname) = pk {
+                                            let plabel = match pname.as_str() {
+                                                "rpIDHash" => Some(1),
+                                                "credentialId" => Some(2),
+                                                "user" => Some(3),
+                                                _ => None,
+                                            };
+                                            if let Some(n) = plabel {
+                                                (Value::Integer(n.into()), pv)
+                                            } else {
+                                                (Value::Text(pname), pv)
+                                            }
+                                        } else {
+                                            (pk, pv)
+                                        }
+                                    } else if let Value::Integer(pn) = pk {
+                                        let pname = match i64::try_from(pn).ok() {
+                                            Some(1) => Some("rpIDHash"),
+                                            Some(2) => Some("credentialId"),
+                                            Some(3) => Some("user"),
+                                            _ => None,
+                                        };
+                                        if let Some(s) = pname {
+                                            (Value::Text(s.to_string()), pv)
+                                        } else {
+                                            (Value::Integer(pn), pv)
+                                        }
+                                    } else {
+                                        (pk, pv)
+                                    }
+                                })
+                                .collect(),
+                        )
+                    } else {
+                        val
                     }
                 } else {
                     val
@@ -929,40 +1009,40 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
                         {
                             Some(0x02)
                         }
-                        t if t.contains("EnumerateRpsEntryResponse") && name == "rp" => Some(0x01),
+                        t if t.contains("EnumerateRpsEntryResponse") && name == "rp" => Some(0x03),
                         t if t.contains("EnumerateRpsEntryResponse") && name == "rpIDHash" => {
-                            Some(0x02)
+                            Some(0x04)
                         }
                         t if t.contains("EnumerateRpsEntryResponse") && name == "totalRPs" => {
-                            Some(0x03)
+                            Some(0x05)
                         }
                         t if t.contains("EnumerateCredentialsEntryResponse") && name == "user" => {
-                            Some(0x01)
+                            Some(0x06)
                         }
                         t if t.contains("EnumerateCredentialsEntryResponse")
                             && name == "credentialId" =>
                         {
-                            Some(0x02)
+                            Some(0x07)
                         }
                         t if t.contains("EnumerateCredentialsEntryResponse")
                             && name == "publicKey" =>
                         {
-                            Some(0x03)
-                        }
-                        t if t.contains("EnumerateCredentialsEntryResponse")
-                            && name == "credProtect" =>
-                        {
-                            Some(0x04)
-                        }
-                        t if t.contains("EnumerateCredentialsEntryResponse")
-                            && name == "largeBlobKey" =>
-                        {
-                            Some(0x05)
+                            Some(0x08)
                         }
                         t if t.contains("EnumerateCredentialsEntryResponse")
                             && name == "totalCredentials" =>
                         {
-                            Some(0x06)
+                            Some(0x09)
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse")
+                            && name == "credProtect" =>
+                        {
+                            Some(0x0A)
+                        }
+                        t if t.contains("EnumerateCredentialsEntryResponse")
+                            && name == "largeBlobKey" =>
+                        {
+                            Some(0x0B)
                         }
                         _ => ctap_key_to_int(&name),
                     };
@@ -1068,20 +1148,21 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
                         ]
                         .get(n as usize)
                         .copied(),
-                        t if t.contains("EnumerateRpsEntryResponse") => {
-                            ["", "rp", "rpIDHash", "totalRPs"].get(n as usize).copied()
-                        }
-                        t if t.contains("EnumerateCredentialsEntryResponse") => [
-                            "",
-                            "user",
-                            "credentialId",
-                            "publicKey",
-                            "credProtect",
-                            "largeBlobKey",
-                            "totalCredentials",
-                        ]
-                        .get(n as usize)
-                        .copied(),
+                        t if t.contains("EnumerateRpsEntryResponse") => match n {
+                            0x03 => Some("rp"),
+                            0x04 => Some("rpIDHash"),
+                            0x05 => Some("totalRPs"),
+                            _ => None,
+                        },
+                        t if t.contains("EnumerateCredentialsEntryResponse") => match n {
+                            0x06 => Some("user"),
+                            0x07 => Some("credentialId"),
+                            0x08 => Some("publicKey"),
+                            0x09 => Some("totalCredentials"),
+                            0x0A => Some("credProtect"),
+                            0x0B => Some("largeBlobKey"),
+                            _ => None,
+                        },
                         _ => None,
                     })
                     .filter(|s| !s.is_empty());
@@ -1096,13 +1177,55 @@ fn root_ctap_keys(value: Value, encode: bool, type_name: &str) -> Value {
     Value::Map(converted)
 }
 
+fn canonicalize_cbor(value: Value) -> Value {
+    match value {
+        Value::Map(entries) => {
+            let mut canonical_entries: Vec<(Value, Value, Vec<u8>)> = entries
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    // No CTAP2, campos ausentes/nulos NUNCA devem aparecer no mapa wire CBOR.
+                    if matches!(v, Value::Null) {
+                        return None;
+                    }
+                    let k_canon = canonicalize_cbor(k);
+                    let v_canon = canonicalize_cbor(v);
+                    if matches!(v_canon, Value::Null) {
+                        return None;
+                    }
+                    let mut k_bytes = alloc::vec![];
+                    let _ = into_writer(&k_canon, &mut k_bytes);
+                    Some((k_canon, v_canon, k_bytes))
+                })
+                .collect();
+
+            // RFC 7049 §3.9 / CTAP2 §6: Ordenação canônica por menor comprimento primeiro,
+            // e desempate por comparação léxica de bytes.
+            canonical_entries.sort_by(|(_, _, a_bytes), (_, _, b_bytes)| {
+                a_bytes.len().cmp(&b_bytes.len()).then_with(|| a_bytes.cmp(b_bytes))
+            });
+
+            Value::Map(
+                canonical_entries
+                    .into_iter()
+                    .map(|(k, v, _)| (k, v))
+                    .collect(),
+            )
+        }
+        Value::Array(entries) => {
+            Value::Array(entries.into_iter().map(canonicalize_cbor).collect())
+        }
+        other => other,
+    }
+}
+
 pub fn encode_cbor<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Ctap2Error> {
     let mut raw = Vec::new();
     ciborium::ser::into_writer(value, &mut raw).map_err(|_| Ctap2Error::Unknown)?;
     let parsed: Value = from_reader(raw.as_slice()).map_err(|_| Ctap2Error::Unknown)?;
     let normalized = root_ctap_keys(parsed, true, core::any::type_name::<T>());
+    let canonical = canonicalize_cbor(normalized);
     let mut buf = alloc::vec![];
-    into_writer(&normalized, &mut buf).map_err(|_| Ctap2Error::Unknown)?;
+    into_writer(&canonical, &mut buf).map_err(|_| Ctap2Error::Unknown)?;
     Ok(buf)
 }
 
@@ -1172,7 +1295,7 @@ impl Default for Ctap2Capabilities {
     fn default() -> Self {
         Self {
             aaguid: AAGUID,
-            versions: vec!["2.0".to_string(), "2.1".to_string()],
+            versions: vec!["FIDO_2_0".to_string(), "FIDO_2_1".to_string()],
             extensions: vec![
                 "credProtect".to_string(),
                 "credBlob".to_string(),
@@ -1220,6 +1343,23 @@ pub trait UserPresence: core::fmt::Debug + Send + Sync {
     fn is_present(&mut self) -> bool;
 }
 
+/// Verificação de usuário embutida (ponto de injeção de mock de host).
+///
+/// Espelha [`UserPresence`]: o firmware de produção não tem hardware de
+/// biometria/PIN-pad, então `user_verification` permanece `None` por padrão
+/// e os subcomandos ClientPIN que exigem UV embutida continuam retornando
+/// `UvBlocked`/`UnsupportedOption`. Hosts e testes podem injetar um mock via
+/// [`Ctap2Authenticator::set_user_verification`]; o anúncio da option `uv` no
+/// GetInfo exige adicionalmente a capability `uv`
+/// (ver [`Ctap2Authenticator::get_info`]).
+pub trait UserVerification: core::fmt::Debug + Send + Sync {
+    /// Executa a verificação de usuário embutida; `Err` indica que o
+    /// usuário não foi verificado (ex.: tentativas esgotadas).
+    fn verify(&mut self) -> Result<(), Ctap2Error>;
+    /// Tentativas restantes de UV embutida, reportadas pelo `getUVRetries` (0x07).
+    fn retries(&self) -> u8;
+}
+
 #[derive(Debug)]
 pub struct Ctap2Authenticator {
     crypto: CryptoEngine,
@@ -1233,6 +1373,7 @@ pub struct Ctap2Authenticator {
     cred_mgmt_creds_state: Option<EnumerateCredentialsState>,
     get_next_assertion_state: Option<GetNextAssertionState>,
     user_presence: Option<Box<dyn UserPresence>>,
+    user_verification: Option<Box<dyn UserVerification>>,
     pin_uv_auth_token: Option<client_pin::PinUvAuthTokenState>,
     pin_agreement_key: Option<crypto::pin_protocol::PinAgreementKey>,
     pin_shared_secret: Option<(crypto::pin_protocol::Zeroizing<Vec<u8>>, u8)>,
@@ -1315,6 +1456,7 @@ impl Ctap2Authenticator {
             cred_mgmt_creds_state: None,
             get_next_assertion_state: None,
             user_presence: None,
+            user_verification: None,
             pin_uv_auth_token: None,
             pin_agreement_key: None,
             pin_shared_secret: None,
@@ -1352,6 +1494,84 @@ impl Ctap2Authenticator {
     /// usado em simulação e testes sem botão físico.
     pub fn set_user_presence(&mut self, presence: Option<Box<dyn UserPresence>>) {
         self.user_presence = presence;
+    }
+
+    /// Define a verificação de usuário embutida (mock de host) usada pelo
+    /// ClientPIN 0x06/0x07.
+    ///
+    /// Quando `None` (padrão), o comportamento é o atual sem hardware:
+    /// 0x06 retorna `UvBlocked`, 0x07 retorna `UnsupportedOption` e o GetInfo
+    /// não anuncia `uv`.
+    pub fn set_user_verification(&mut self, verification: Option<Box<dyn UserVerification>>) {
+        self.user_verification = verification;
+    }
+
+    /// Tentativas restantes de UV embutida quando há mock injetado **e** a
+    /// capability `uv` está habilitada; `None` preserva o padrão (sem UV).
+    ///
+    /// O contador é persistente (`sys:uv_retries`), espelhando o de PIN —
+    /// sobrevive a reboots; o valor volátil do mock serve apenas para semear
+    /// o storage nos testes.
+    pub(crate) fn builtin_uv_retries(&self) -> Option<u8> {
+        self.user_verification.as_ref()?;
+        if !self.capabilities.options.contains(&"uv".to_string()) {
+            return None;
+        }
+        Some(self.get_uv_retries())
+    }
+
+    /// Contador persistente de tentativas de UV embutida.
+    pub(crate) fn get_uv_retries(&self) -> u8 {
+        client_pin::read_uv_retries(&self.storage)
+    }
+
+    /// Restaura o contador persistente de UV após verificação bem-sucedida.
+    pub(crate) fn reset_uv_retries(&mut self) {
+        let _ = self.storage.store(
+            client_pin::UV_RETRIES_KEY,
+            client_pin::UV_MAX_RETRIES.to_string().into_bytes(),
+        );
+    }
+
+    /// Consome uma tentativa de UV embutida (persistente).
+    pub(crate) fn decrement_uv_retries(&mut self) {
+        let current = self.get_uv_retries();
+        let new = current.saturating_sub(1);
+        let _ = self
+            .storage
+            .store(client_pin::UV_RETRIES_KEY, new.to_string().into_bytes());
+    }
+
+    /// Executa a UV embutida para o `getPinUvAuthTokenUsingUvWithPermissions`
+    /// (0x06). Sem mock injetado ou sem a capability `uv`, retorna
+    /// `UvBlocked` (comportamento atual, CTAP 2.1 §6.5.5.7.3). Com contador
+    /// zerado, bloqueia sem chamar o verificador; falha decrementa, sucesso
+    /// reseta o contador persistente.
+    pub(crate) fn perform_builtin_uv(&mut self) -> Result<(), Ctap2Error> {
+        if !self.capabilities.options.contains(&"uv".to_string()) {
+            return Err(Ctap2Error::UvBlocked);
+        }
+        if self.user_verification.is_none() {
+            return Err(Ctap2Error::UvBlocked);
+        }
+        if self.get_uv_retries() == 0 {
+            return Err(Ctap2Error::UvBlocked);
+        }
+        let result = self
+            .user_verification
+            .as_mut()
+            .ok_or(Ctap2Error::UvBlocked)?
+            .verify();
+        match result {
+            Ok(()) => {
+                self.reset_uv_retries();
+                Ok(())
+            }
+            Err(e) => {
+                self.decrement_uv_retries();
+                Err(e)
+            }
+        }
     }
 
     /// Define a lista de RP IDs autorizados para Enterprise Attestation.
@@ -1846,11 +2066,6 @@ impl Ctap2Authenticator {
                 icon_url: None,
             }),
             number_of_credentials: if total > 1 { Some(total as u16) } else { None },
-            next: if total > 1 && current_index + 1 < total {
-                Some(true)
-            } else {
-                None
-            },
             extensions: if has_ext { Some(ext_outputs) } else { None },
         })
     }
@@ -1866,16 +2081,27 @@ impl Ctap2Authenticator {
 
         // Opções dinâmicas: `clientPin` indica o *suporte* à funcionalidade
         // (obrigatório para que plataformas possam definir o PIN inicial) e
-        // `pinUvAuthToken` o suporte a tokens. `uv` permanece ausente.
+        // `pinUvAuthToken` o suporte a tokens.
         let mut options = self.capabilities.options.clone();
+        // Mock de UV embutida restrito a host: `uv` só é anunciado com um
+        // verificador injetado; sem ele, a option é removida para que hosts
+        // não tentem 0x06/0x07 (comportamento padrão, sem hardware).
+        if self.user_verification.is_none() {
+            options.retain(|option| option != "uv");
+        }
         if !self.capabilities.pin_uv_auth_protocols.is_empty() {
             if !options.contains(&"pinUvAuthToken".to_string()) {
                 options.push("pinUvAuthToken".to_string());
             }
-            if client_pin::is_pin_set(&self.storage) && !options.contains(&"clientPin".to_string())
-            {
-                options.push("clientPin".to_string());
+            if client_pin::is_pin_set(&self.storage) {
+                if !options.contains(&"clientPin".to_string()) {
+                    options.push("clientPin".to_string());
+                }
+            } else {
+                options.retain(|option| option != "clientPin");
             }
+        } else {
+            options.retain(|option| option != "clientPin" && option != "pinUvAuthToken");
         }
 
         // Algoritmos anunciados no GetInfo: ES256, EdDSA e ES384 sempre; os
@@ -2108,7 +2334,6 @@ impl Ctap2Authenticator {
             .build_get_assertion_response(
                 &credential,
                 matching.len(),
-                next_index,
                 &client_data_hash,
                 flags,
                 chained_hmac,
@@ -2293,10 +2518,13 @@ impl Ctap2Authenticator {
             None,
         )?;
         if !pin_authenticated {
-            // CTAP 2.1 §6.12: todo subcomando de Credential Management exige um
-            // pinUvAuthToken com permissão `cm` — inclusive quando nenhum PIN
-            // está configurado, pois as respostas expõem user handles/nomes e
-            // permitem exclusão de credenciais residentes.
+            // CTAP 2.1 §6.8 / §6.12: todo subcomando de Credential Management exige um
+            // pinUvAuthToken com permissão `cm`. Se nenhum PIN estiver configurado,
+            // deve retornar CTAP2_ERR_PIN_NOT_SET (0x35); se houver PIN configurado,
+            // retorna CTAP2_ERR_PUAT_REQUIRED / PinRequired (0x36).
+            if !client_pin::is_pin_set(&self.storage) {
+                return Err(Ctap2Error::PinNotSet);
+            }
             return Err(Ctap2Error::PinRequired);
         }
 
@@ -2366,8 +2594,8 @@ impl Ctap2Authenticator {
 
         let response = cred_mgmt::EnumerateRpsEntryResponse {
             rp: RelyingParty {
-                id: first_rp_id,
-                name: None,
+                id: first_rp_id.clone(),
+                name: Some(first_rp_id),
                 icon: None,
             },
             rp_id_hash: first_rp_hash,
@@ -2393,7 +2621,7 @@ impl Ctap2Authenticator {
         let response = cred_mgmt::EnumerateRpsEntryResponse {
             rp: RelyingParty {
                 id: rp_id.clone(),
-                name: None,
+                name: Some(rp_id.clone()),
                 icon: None,
             },
             rp_id_hash: rp_hash.clone(),
@@ -2489,7 +2717,7 @@ impl Ctap2Authenticator {
                 id: credential.credential_id.clone(),
                 transports: None,
             },
-            public_key: credential.public_key.clone(),
+            public_key: cose_key_value(credential),
             total_credentials: total,
             // Política real da credencial; a enumeração exige token `cm`
             // autenticado, então expô-la aqui é seguro (CTAP 2.1 §6.12.2).
@@ -2577,7 +2805,6 @@ impl Ctap2Authenticator {
         &mut self,
         credential: &Credential,
         total: usize,
-        current_index: usize,
         client_data_hash: &[u8],
         flags: u8,
         chained_hmac: Option<Value>,
@@ -2624,8 +2851,6 @@ impl Ctap2Authenticator {
             _ => self.crypto.sign(&data_to_sign, &credential.private_key)?,
         };
 
-        let has_more = current_index + 1 < total;
-
         Ok(GetAssertionResponse {
             credential: Some(CredentialDescriptor {
                 r#type: "public-key".to_string(),
@@ -2634,9 +2859,15 @@ impl Ctap2Authenticator {
             }),
             auth_data,
             signature,
-            user: None,
+            // CTAP 2.1 §6.2: a asserção encadeada carrega a mesma entidade
+            // `user` (0x04) da asserção inicial — antes omitida aqui.
+            user: Some(User {
+                id: credential.user_handle.clone().unwrap_or_default(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            }),
             number_of_credentials: Some(total as u16),
-            next: Some(has_more),
             extensions: chained_hmac.map(|output| ExtensionOutputs {
                 hmac_secret: Some(output),
                 ..Default::default()
@@ -3015,6 +3246,33 @@ fn credential_management_auth_message(data: &[u8]) -> Result<Vec<u8>, Ctap2Error
 }
 
 /// Builds a COSE_Key CBOR map for an Ed25519 (EdDSA, alg -8) public key.
+fn cose_key_value(credential: &Credential) -> Value {
+    match credential.algorithm {
+        -7 => {
+            let (x, y) = if credential.public_key.len() == 65 && credential.public_key[0] == 0x04 {
+                (&credential.public_key[1..33], &credential.public_key[33..65])
+            } else if credential.public_key.len() == 64 {
+                (&credential.public_key[0..32], &credential.public_key[32..64])
+            } else {
+                (&credential.public_key[..], &[][..])
+            };
+            Value::Map(vec![
+                (Value::Integer(1.into()), Value::Integer(2.into())),
+                (Value::Integer(3.into()), Value::Integer((-7).into())),
+                (Value::Integer((-1).into()), Value::Integer(1.into())),
+                (Value::Integer((-2).into()), Value::Bytes(x.to_vec())),
+                (Value::Integer((-3).into()), Value::Bytes(y.to_vec())),
+            ])
+        }
+        _ => Value::Map(vec![
+            (Value::Integer(1.into()), Value::Integer(1.into())),
+            (Value::Integer(3.into()), Value::Integer((-8).into())),
+            (Value::Integer((-1).into()), Value::Integer(6.into())),
+            (Value::Integer((-2).into()), Value::Bytes(credential.public_key.clone())),
+        ]),
+    }
+}
+
 /// Labels: kty(1)=OKP(1), alg(3)=EdDSA(-8), crv(-1)=Ed25519(6), x(-2)=public key.
 fn build_cose_key(public_key: &[u8]) -> Result<Vec<u8>, Ctap2Error> {
     let mut key_map: BTreeMap<i64, Value> = BTreeMap::new();
@@ -3115,6 +3373,44 @@ mod tests {
             decode_cbor::<MakeCredentialRequest>(&encoded),
             Err(Ctap2Error::InvalidCbor)
         ));
+    }
+
+    #[test]
+    fn test_make_credential_minimal_request_omits_optional_fields() {
+        use ciborium::Value;
+        // CBOR com apenas campos obrigatórios: 1=clientDataHash, 2=rp, 3=user, 4=pubKeyCredParams
+        let mut map = Vec::new();
+        map.push((Value::Integer(1.into()), Value::Bytes(vec![0xAA; 32])));
+        map.push((
+            Value::Integer(2.into()),
+            Value::Map(vec![(
+                Value::Text("id".to_string()),
+                Value::Text("webauthn.io".to_string()),
+            )]),
+        ));
+        map.push((
+            Value::Integer(3.into()),
+            Value::Map(vec![
+                (Value::Text("id".to_string()), Value::Bytes(vec![1, 2, 3])),
+                (Value::Text("name".to_string()), Value::Text("zequina".to_string())),
+            ]),
+        ));
+        map.push((
+            Value::Integer(4.into()),
+            Value::Array(vec![Value::Map(vec![
+                (Value::Text("type".to_string()), Value::Text("public-key".to_string())),
+                (Value::Text("alg".to_string()), Value::Integer((-7).into())),
+            ])]),
+        ));
+        let mut raw = Vec::new();
+        ciborium::ser::into_writer(&Value::Map(map), &mut raw).unwrap();
+
+        let req: MakeCredentialRequest = decode_cbor(&raw).expect("deve decodificar sem excludeList e options");
+        assert_eq!(req.rp.id, "webauthn.io");
+        assert_eq!(req.user.name.as_deref(), Some("zequina"));
+        assert!(req.exclude_list.is_empty());
+        assert!(req.options.up);
+        assert!(!req.options.uv);
     }
 
     #[test]
@@ -3670,7 +3966,7 @@ mod tests {
         // opcionais (skip_serializing_if), e o roundtrip tipado com
         // serde_bytes não é obrigatório para validar o conteúdo.
         let value: Value = ciborium::de::from_reader(encoded.as_slice()).unwrap();
-        let cred_protect = cbor_field(&value, "4"); // chave CTAP de credProtect
+        let cred_protect = cbor_field(&value, "10"); // chave CTAP 2.1 (0x0A) de credProtect
         assert_eq!(cred_protect, Some(&Value::Integer(3.into())));
     }
 
@@ -3748,6 +4044,84 @@ mod tests {
         assert!(options.iter().any(|(key, value)| {
             matches!((key, value), (Value::Text(name), Value::Bool(true)) if name == "up")
         }));
+    }
+
+    #[test]
+    fn test_get_info_cbor_is_strictly_canonical() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+        let info = authenticator.get_info().unwrap();
+        let wire = encode_cbor(&info).unwrap();
+
+        let value: ciborium::Value = ciborium::de::from_reader(wire.as_slice()).unwrap();
+        let ciborium::Value::Map(entries) = value else {
+            panic!("GetInfo deve ser mapa");
+        };
+        for window in entries.windows(2) {
+            let mut a_bytes = Vec::new();
+            let mut b_bytes = Vec::new();
+            ciborium::ser::into_writer(&window[0].0, &mut a_bytes).unwrap();
+            ciborium::ser::into_writer(&window[1].0, &mut b_bytes).unwrap();
+            assert!(
+                a_bytes.len() < b_bytes.len() || (a_bytes.len() == b_bytes.len() && a_bytes < b_bytes),
+                "Chaves do GetInfo devem estar em ordem canônica estrita"
+            );
+        }
+    }
+
+    #[test]
+    fn test_get_assertion_cbor_omits_null_fields_and_is_strictly_canonical() {
+        let resp = GetAssertionResponse {
+            credential: Some(CredentialDescriptor {
+                r#type: "public-key".to_string(),
+                id: vec![1, 2, 3, 4],
+                transports: None,
+            }),
+            auth_data: vec![0u8; 37],
+            signature: vec![1u8; 64],
+            user: Some(User {
+                id: b"test-user".to_vec(),
+                name: None,
+                display_name: None,
+                icon_url: None,
+            }),
+            number_of_credentials: None,
+            extensions: None,
+        };
+        let wire = encode_cbor(&resp).unwrap();
+        let value: ciborium::Value = ciborium::de::from_reader(wire.as_slice()).unwrap();
+        let ciborium::Value::Map(entries) = value else {
+            panic!("GetAssertion deve ser mapa");
+        };
+        fn assert_no_nulls(val: &ciborium::Value) {
+            match val {
+                ciborium::Value::Null => panic!("Valor Null encontrado em CBOR do CTAP2!"),
+                ciborium::Value::Map(m) => {
+                    for (k, v) in m {
+                        assert_no_nulls(k);
+                        assert_no_nulls(v);
+                    }
+                }
+                ciborium::Value::Array(a) => {
+                    for v in a {
+                        assert_no_nulls(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_nulls(&ciborium::Value::Map(entries.clone()));
+        for window in entries.windows(2) {
+            let mut a_bytes = Vec::new();
+            let mut b_bytes = Vec::new();
+            ciborium::ser::into_writer(&window[0].0, &mut a_bytes).unwrap();
+            ciborium::ser::into_writer(&window[1].0, &mut b_bytes).unwrap();
+            assert!(
+                a_bytes.len() < b_bytes.len() || (a_bytes.len() == b_bytes.len() && a_bytes < b_bytes),
+                "Chaves do GetAssertion devem estar em ordem canônica estrita"
+            );
+        }
     }
 
     #[test]
@@ -5574,6 +5948,97 @@ mod tests {
         assert!(matches!(result, Err(Ctap2Error::NoCredentials)));
     }
 
+    /// GetNextAssertion inclui a entidade `user` (0x04) de cada asserção
+    /// encadeada (CTAP 2.1 §6.2) e não emite a chave extra `next` no wire.
+    #[test]
+    fn test_get_next_assertion_includes_user_and_no_next_key() {
+        let crypto = CryptoEngine::new().unwrap();
+        let storage = StorageEngine::new().unwrap();
+        let mut authenticator = Ctap2Authenticator::new(AAGUID, crypto, storage).unwrap();
+
+        for i in 0..2u8 {
+            authenticator
+                .make_credential(MakeCredentialRequest {
+                    client_data_hash: vec![i; 32],
+                    rp: RelyingParty {
+                        id: "example.com".to_string(),
+                        name: None,
+                        icon: None,
+                    },
+                    user: User {
+                        id: vec![i; 8],
+                        name: None,
+                        display_name: None,
+                        icon_url: None,
+                    },
+                    pub_key_cred_params: vec![PublicKeyCredParams {
+                        r#type: "public-key".to_string(),
+                        algorithms: -8,
+                    }],
+                    exclude_list: vec![],
+                    extensions: None,
+                    options: MakeCredentialOptions {
+                        rk: false,
+                        uv: true,
+                        up: true,
+                        extended: false,
+                    },
+                    pin_uv_auth_param: None,
+                    pin_protocol: None,
+                    enterprise_protections: None,
+                })
+                .unwrap();
+        }
+
+        let get_assertion_req = GetAssertionRequest {
+            rp_id: "example.com".to_string(),
+            credentials: vec![],
+            allow_list: None,
+            client_data_hash: b"test".to_vec(),
+            extensions: None,
+            options: GetAssertionOptions {
+                up: false,
+                uv: true,
+            },
+            pin_uv_auth_param: None,
+            pin_protocol: None,
+            uv: None,
+        };
+
+        let encoded = encode_cbor(&get_assertion_req).unwrap();
+        let first_raw = authenticator.process_command(0x02, encoded).unwrap();
+        let first: GetAssertionResponse = decode_cbor(&first_raw).unwrap();
+        let first_user_id = first.user.map(|u| u.id).unwrap_or_default();
+        assert!(!first_user_id.is_empty());
+
+        let next_raw = authenticator.process_command(0x08, vec![]).unwrap();
+        let next_response: GetAssertionResponse = decode_cbor(&next_raw).unwrap();
+        let next_user_id = next_response.user.map(|u| u.id).unwrap_or_default();
+        assert!(!next_user_id.is_empty());
+        assert_ne!(next_user_id, first_user_id);
+        assert_eq!(next_response.number_of_credentials, Some(2));
+
+        // Wire: chave inteira 0x04 presente, nenhuma chave de texto `next`.
+        let wire: Value = decode_cbor(&next_raw).unwrap();
+        let Value::Map(entries) = &wire else {
+            panic!("resposta GetNextAssertion não é um mapa CBOR");
+        };
+        assert!(
+            entries
+                .iter()
+                .any(|(k, _)| matches!(k, Value::Integer(n) if *n == 4.into())),
+            "wire sem a entidade user (0x04): {:?}",
+            wire
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(k, _)| !matches!(k, Value::Text(t) if t == "next")),
+            "wire com chave extra `next`: {:?}",
+            wire
+        );
+    }
+
     /// Localiza um campo em um mapa CBOR decodificado. No wire format, as
     /// chaves do mapa de topo viram inteiros CTAP (`root_ctap_keys`) e os
     /// mapas aninhados preservam os nomes de texto dos campos serde.
@@ -6394,8 +6859,8 @@ mod tests {
         let error = authenticator
             .process_command(0x0A, encode_cbor(&request).unwrap())
             .unwrap_err();
-        assert_eq!(error, Ctap2Error::PinRequired);
-        assert_eq!(error.as_u8(), 0x36);
+        assert_eq!(error, Ctap2Error::PinNotSet);
+        assert_eq!(error.as_u8(), 0x35);
         // Nada vazou nem foi apagado.
         assert_eq!(authenticator.get_storage().get_credentials_count(), 1);
     }

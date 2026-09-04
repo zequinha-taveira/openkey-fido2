@@ -131,7 +131,9 @@ impl<'a, B: UsbBus> CtapHidClass<'a, B> {
 impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> UsbResult<()> {
         writer.interface(self.iface, 0x03, 0x00, 0x00)?;
-        writer.write(0x21, &self.hid_descriptor())?;
+        // DescriptorWriter::write já prefixa bLength (9) e bDescriptorType (0x21);
+        // passa apenas o corpo de 7 bytes sem duplicar o cabeçalho.
+        writer.write(0x21, &self.hid_descriptor()[2..])?;
         writer.endpoint(&self.ep_in)?;
         writer.endpoint(&self.ep_out)?;
         Ok(())
@@ -149,34 +151,55 @@ impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
     fn control_in(&mut self, xfer: ControlIn<B>) {
         let req = *xfer.request();
 
-        // GET_DESCRIPTOR (HID Report, tipo 0x22) — requisitado pelo host
-        // (navegador / FIDO Conformance Tool) durante a enumeração.
+        // GET_DESCRIPTOR (HID Descriptor 0x21 ou HID Report 0x22) — requisitado
+        // pelo host durante a enumeração.
         if req.request_type == control::RequestType::Standard
             && req.recipient == control::Recipient::Interface
             && req.request == control::Request::GET_DESCRIPTOR
-            && (req.value >> 8) == 0x22
         {
-            let _ = xfer.accept_with(CTAPHID_REPORT_DESCRIPTOR);
-            return;
+            match (req.value >> 8) as u8 {
+                0x21 => {
+                    let desc = self.hid_descriptor();
+                    let _ = xfer.accept_with(&desc);
+                    return;
+                }
+                0x22 => {
+                    let _ = xfer.accept_with(CTAPHID_REPORT_DESCRIPTOR);
+                    return;
+                }
+                _ => {}
+            }
         }
 
         // HID class requests IN que o driver Windows envia durante o start
-        // (GET_REPORT 0x01, GET_IDLE 0x02, GET_PROTOCOL 0x03). Stall aqui
-        // faz CM_PROB_FAILED_START 10 no composto; CTAPHID não usa essas
-        // features, então responde com payload zero.
+        // (GET_REPORT 0x01, GET_IDLE 0x02, GET_PROTOCOL 0x03). Responder com
+        // comprimento errado (ex.: ZLP onde o host espera 1..64 bytes) faz
+        // CM_PROB_FAILED_START 10 no composto; CTAPHID não usa essas
+        // features, então responde com payload zero NO comprimento esperado:
+        // GET_REPORT → zeros até wLength (máx. 64), GET_IDLE → 1 byte 0
+        // (idle indefinido), GET_PROTOCOL → 1 byte 1 (report protocol).
         if req.request_type == control::RequestType::Class
             && req.recipient == control::Recipient::Interface
         {
             match req.request {
-                0x01 | 0x02 | 0x03 => {
-                    let _ = xfer.accept(|_| Ok(0));
-                    return;
+                0x01 => {
+                    // GET_REPORT (Input): zeros; nunca expõe estado interno.
+                    static ZEROS: [u8; PACKET_SIZE] = [0u8; PACKET_SIZE];
+                    let n = core::cmp::min(req.length as usize, PACKET_SIZE);
+                    let _ = xfer.accept_with(&ZEROS[..n]);
+                }
+                0x02 => {
+                    // GET_IDLE: 1 byte.
+                    let _ = xfer.accept_with(&[0u8][..core::cmp::min(req.length as usize, 1)]);
+                }
+                0x03 => {
+                    // GET_PROTOCOL: 1 byte, 1 = report protocol.
+                    let _ = xfer.accept_with(&[1u8][..core::cmp::min(req.length as usize, 1)]);
                 }
                 // SET_* via IN com wLength=0 chegam aqui em alguns stacks;
                 // aceitar também para não travar enumeração.
-                0x09 | 0x0A | 0x0B => {
+                0x09..=0x0B => {
                     let _ = xfer.accept(|_| Ok(0));
-                    return;
                 }
                 _ => {}
             }
@@ -194,15 +217,13 @@ impl<B: UsbBus> UsbClass<B> for CtapHidClass<'_, B> {
                 // apenas consome o estágio de dados.
                 // SET_IDLE (0x0A) / SET_PROTOCOL (0x0B) — sem payload, mas
                 // Windows os envia no barramento de controle durante o start.
-                0x09 | 0x0A | 0x0B => {
+                0x09..=0x0B => {
                     let _ = xfer.accept();
-                    return;
                 }
                 // GET_* que por algum motivo cheguem como OUT (wLength=0):
                 // aceitar para não stallar.
-                0x01 | 0x02 | 0x03 => {
+                0x01..=0x03 => {
                     let _ = xfer.accept();
-                    return;
                 }
                 _ => {}
             }
@@ -494,5 +515,20 @@ mod tests {
             result,
             Err(EmbeddedTransportError::NotInitialized)
         ));
+    }
+
+    #[test]
+    fn test_hid_descriptor_layout() {
+        let (backend, _state) = make_backend();
+        let desc = backend.hid.hid_descriptor();
+        assert_eq!(desc.len(), 9);
+        assert_eq!(desc[0], 0x09); // bLength
+        assert_eq!(desc[1], 0x21); // bDescriptorType (HID)
+        assert_eq!(&desc[2..4], &[0x11, 0x01]); // bcdHID 1.11
+        assert_eq!(desc[6], 0x22); // Report descriptor type
+        let rpt_len = u16::from_le_bytes([desc[7], desc[8]]) as usize;
+        assert_eq!(rpt_len, CTAPHID_REPORT_DESCRIPTOR.len());
+        // O corpo passado ao DescriptorWriter::write tem 7 bytes (sem bLength/bDescriptorType):
+        assert_eq!(&desc[2..], &[0x11, 0x01, 0x00, 0x01, 0x22, 0x22, 0x00]);
     }
 }

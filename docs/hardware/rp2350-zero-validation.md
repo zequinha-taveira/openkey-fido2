@@ -53,8 +53,10 @@
 > (regenerar com o comando da seção 2 após qualquer mudança de firmware).
 >
 > **Nota de correção:** o runner do crate (`cargo run`) usava
-> `--chip RP2350`, nome que o probe-rs não reconhece; corrigido para
-> `--chip RP235x` em `examples/rp2350-firmware/.cargo/config.toml`.
+- [ ] Ferramentas neutras de validação de padrão (FIDO2 / CCID / ISO 7816-4):
+  - **`python-fido2`**: Implementação neutra de referência FIDO2/CTAP2 (`pip install fido2`)
+  - **`opensc-tool` (OpenSC)**: Utilitário neutro padrão da indústria para CCID e smart cards ISO 7816-4 (`winget install OpenSC.OpenSC` no Windows ou `apt install opensc` no Linux)
+  - **`python tools/hardware_check.py`**: Suíte de validação do projeto baseada em python-fido2 + PC-SC genérico nativo do SO
 
 ### picotool nesta máquina
 
@@ -82,6 +84,22 @@ cd examples\rp2350-firmware
 cargo build -p rp2350-firmware --release
 ```
 
+> **Nesta máquina Windows (sem `link.exe` MSVC):** usar a toolchain GNU e o
+> `gcc-arm-none-eabi` 10.3 do Pico SDK no PATH (exigido pelo build.rs do
+> ring vendido):
+>
+> ```powershell
+> cd examples\rp2350-firmware
+> $env:Path = 'C:\Program Files\Raspberry Pi\Pico SDK v1.5.1\gcc-arm-none-eabi\bin;' + $env:Path
+> cargo +1.98.0-x86_64-pc-windows-gnu build -p rp2350-firmware --release
+> # flavor opt-in YubiKey (só teste privado, NÃO PARA DISTRIBUIÇÃO):
+> cargo +1.98.0-x86_64-pc-windows-gnu build -p rp2350-firmware --release --features yubikey5-identity
+> ```
+>
+> UF2s geradas 2026-09-04 em `target\thumbv8m.main-none-eabihf\release\`:
+> `rp2350-firmware.uf2` (default `1209:0001`) e
+> `rp2350-firmware-yubikey5.uf2` (opt-in `1050:0407`).
+
 - [ ] Build conclui sem erros
 - [ ] ELF gerado em
       `examples\rp2350-firmware\target\thumbv8m.main-none-eabihf\release\rp2350-firmware`
@@ -103,6 +121,10 @@ picotool uf2 convert target\thumbv8m.main-none-eabihf\release\rp2350-firmware -t
 ---
 
 ## 3. Gravação via UF2 (drag-and-drop, sem debugger)
+
+> Validação sem HW (CI): `just hardware-flash-dry` /
+> `python tools/flash_rp2350.py --dry-run --json` — resolve ELF/UF2,
+> mostra os comandos probe-rs/picotool e o poll USB sem tocar na placa.
 
 Procedimento do wiki da Waveshare (BOOTSEL entra no modo download da Boot ROM):
 
@@ -187,9 +209,11 @@ O firmware tem duas identidades USB, escolhidas em tempo de compilação:
 | Build | VID:PID | Finalidade |
 |-------|---------|------------|
 | Padrão (distribuição) | `1209:0001` (pid.codes do openkey-fido2) | identidade própria do projeto |
-| Opt-in `--features yubikey5-identity` / `--features yubikey4-identity` (alias, ADR-0025) | `1050:0407` (Yubico YubiKey 4/5 — família `1050:0407` no modo OTP+FIDO+CCID) | reconhecimento automático por ykman / Yubico Authenticator (casamento por VID/PID) — **NÃO PARA DISTRIBUIÇÃO** |
+| Opt-in `--features yubikey5-identity` / `--features yubikey4-identity` (alias, ADR-0025) | `1050:0407` (Yubico YubiKey 4/5 — família `1050:0407`, modo HID+CCID sem OTP; Product Name: `"Yubico Yubikey"` / `"YubiKey OTP+FIDO+CCID"`) | reconhecimento automático por ykman / Yubico Authenticator (casamento por VID/PID) — **NÃO PARA DISTRIBUIÇÃO** |
 
-> Vendor do profile `YUBIKEY_4_5` é `Yubikey 4/5` (`board_generic::YUBIKEY_4_5`, `device_profile::UsbIdentity::yubikey()` → `1050:0407`) com **Secure Boot ✅** (`secure_boot`) + **Secure Lock ✅** (`debug_disable+otp+unique_id+tamper`).
+> **Nota de Identidade USB:** The default USB identity pid.codes is `0x1209:0x0001`; the YubiKey USB identity that ykman / Yubico Authenticator auto-recognize is the opt-in VID:PID=Yubikey5 (`0x1050:0x0407`) build, not for distribution.
+
+> Vendor do profile `YUBIKEY_4_5` é `Yubico` (`board_generic::YUBIKEY_4_5`, `device_profile::UsbIdentity::yubico_yubikey()` / `yubikey()` → `1050:0407`) com **Secure Boot ✅** (`secure_boot`) + **Secure Lock ✅** (`debug_disable+otp+unique_id+tamper`).
 
 > A UF2 padrão desta máquina (`rp2350-firmware.uf2`) usa a identidade
 > pid.codes. A variante YubiKey 4/5 é gerada com
@@ -230,7 +254,7 @@ Dispositivo composto esperado (HID `0xF1D0` + CCID `0x0B`):
       Interface Humana" (HID FIDO) **e** "Leitores de cartão inteligente"
       (CCID) contêm as duas interfaces do composto sob a mesma VID:PID.
 
-- [ ] Validação automatizada (HID+CCID+applets):
+- [ ] Validação automatizada neutra (HID+CCID+applets via `hardware_check.py`):
 
   ```powershell
   python tools/hardware_check.py
@@ -240,8 +264,42 @@ Dispositivo composto esperado (HID `0xF1D0` + CCID `0x0B`):
   ```
 
   Esperado: `ctap_ok=true`, `readers` contém o leitor CCID com ATR T=0
-  (`3B DA ... 6F 70 65 6E...`), `select_oath` e `select_management` com
+  (`3B FA ... 6F 70 65 6E...`), `select_oath` e `select_management` com
   `sw=9000` (ou payload de versão/desafio no SELECT).
+
+  > **Diagnóstico medido em hardware real (placa física RP2350-Zero):**
+  >
+  > | Parâmetro | Valor Medido | Diagnóstico Técnico |
+  > | :--- | :--- | :--- |
+  > | `ykman_compatible` | `true` | Nome casa com substring esperada (`Yubico YubiKey OTP+FIDO+CCID`) |
+  > | `is_yubikey_optin` | `true` | É o build opt-in `1050:0407` |
+  > | `connect_error` | `0x80100066` | `SCARD_W_REMOVED_CARD` (slot CCID sem resposta de ATR ao Power On) |
+  > | `HID FIDO` | `nenhum enumerado` | CTAPHID ping falhou / sem descritor HID FIDO ativo |
+  > | `ATR` | `null` | Sem resposta de power-on (`PC_to_RDR_IccPowerOn`) |
+  >
+  > Para o checklist exato do que implementar no firmware, consulte [O que falta no firmware](#o-que-falta-no-firmware).
+
+- [ ] Validação neutra com **`opensc-tool`** (ferramenta padrão aberta ISO 7816-4):
+
+  ```powershell
+  # 1. Listar leitores detectados pelo PC-SC
+  opensc-tool -l
+
+  # 2. Ler ATR neutro do cartão
+  opensc-tool -a
+
+  # 3. SELECT OATH (AID A0000005272101)
+  opensc-tool -s 00:a4:04:00:07:a0:00:00:05:27:21:01
+
+  # 4. SELECT Management (AID A000000527471117)
+  opensc-tool -s 00:a4:04:00:08:a0:00:00:05:27:47:11:17
+
+  # 5. SELECT PIV (AID A000000308000010000100)
+  opensc-tool -s 00:a4:04:00:09:a0:00:00:03:08:00:00:10:00
+
+  # 6. SELECT OpenPGP (AID D27600012401)
+  opensc-tool -s 00:a4:04:00:06:d2:76:00:01:24:01
+  ```
 
 ---
 
@@ -289,6 +347,12 @@ Procedimento de validação:
 - [ ] Gravar `rp2350-firmware.uf2` (seção 3) e confirmar enumeração USB (seção 5)
 - [ ] Abrir o **Yubico Authenticator** (ou `ykman oath accounts list`) e
       confirmar que o dispositivo aparece via PCSC
+- [ ] `ykman list --serials`: esperado `Yubico YubiKey 5 0` + serial do
+      dispositivo (identidade `1050:0407` da variante opt-in, seção 5):
+
+  ```powershell
+  ykman list --serials
+  ```
 - [ ] Adicionar uma credencial TOTP de teste no app (qualquer issuer/nome;
       usar segredo conhecido para conferir o código depois)
 - [ ] Anotar o código TOTP exibido: `________`
@@ -304,12 +368,48 @@ Procedimento de validação:
 > seção 5 se o tamanho probeado confere; um tamanho errado deslocaria a
 > região. Registrar o resultado aqui: ________________
 
+### Validação com Ferramentas Neutras de Padrão vs Ferramentas de Fabricante
+
+> **Diagnóstico "Esta YubiKey não pode ser acessada / Dispositivo Inacessível":**
+> Aplicativos proprietários como o Yubico Authenticator podem relatar o dispositivo
+> como inacessível se o subsistema PC/SC retornar código `0x80100066`
+> (`SCARD_W_REMOVED_CARD` — cartão ausente no slot CCID ou ATR não entregue
+> dentro da janela esperada pelo driver WUDF) ou se checagens de integridade
+> de hardware exclusivas de fabricante falharem.
+>
+> **Abordagem recomendada (Padrões Abertos):**
+> Ferramentas neutras de padrão como **`opensc-tool`**, **`python-fido2`** e o
+> **`PC-SC genérico`** (`python tools/hardware_check.py`) operam diretamente
+> sobre os padrões ISO 7816-4, CCID e CTAP2/WebAuthn, sem restrições nem
+> premissas proprietárias de fabricante, fornecendo o diagnóstico técnico
+> autoritativo e independente.
+
+### O que falta no firmware
+
+O leitor CCID aparece (`Yubico YubiKey OTP+FIDO+CCID 0`), mas a interface CCID precisa:
+
+1. **Responder ao ICC Power On com um ATR válido (ex.: `3B 8D 80 01...`)**:
+   - O comando CCID `PC_to_RDR_IccPowerOn` (`0x62`) recebido pelo endpoint Bulk OUT precisa responder com `RDR_to_PC_DataBlock` (`0x80`) contendo um Answer To Reset (ATR) válido e bem formatado segundo ISO 7816-3.
+   - Sem essa resposta de ativação, o subsistema PC/SC do Windows considera o cartão ausente ou inativo, retornando o código de erro `0x80100066` (`SCARD_W_REMOVED_CARD`) em chamadas de `SCardConnect` ou mantendo o leitor em estado MUTE.
+
+2. **Processar APDU SELECT dos applets (OATH, Management, etc.)**:
+   - O comando CCID `PC_to_RDR_XfrBlock` (`0x6F`) precisa receber as APDUs ISO 7816-4 enviadas pelo host e despachar o comando `SELECT AID` para os applets correspondentes:
+     - **Management Applet**: AID `A0 00 00 05 27 47 11 17`
+     - **OATH Applet**: AID `A0 00 00 05 27 21 01`
+     - **PIV Applet**: AID `A0 00 00 03 08`
+     - **OpenPGP Applet**: AID `D2 76 00 01 24 01`
+   - O firmware deve responder com o status word `90 00` e o payload TLV esperado pelos clientes (ex.: YubiKey Manager, Yubico Authenticator, OpenSC).
+
+3. **Enumeração e resposta CTAPHID da Interface USB-HID FIDO**:
+   - A Interface 0 do descritor USB composto precisa expor a classe HID com usage page `0xF1D0` e responder ao pacote `CTAPHID_INIT` / `CTAPHID_PING`. Se o endpoint de interrupção não processar os relatórios ou houver conflito de endpoint/descritor no USB stack, o host relatará "nenhum HID FIDO enumerado" e o CTAPHID ping falhará.
+
 ---
 
 ## 8. Ainda não verificado (honesto)
 
 Itens que este runbook **não cobre** e continuam em aberto:
 
+- [ ] Interface CCID em hardware físico: responder ao ICC Power On com ATR válido e processar APDU SELECT dos applets (OATH, Management, etc.)
 - [ ] WS2812B (GPIO16) como `StatusLed`: a trait existe em
       `transport::embedded`, mas falta o driver PIO; hoje o LED não reflete
       estados do autenticador

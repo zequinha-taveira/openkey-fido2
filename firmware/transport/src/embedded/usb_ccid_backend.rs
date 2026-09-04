@@ -136,19 +136,21 @@ const CCID_CONTROL_ABORT: u8 = 0x01;
 
 /// ATR T=0 plausível retornado pelo `IccPowerOn`.
 ///
-/// TS/T0 com convenção direta, TA1-TD1 presentes e 10 bytes históricos
-/// contendo o ASCII "openkey" — suficiente para o PCSC negociar velocidade
-/// padrão T=0.
-pub const T0_ATR: [u8; 16] = [
+/// TS/T0 com convenção direta, TA1/TB1/TD1 presentes (T=0 exclusivo,
+/// coerente com `dwProtocols` do descritor) e 10 bytes históricos contendo
+/// o ASCII "openkey" — suficiente para o PCSC negociar velocidade padrão
+/// T=0. Total 1+1+3+10 = 15 bytes exatos: T0 errado ou byte extra (ex.:
+/// TCK de T=1, que T=0 não tem) faz o PCSC rejeitar o ATR (slot MUTE,
+/// `SCardConnect` 0x80100066). Há teste estrutural que trava o comprimento.
+pub const T0_ATR: [u8; 15] = [
     0x3B, // TS: convenção direta
-    0xDA, // T0: Y1=1101b (TA1..TD1), K=10 bytes históricos
+    0xDA, // T0: Y1=1101b (TA1, TB1, TD1), K=10 bytes históricos
     0x11, // TA1: Fi=372, Di=1
     0x50, // TB1: PI1
-    0x00, // TC1: N=0
-    0x01, // TD1: próximo grupo vazio, T=0
-    0x6F, 0x70, 0x65, 0x6E, // 'open'
+    0x00, // TD1: próximo grupo vazio, protocolo T=0
+    0x01, 0x6F, 0x70, 0x65, 0x6E, // 0x01 + 'open'
     0x4B, 0x65, 0x79, // 'key'
-    0xA0, 0x00, 0x00,
+    0xA0, 0x00,
 ];
 
 /// Parâmetros T=0 padrão (Fi/Di=372/1, guarda N=0, WI=10, clock parado não
@@ -215,6 +217,15 @@ pub struct CcidClass<'a, B: UsbBus> {
     /// Mensagem RDR_to_PC montada aguardando envio no bulk IN.
     tx_buf: [u8; MAX_MSG_LEN],
     tx_len: usize,
+    /// Bytes da mensagem ativa já entregues ao bulk IN (dreno em pacotes
+    /// de até 64 B — `EndpointIn::write` leva um pacote por chamada).
+    tx_sent: usize,
+    /// Segunda mensagem enfileirada enquanto a ativa drena. Sem ela, uma
+    /// sondagem `GetSlotStatus` (o driver PCSC sonda agressivamente durante
+    /// o `IccPowerOn`) sobrescreveria a resposta ativa — o host nunca veria
+    /// o ATR e marcaria o slot como MUTE.
+    q_buf: [u8; MAX_MSG_LEN],
+    q_len: usize,
     /// ICC ativado por IccPowerOn ainda não seguido de PowerOff.
     powered: bool,
     /// Parâmetros T=0 correntes (atualizados por SetParameters).
@@ -262,6 +273,9 @@ impl<'a, B: UsbBus> CcidClass<'a, B> {
             rx_overflow: false,
             tx_buf: [0u8; MAX_MSG_LEN],
             tx_len: 0,
+            tx_sent: 0,
+            q_buf: [0u8; MAX_MSG_LEN],
+            q_len: 0,
             powered: false,
             params: T0_DEFAULT_PARAMS,
             pending: false,
@@ -500,16 +514,22 @@ impl<'a, B: UsbBus> CcidClass<'a, B> {
                 } else {
                     // take() desacopla o handler de &mut self, permitindo
                     // chamar métodos durante o empréstimo; restaurado ao final.
+                    // Destino da resposta: fila quando há mensagem ativa
+                    // ainda drenando (nunca sobrescreve o TX ativo).
+                    let to_queue = self.tx_active();
                     let mut stored = self.handler.take();
                     let handled = match stored.as_deref_mut() {
                         Some(f) => {
-                            // Handler escreve direto em tx_buf[10..]: sela o
-                            // cabeçalho depois, sem cópia extra.
+                            let dest = if to_queue {
+                                &mut self.q_buf[CCID_HEADER_LEN..]
+                            } else {
+                                &mut self.tx_buf[CCID_HEADER_LEN..]
+                            };
                             let n = f(
                                 &self.rx_buf[CCID_HEADER_LEN..CCID_HEADER_LEN + dw_len],
-                                &mut self.tx_buf[CCID_HEADER_LEN..],
+                                dest,
                             );
-                            Some(core::cmp::min(n, MAX_PAYLOAD_LEN))
+                            Some((core::cmp::min(n, MAX_PAYLOAD_LEN), to_queue))
                         }
                         None => {
                             // Modo manual: retém o payload para a troca
@@ -527,7 +547,11 @@ impl<'a, B: UsbBus> CcidClass<'a, B> {
                     self.handler = stored;
 
                     match handled {
-                        Some(n) => {
+                        Some((n, true)) => {
+                            let st = self.ok_status();
+                            self.seal_q(RDR_TO_PC_DATABLOCK, n, slot, seq, st, NO_ERROR, 0x00);
+                        }
+                        Some((n, false)) => {
                             let st = self.ok_status();
                             self.seal_tx(RDR_TO_PC_DATABLOCK, n, slot, seq, st, NO_ERROR, 0x00);
                         }
@@ -577,12 +601,42 @@ impl<'a, B: UsbBus> CcidClass<'a, B> {
         self.rx_overflow = false;
     }
 
+    /// Há mensagem ativa ainda drenando no bulk IN.
+    fn tx_active(&self) -> bool {
+        self.tx_sent < self.tx_len
+    }
+
+    /// Escreve o cabeçalho RDR_to_PC no buffer (10 bytes, §6.2).
+    ///
+    /// Layout: `[tipo][dwLength LE][slot][seq][bStatus][bError][específico]`
+    /// — o byte 9 é `bChainParameter` (DataBlock), `bRFU` (SlotStatus) ou
+    /// `bProtocolNum` (Parameters).
+    #[allow(clippy::too_many_arguments)]
+    fn write_header(
+        buf: &mut [u8; MAX_MSG_LEN],
+        msg_type: u8,
+        data_len: usize,
+        slot: u8,
+        seq: u8,
+        status: u8,
+        error: u8,
+        specific: u8,
+    ) {
+        buf[0] = msg_type;
+        let dl = data_len as u32;
+        buf[1..5].copy_from_slice(&dl.to_le_bytes());
+        buf[5] = slot;
+        buf[6] = seq;
+        buf[7] = status;
+        buf[8] = error;
+        buf[9] = specific;
+    }
+
     /// Escreve o cabeçalho RDR_to_PC em `tx_buf` e dispara o envio; os dados
     /// já residem em `tx_buf[CCID_HEADER_LEN..CCID_HEADER_LEN + data_len]`.
     ///
-    /// Layout do cabeçalho: `[tipo][dwLength LE][slot][seq][bStatus][bError]
-    /// [específico]` — o byte 9 é `bChainParameter` (DataBlock), `bRFU`
-    /// (SlotStatus) ou `bProtocolNum` (Parameters), conforme §6.2.
+    /// Chamadores garantem que não há mensagem ativa drenando (ver
+    /// `dispatch_rx`: handler escreve na fila nesse caso).
     #[allow(clippy::too_many_arguments)]
     fn seal_tx(
         &mut self,
@@ -594,19 +648,54 @@ impl<'a, B: UsbBus> CcidClass<'a, B> {
         error: u8,
         specific: u8,
     ) {
-        self.tx_buf[0] = msg_type;
-        let dl = data_len as u32;
-        self.tx_buf[1..5].copy_from_slice(&dl.to_le_bytes());
-        self.tx_buf[5] = slot;
-        self.tx_buf[6] = seq;
-        self.tx_buf[7] = status;
-        self.tx_buf[8] = error;
-        self.tx_buf[9] = specific;
+        Self::write_header(
+            &mut self.tx_buf,
+            msg_type,
+            data_len,
+            slot,
+            seq,
+            status,
+            error,
+            specific,
+        );
         self.tx_len = CCID_HEADER_LEN + data_len;
+        self.tx_sent = 0;
+        self.flush_tx();
+    }
+
+    /// Sela uma resposta direto na fila (mensagem ativa ainda drenando).
+    #[allow(clippy::too_many_arguments)]
+    fn seal_q(
+        &mut self,
+        msg_type: u8,
+        data_len: usize,
+        slot: u8,
+        seq: u8,
+        status: u8,
+        error: u8,
+        specific: u8,
+    ) {
+        Self::write_header(
+            &mut self.q_buf,
+            msg_type,
+            data_len,
+            slot,
+            seq,
+            status,
+            error,
+            specific,
+        );
+        // Fila de profundidade 1: a mais recente vence (sondagens de
+        // SlotStatus são idempotentes; DataBlocks nunca disputam a fila —
+        // `resp_awaiting` os serializa).
+        self.q_len = CCID_HEADER_LEN + data_len;
         self.flush_tx();
     }
 
     /// Monta e enfileira uma resposta cujos dados precisam ser copiados.
+    ///
+    /// Vai para a fila quando há mensagem ativa drenando — nunca sobrescreve
+    /// bytes ainda não escoados (causa raiz do slot MUTE no driver real).
     #[allow(clippy::too_many_arguments)]
     fn queue_response(
         &mut self,
@@ -619,8 +708,35 @@ impl<'a, B: UsbBus> CcidClass<'a, B> {
         data: &[u8],
     ) {
         let n = core::cmp::min(data.len(), MAX_PAYLOAD_LEN);
-        self.tx_buf[CCID_HEADER_LEN..CCID_HEADER_LEN + n].copy_from_slice(&data[..n]);
-        self.seal_tx(msg_type, n, slot, seq, status, error, specific);
+        if self.tx_active() {
+            self.q_buf[CCID_HEADER_LEN..CCID_HEADER_LEN + n].copy_from_slice(&data[..n]);
+            Self::write_header(
+                &mut self.q_buf,
+                msg_type,
+                n,
+                slot,
+                seq,
+                status,
+                error,
+                specific,
+            );
+            self.q_len = CCID_HEADER_LEN + n;
+        } else {
+            self.tx_buf[CCID_HEADER_LEN..CCID_HEADER_LEN + n].copy_from_slice(&data[..n]);
+            Self::write_header(
+                &mut self.tx_buf,
+                msg_type,
+                n,
+                slot,
+                seq,
+                status,
+                error,
+                specific,
+            );
+            self.tx_len = CCID_HEADER_LEN + n;
+            self.tx_sent = 0;
+        }
+        self.flush_tx();
     }
 
     /// Monta `RDR_to_PC_Parameters`: o byte 9 carrega `bProtocolNum`.
@@ -636,16 +752,37 @@ impl<'a, B: UsbBus> CcidClass<'a, B> {
         );
     }
 
-    /// Envia o buffer TX no bulk IN; `WouldBlock` é retentado no próximo
-    /// ciclo de polling. Outros erros descartam a mensagem sem pânico.
+    /// Drena o TX no bulk IN em pacotes de até 64 B, escoando o máximo
+    /// possível por ciclo de polling (`WouldBlock` — endpoint ainda ocupado
+    /// — pausa até o próximo poll). Promove a fila quando a ativa escoa.
+    /// Outros erros descartam a mensagem ativa (sem pânico) e promovem a fila.
     fn flush_tx(&mut self) {
-        if self.tx_len == 0 {
-            return;
-        }
-        match self.ep_in.write(&self.tx_buf[..self.tx_len]) {
-            Ok(_) => self.tx_len = 0,
-            Err(UsbError::WouldBlock) => { /* retenta no próximo poll */ }
-            Err(_) => self.tx_len = 0,
+        loop {
+            if !self.tx_active() {
+                if self.q_len == 0 {
+                    return;
+                }
+                self.tx_buf[..self.q_len].copy_from_slice(&self.q_buf[..self.q_len]);
+                self.tx_len = self.q_len;
+                self.tx_sent = 0;
+                self.q_len = 0;
+            }
+            let end = core::cmp::min(self.tx_sent + PACKET_SIZE, self.tx_len);
+            match self.ep_in.write(&self.tx_buf[self.tx_sent..end]) {
+                Ok(0) => return, // sem progresso: retenta no próximo poll
+                Ok(n) => {
+                    self.tx_sent += n;
+                    if !self.tx_active() {
+                        self.tx_len = 0;
+                        self.tx_sent = 0;
+                    }
+                }
+                Err(UsbError::WouldBlock) => return,
+                Err(_) => {
+                    self.tx_len = 0;
+                    self.tx_sent = 0;
+                }
+            }
         }
     }
 
@@ -699,7 +836,9 @@ impl<B: UsbBus> UsbClass<B> for CcidClass<'_, B> {
     fn get_configuration_descriptors(&self, writer: &mut DescriptorWriter) -> UsbResult<()> {
         // Interface smart card (bInterfaceClass 0x0B), sem subclass/protocol.
         writer.interface(self.iface, 0x0B, 0x00, 0x00)?;
-        writer.write(0x21, &CCID_CLASS_DESCRIPTOR)?;
+        // DescriptorWriter::write já prefixa bLength (54) e bDescriptorType (0x21);
+        // passa apenas o corpo de 52 bytes sem duplicar o cabeçalho.
+        writer.write(0x21, &CCID_CLASS_DESCRIPTOR[2..])?;
         writer.endpoint(&self.ep_in)?;
         writer.endpoint(&self.ep_out)?;
         Ok(())
@@ -710,6 +849,8 @@ impl<B: UsbBus> UsbClass<B> for CcidClass<'_, B> {
         // (powered) persiste até um PowerOff explícito.
         self.clear_rx();
         self.tx_len = 0;
+        self.tx_sent = 0;
+        self.q_len = 0;
     }
 
     fn control_out(&mut self, xfer: ControlOut<B>) {
@@ -887,6 +1028,9 @@ mod tests {
     struct MockInner {
         in_data: [u8; MOCK_CAP],
         in_len: usize,
+        /// Quando true, o bulk IN rejeita escritas (`WouldBlock`), como o
+        /// endpoint ocupado no hardware real.
+        in_busy: bool,
         out_data: [u8; MOCK_CAP],
         out_len: usize,
         out_pending: bool,
@@ -899,6 +1043,7 @@ mod tests {
             Self {
                 in_data: [0; MOCK_CAP],
                 in_len: 0,
+                in_busy: false,
                 out_data: [0; MOCK_CAP],
                 out_len: 0,
                 out_pending: false,
@@ -927,12 +1072,19 @@ mod tests {
             inner.out_pending = true;
         }
 
-        /// Snapshot da última resposta enviada no bulk IN (zera o registro).
+        /// Snapshot de tudo enviado no bulk IN desde a última coleta (zera
+        /// o registro). Acumula pacotes: respostas multi-pacote chegam
+        /// concatenadas, como o host as recebe.
         fn take_sent(state: &Arc<Mutex<MockInner>>) -> Vec<u8> {
             let mut inner = state.lock().unwrap();
             let v = inner.in_data[..inner.in_len].to_vec();
             inner.in_len = 0;
             v
+        }
+
+        /// Liga/desliga a simulação de endpoint IN ocupado (`WouldBlock`).
+        fn set_busy(state: &Arc<Mutex<MockInner>>, busy: bool) {
+            state.lock().unwrap().in_busy = busy;
         }
     }
 
@@ -963,9 +1115,17 @@ mod tests {
 
         fn write(&self, _ep_addr: EndpointAddress, buf: &[u8]) -> UsbResult<usize> {
             let mut inner = self.state.lock().unwrap();
-            let n = core::cmp::min(buf.len(), MOCK_CAP);
-            inner.in_data[..n].copy_from_slice(&buf[..n]);
-            inner.in_len = n;
+            if inner.in_busy {
+                return Err(UsbError::WouldBlock);
+            }
+            // Modela o hardware: um pacote bulk por escrita (64 B); o resto
+            // segue nas próximas chamadas — como `flush_tx` drena em chunks.
+            let space = MOCK_CAP - inner.in_len;
+            let n = core::cmp::min(buf.len(), space);
+            let n = core::cmp::min(n, PACKET_SIZE);
+            let off = inner.in_len;
+            inner.in_data[off..off + n].copy_from_slice(&buf[..n]);
+            inner.in_len += n;
             Ok(n)
         }
 
@@ -1129,6 +1289,101 @@ mod tests {
         assert_eq!(error, NO_ERROR);
         assert_eq!(data, T0_ATR.to_vec());
         assert!(backend.ccid.is_powered());
+    }
+
+    #[test]
+    fn test_t0_atr_length_matches_t0_declaration() {
+        // ISO 7816-3: total = 1 (TS) + 1 (T0) + iface(Y1) + hist(K), sem
+        // TCK em T=0 exclusivo. ATR fora do declarado faz o PCSC rejeitar
+        // (slot MUTE, `SCardConnect` 0x80100066 em hardware real).
+        let t0 = T0_ATR[1];
+        let y = t0 >> 4;
+        let k = (t0 & 0x0F) as usize;
+        let n_iface = (0..4).filter(|i| y & (8 >> i) != 0).count();
+        assert_eq!(T0_ATR.len(), 2 + n_iface + k);
+        // Último byte de interface (TD1): sem grupos seguintes (Y2=0) e
+        // protocolo T=0 (coerente com dwProtocols do descritor).
+        let td1 = T0_ATR[2 + n_iface - 1];
+        assert_eq!(td1 & 0xF0, 0x00);
+        assert_eq!(td1 & 0x0F, 0x00);
+    }
+
+    #[test]
+    fn test_atr_survives_slot_status_race_on_busy_endpoint() {
+        // Regressão do slot MUTE no driver real: com o bulk IN ocupado, o
+        // ATR do PowerOn fica retido e a sondagem GetSlotStatus (agressiva
+        // durante o power-on) NÃO pode sobrescrevê-lo — vai para a fila.
+        let (mut backend, state) = make_backend();
+        backend.init().unwrap();
+
+        MockUsbBus::set_busy(&state, true);
+        MockUsbBus::queue_out(
+            &state,
+            &pc_msg(PC_TO_RDR_ICC_POWER_ON, 7, [0x01, 0, 0], &[]),
+        );
+        assert!(backend.poll());
+        assert!(backend.ccid.tx_active(), "ATR retido sem escoar");
+        assert_eq!(MockUsbBus::take_sent(&state).len(), 0);
+
+        MockUsbBus::queue_out(
+            &state,
+            &pc_msg(PC_TO_RDR_GET_SLOT_STATUS, 8, [0, 0, 0], &[]),
+        );
+        assert!(backend.poll());
+
+        // Endpoint livre: as duas respostas escoam em ordem (ATR primeiro).
+        MockUsbBus::set_busy(&state, false);
+        backend.poll();
+        let sent = MockUsbBus::take_sent(&state);
+        let (mtype, dw, _slot, seq, status, error, _specific, data) = rdr_parse(&sent);
+        assert_eq!(mtype, RDR_TO_PC_DATABLOCK);
+        assert_eq!(dw, T0_ATR.len());
+        assert_eq!(seq, 7);
+        assert_eq!(status, STATUS_ICC_ACTIVE);
+        assert_eq!(error, NO_ERROR);
+        assert_eq!(&data[..dw], &T0_ATR.to_vec()[..]);
+        // Segunda mensagem concatenada: SlotStatus da sondagem, com bSeq.
+        let rest = &sent[CCID_HEADER_LEN + dw..];
+        let (mtype2, dw2, _s2, seq2, status2, error2, _sp2, _d2) = rdr_parse(rest);
+        assert_eq!(mtype2, RDR_TO_PC_SLOTSTATUS);
+        assert_eq!(dw2, 0);
+        assert_eq!(seq2, 8);
+        assert_eq!(status2, STATUS_ICC_ACTIVE);
+        assert_eq!(error2, NO_ERROR);
+        assert!(backend.ccid.is_powered());
+    }
+
+    #[test]
+    fn test_long_data_block_drains_in_64b_chunks_without_loss() {
+        // Resposta manual de 200 bytes → DataBlock de 210 bytes escoa em
+        // pacotes de 64 B (64+64+64+18) sem truncamento nem perda.
+        let (mut backend, state) = make_backend();
+        backend.init().unwrap();
+
+        let select = [
+            0x00, 0xA4, 0x04, 0x00, 0x07, 0xA0, 0x00, 0x00, 0x05, 0x27, 0x21, 0x01,
+        ];
+        MockUsbBus::queue_out(
+            &state,
+            &pc_msg(PC_TO_RDR_XFR_BLOCK, 9, [0x00, 0x00, 0x00], &select),
+        );
+        assert!(backend.poll());
+        assert!(backend.ccid.is_pending());
+        let mut apdu = [0u8; MAX_PAYLOAD_LEN];
+        let n = backend.ccid.take_pending_request(&mut apdu).unwrap();
+        assert_eq!(&apdu[..n], &select);
+
+        let big = [0xABu8; 200];
+        backend.ccid.send_response(&big).unwrap();
+        backend.poll();
+        let sent = MockUsbBus::take_sent(&state);
+        let (mtype, dw, _slot, seq, status, error, _specific, data) = rdr_parse(&sent);
+        assert_eq!(mtype, RDR_TO_PC_DATABLOCK);
+        assert_eq!(dw, 200);
+        assert_eq!(seq, 9);
+        assert_eq!(status, STATUS_ICC_INACTIVE);
+        assert_eq!(error, NO_ERROR);
+        assert_eq!(data, big.to_vec());
     }
 
     #[test]

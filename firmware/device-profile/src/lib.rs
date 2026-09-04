@@ -17,7 +17,7 @@ pub mod profile;
 pub use capability::{Capabilities, CapabilityDiscovery};
 pub use profile::{
     AttestationType, DeviceProfile, DeviceProfileBuilder, Extension, PinPolicy, Protocol,
-    Transport, TransportConfig, TransportType, UsbIdentity,
+    Transport, TransportConfig, TransportType, UsbIdentity, UsbVendorPreset,
 };
 
 // Re-export attestation types for convenience

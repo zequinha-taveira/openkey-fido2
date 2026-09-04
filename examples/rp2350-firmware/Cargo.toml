@@ -23,6 +23,10 @@ ring = { path = "vendor/ring" }
 # Identidade USB opcional para reconhecimento automático por ferramentas
 # da Yubico (ykman / Yubico Authenticator), que casam por VID/PID.
 #
+# The default USB identity pid.codes is 0x1209:0x0001; the YubiKey USB identity
+# that ykman / Yubico Authenticator auto-recognize is the opt-in VID:PID=Yubikey5
+# build, not for distribution.
+#
 # ATENÇÃO: usa o VID/PID da Yubico — uso restrito a testes privados;
 # NÃO PARA DISTRIBUIÇÃO. Builds publicados devem usar a identidade
 # pid.codes padrão do projeto. `yubikey4-identity` é alias de
@@ -42,9 +46,12 @@ test = true
 # de geometria é pura e testa em host; ver [lib] acima).
 [target.'cfg(target_arch = "arm")'.dependencies]
 board-generic = { path = "../../firmware/board-generic" }
+# Identidade USB (presets openkey/yubikey5 — fonte única em device-profile).
+device-profile = { path = "../../firmware/device-profile", default-features = false }
 # Stack do autenticador: applets Yubico (OATH/Management) para o roteador
 # CCID. Sem `rs256` (RSA exige rand/std) e sem `std` — alvo bare-metal.
 authenticator = { path = "../../firmware/authenticator", default-features = false }
+ctap2 = { path = "../../protocol/ctap2", default-features = false }
 crypto = { path = "../../protocol/crypto", default-features = false }
 storage = { path = "../../firmware/storage", default-features = false }
 cortex-m = "0.7"

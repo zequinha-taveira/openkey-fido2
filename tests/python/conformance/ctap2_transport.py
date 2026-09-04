@@ -97,19 +97,40 @@ class SimulatorClient:
         )
 
     def close(self) -> None:
-        """Encerra o processo do simulador."""
-        if self._proc.poll() is None:
-            if self._proc.stdin:
+        """Encerra o processo do simulador.
+
+        Garante (de forma portátil) que o filho terminou e que os pipes
+        do pai foram liberados antes de retornar, de modo que no Windows
+        nenhum handle sobre o arquivo de storage permaneça aberto quando
+        o `TemporaryDirectory` do teste for removido.
+        """
+        proc = self._proc
+        if proc.poll() is None:
+            if proc.stdin:
                 try:
-                    self._proc.stdin.close()
+                    proc.stdin.close()
                 except OSError:
                     pass
-            self._proc.terminate()
+            proc.terminate()
             try:
-                self._proc.wait(timeout=2)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
-                self._proc.wait()
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        # Libera os fds do lado do pai; no Windows, pipes abertos podem
+        # reter locks e fazer `shutil.rmtree` falhar com WinError 145.
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
 
     def __enter__(self) -> SimulatorClient:
         return self
@@ -155,11 +176,23 @@ class SimulatorClient:
                 pass
 
     def wait_exited(self, timeout: float = 5.0) -> int | None:
-        """Aguarda o processo terminar e retorna seu código de saída."""
+        """Aguarda o processo terminar e retorna seu código de saída.
+
+        Em caso de timeout, faz fallback para `kill()` + nova espera, de
+        modo que o chamador nunca libere o diretório de storage com o
+        filho ainda vivo (flake WinError 145 no teardown).
+        """
         try:
             return self._proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return None
+            try:
+                self._proc.kill()
+            except OSError:
+                pass
+            try:
+                return self._proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return None
 
     def send_raw(self, cmd: int, payload: bytes = b"") -> tuple[int, bytes]:
         """Envia um comando CTAP2 cru e retorna (status_code, response_bytes)."""

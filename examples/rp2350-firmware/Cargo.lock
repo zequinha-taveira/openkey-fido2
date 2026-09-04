@@ -1065,6 +1065,8 @@ dependencies = [
  "cortex-m",
  "cortex-m-rt",
  "crypto",
+ "ctap2",
+ "device-profile",
  "embedded-alloc",
  "embedded-hal 1.0.0",
  "getrandom",

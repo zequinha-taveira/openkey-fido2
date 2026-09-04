@@ -1,11 +1,15 @@
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
-use authenticator::{EmbeddedAuthenticator, InsecureHostStorage};
+use authenticator::{
+    register_multiprotocol_applets, EmbeddedAuthenticator, InsecureHostStorage, ManagementApplet,
+    OathApplet, OpenPgpApplet, PivApplet,
+};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use ciborium::Value as CborValue;
+use crypto::CryptoEngine;
 use ctap2::{
     AttestationCertificate, AttestationFormat, CredentialDescriptor, Ctap2Error, Extensions,
     GetAssertionOptions, GetAssertionRequest, MakeCredentialOptions, MakeCredentialRequest,
@@ -13,6 +17,9 @@ use ctap2::{
 };
 use device_profile::{DeviceProfile, DeviceProfileBuilder, PinPolicy};
 use serde_json::{json, Value};
+use std::cell::RefCell;
+use storage::{FileStorageBackend, StorageEngine};
+use transport::iso7816::CardRouter;
 
 const ERR_JSON_INVALID: u8 = 0x02;
 
@@ -30,6 +37,133 @@ fn simulator_profile() -> DeviceProfile {
 struct Simulator {
     auth: EmbeddedAuthenticator,
     storage_path: Option<PathBuf>,
+    /// Roteador ISO 7816 multi-protocolo (Management + OATH + PIV + OpenPGP).
+    ///
+    /// Os applets referenciados pelo roteador vivem em `Box::leak` (`'static`);
+    /// o `reset` reconstrói o roteador com vazamento novo — aceitável no
+    /// simulador, cujo tempo de vida é o do processo. Com `--storage-path`,
+    /// os applets usam o mesmo arquivo do storage CTAP2 (mesma identidade
+    /// entre reinícios); sem ele, o storage dos applets é em memória.
+    card_router: CardRouter<'static>,
+    /// Engine persistente dos applets (`Some` com `--storage-path`).
+    ///
+    /// Aponta para o `RefCell` vazado que sustenta os applets; o `reset`
+    /// reconstrói o roteador sobre o MESMO engine (sessões VERIFY/PW1 caem,
+    /// estados `sys:*` permanecem). `None` = memória (comportamento legado).
+    applet_storage: Option<&'static RefCell<StorageEngine>>,
+    /// Chave-mestra dos applets persistentes, derivada do caminho.
+    applet_key: Option<[u8; 32]>,
+}
+
+/// Deriva a chave-mestra dos applets a partir do caminho do storage.
+///
+/// Espelha `derive_key_from_path` do CTAP2 com separação de domínio
+/// (`":applets"`): mesma identidade entre reinícios, sem reutilizar a chave
+/// do CTAP2. **Inseguro por construção** como o `InsecureHostStorage` —
+/// restrito ao simulador e a testes; nunca logar o material derivado.
+fn derive_applet_key_from_path(path: &Path) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    // `sha256` independe da chave do motor; o motor aleatório é descartado.
+    let probe = CryptoEngine::new()?;
+    let mut input = path.to_string_lossy().into_owned().into_bytes();
+    input.extend_from_slice(b":applets");
+    let hash = probe.sha256(&input);
+    // Sem buffer zerado intermediário: converte o digest direto para evitar
+    // valor criptográfico hard-coded (CodeQL rust/hard-coded-cryptographic-value).
+    // A derivação determinística é intencional (persistência entre reinícios);
+    // a insegurança já está documentada acima — restrito a simulador/testes.
+    let key: [u8; 32] = hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| "SHA-256 deve produzir 32 bytes")?;
+    Ok(key)
+}
+
+/// Monta um roteador multi-protocolo novo sobre storage em memória.
+///
+/// Cada applet recebe um `CryptoEngine` próprio com chave aleatória; o estado
+/// cifrado (`sys:*`) mora no `StorageEngine` vazado junto dos applets.
+fn new_card_router() -> Result<CardRouter<'static>, Box<dyn std::error::Error>> {
+    let storage: &'static RefCell<StorageEngine> =
+        Box::leak(Box::new(RefCell::new(StorageEngine::new()?)));
+    let management: &'static mut ManagementApplet<'static> = Box::leak(Box::new(
+        ManagementApplet::new(storage, CryptoEngine::new()?)?,
+    ));
+    let oath: &'static mut OathApplet<'static> =
+        Box::leak(Box::new(OathApplet::new(storage, CryptoEngine::new()?)?));
+    let piv: &'static mut PivApplet<'static> =
+        Box::leak(Box::new(PivApplet::new(storage, CryptoEngine::new()?)?));
+    let openpgp: &'static mut OpenPgpApplet<'static> =
+        Box::leak(Box::new(OpenPgpApplet::new(storage, CryptoEngine::new()?)?));
+    let mut router = CardRouter::new();
+    register_multiprotocol_applets(&mut router, management, oath, piv, openpgp);
+    Ok(router)
+}
+
+/// Monta um roteador multi-protocolo sobre um storage e chave existentes.
+///
+/// Usado com `--storage-path` (construção e `reset`): os 4 applets partilham
+/// a mesma chave derivada do caminho, como o firmware partilha um único
+/// `CryptoEngine` entre applets — o estado cifrado (`sys:*`) permanece
+/// legível entre reinícios do processo.
+fn new_card_router_over(
+    storage: &'static RefCell<StorageEngine>,
+    key: [u8; 32],
+) -> Result<CardRouter<'static>, Box<dyn std::error::Error>> {
+    let management: &'static mut ManagementApplet<'static> = Box::leak(Box::new(
+        ManagementApplet::new(storage, CryptoEngine::from_key(key))?,
+    ));
+    let oath: &'static mut OathApplet<'static> = Box::leak(Box::new(OathApplet::new(
+        storage,
+        CryptoEngine::from_key(key),
+    )?));
+    let piv: &'static mut PivApplet<'static> = Box::leak(Box::new(PivApplet::new(
+        storage,
+        CryptoEngine::from_key(key),
+    )?));
+    let openpgp: &'static mut OpenPgpApplet<'static> = Box::leak(Box::new(OpenPgpApplet::new(
+        storage,
+        CryptoEngine::from_key(key),
+    )?));
+    let mut router = CardRouter::new();
+    register_multiprotocol_applets(&mut router, management, oath, piv, openpgp);
+    Ok(router)
+}
+
+/// Decodifica hex (`"00a4..."`) em bytes; rejeita ímpar, vazio ou não-hex.
+fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
+    let hex = hex.trim();
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return Err("campo apdu deve ser hex com nº par de dígitos".to_string());
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bytes = hex.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_val(bytes[i]).ok_or("campo apdu contém dígito não-hex")?;
+        let lo = hex_val(bytes[i + 1]).ok_or("campo apdu contém dígito não-hex")?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_encode(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(data.len() * 2);
+    for b in data {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
 }
 
 fn b64_encode(data: &[u8]) -> String {
@@ -187,16 +321,29 @@ impl Simulator {
         Ok(Self {
             auth: EmbeddedAuthenticator::new_with_profile(simulator_profile())?,
             storage_path: None,
+            card_router: new_card_router()?,
+            applet_storage: None,
+            applet_key: None,
         })
     }
 
     fn with_storage_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        // Applets partilham o MESMO arquivo do CTAP2: `FileStorageBackend`
+        // recarrega do disco a cada acesso, então os dois engines coexistem
+        // sem apagar as chaves um do outro (`sys:*` + `cred:*`).
+        let applet_key = derive_applet_key_from_path(&path)?;
+        let applet_storage: &'static RefCell<StorageEngine> = Box::leak(Box::new(RefCell::new(
+            StorageEngine::with_backend(Box::new(FileStorageBackend::new(path.clone())?)),
+        )));
         Ok(Self {
             auth: EmbeddedAuthenticator::new_with_insecure_host_storage(
                 InsecureHostStorage::new(path.clone()),
                 simulator_profile(),
             )?,
             storage_path: Some(path),
+            card_router: new_card_router_over(applet_storage, applet_key)?,
+            applet_storage: Some(applet_storage),
+            applet_key: Some(applet_key),
         })
     }
 
@@ -212,7 +359,21 @@ impl Simulator {
         match result {
             Ok(auth) => {
                 self.auth = auth;
-                json!({"ok": true})
+                // Persistente: roteador novo sobre o MESMO engine — sessões
+                // VERIFY/PW1 e estado sys:* voltam à fábrica só na memória
+                // volátil dos applets; o arquivo é preservado. Memória: engine
+                // novo, estado some (comportamento legado).
+                let router = match (self.applet_storage, self.applet_key) {
+                    (Some(storage), Some(key)) => new_card_router_over(storage, key),
+                    _ => new_card_router(),
+                };
+                match router {
+                    Ok(router) => {
+                        self.card_router = router;
+                        json!({"ok": true})
+                    }
+                    Err(error) => error_value(error),
+                }
             }
             Err(error) => error_value(error),
         }
@@ -618,6 +779,35 @@ impl Simulator {
         }
     }
 
+    /// Roteia uma APDU ISO 7816 bruta (hex) ao `CardRouter` multi-protocolo.
+    ///
+    /// Request: `{"op":"apdu","apdu":"<hex CLA INS P1 P2 [Lc data] [Le]>"}`.
+    /// Formas curta e estendida (casos 1/2S/3S/4S/2E/3E/4E) são aceitas; `Le`
+    /// ausente na resposta gera encadeamento `61 XX` a consumir com
+    /// GET RESPONSE (`00c0000000`) na chamada seguinte.
+    /// Response: `{"ok":true,"response":"<hex data+SW>","data":"<hex>",
+    /// "sw":36864}` (`sw` decimal, `0x9000` no sucesso).
+    fn apdu(&mut self, req: &Value) -> Value {
+        let hex = match req.get("apdu").and_then(Value::as_str) {
+            Some(hex) => hex,
+            None => {
+                return json!({"ok": false, "code": ERR_JSON_INVALID, "message": "campo apdu ausente"});
+            }
+        };
+        let raw = match hex_decode(hex) {
+            Ok(raw) => raw,
+            Err(msg) => return json!({"ok": false, "code": ERR_JSON_INVALID, "message": msg}),
+        };
+        let resp = self.card_router.process(&raw);
+        let sw = resp.sw.unwrap_or(0x9000);
+        json!({
+            "ok": true,
+            "response": hex_encode(&resp.to_bytes()),
+            "data": hex_encode(&resp.data),
+            "sw": sw,
+        })
+    }
+
     fn client_pin(&mut self, req: &Value) -> Value {
         use ctap2::client_pin::{self, ClientPin, ClientPinSubCommand};
 
@@ -692,7 +882,9 @@ impl Simulator {
                             "ok": true,
                             "credential_id": b64_encode(&assertion.credential.as_ref().map(|c| c.id.clone()).unwrap_or_default()),
                             "number_of_credentials": assertion.number_of_credentials,
-                            "next": assertion.next,
+                            "user_handle": b64_encode(
+                                &assertion.user.map(|u| u.id).unwrap_or_default()
+                            ),
                         }),
                         Err(_) => json!({"ok": true, "cbor": b64_encode(&response)}),
                     }
@@ -886,6 +1078,7 @@ fn main() {
             "enumerate_rps_next" => simulator.enumerate_rps_next(),
             "bio_enroll" => simulator.bio_enroll(&request),
             "process_command" => simulator.process_command(&request),
+            "apdu" => simulator.apdu(&request),
             "client_pin" => simulator.client_pin(&request),
             "get_info" => simulator.get_info(),
             "reset" => simulator.reset(),

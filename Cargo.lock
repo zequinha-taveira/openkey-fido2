@@ -549,9 +549,12 @@ dependencies = [
  "authenticator",
  "base64",
  "ciborium",
+ "crypto",
  "ctap2",
  "device-profile",
  "serde_json",
+ "storage",
+ "transport",
 ]
 
 [[package]]

@@ -89,9 +89,16 @@ def test_get_info_advertises_pin_capabilities():
         assert 0x06 in info, "pinUvAuthProtocols ausente"
         assert sorted(info[0x06]) == [1, 2]
         options = info.get(0x04, {})
-        assert options.get("clientPin") is True
+        assert options.get("clientPin") is False
         assert options.get("pinUvAuthToken") is True
         assert "uv" not in options or options.get("uv") is not True
+
+        # CTAP 2.0 / 2.1 §6.4: torna-se True assim que um PIN é definido.
+        pin = ClientPin(SimCtap2(client), protocol=PinProtocolV2())
+        pin.set_pin("1234")
+        status, info_after = client.send_cbor(CtapCmd.GET_INFO)
+        assert status == 0x00
+        assert info_after.get(0x04, {}).get("clientPin") is True
 
 
 def test_set_pin_and_retries_protocol_2():

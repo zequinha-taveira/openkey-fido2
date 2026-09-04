@@ -192,10 +192,21 @@ fn replace_file(
 #[cfg(feature = "std")]
 impl StorageBackend for FileStorageBackend {
     fn read(&self, key: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        Ok(self.cache.get(key).cloned())
+        // Recarrega do disco: outro `StorageEngine` sobre o mesmo arquivo
+        // (ex.: CTAP2 + applets do simulador com `--storage-path`) pode ter
+        // escrito ou apagado chaves após a abertura desta instância.
+        // Escritas próprias sempre fazem flush imediato, então o disco é a
+        // verdade atual — sem fallback ao cache, que ressuscitaria chaves
+        // apagadas por outro engine.
+        let snapshot = Self::load_snapshot(&self.path, &self.journal_path)?;
+        Ok(snapshot.get(key).cloned())
     }
 
     fn write(&mut self, key: &str, value: &[u8]) -> Result<(), StorageError> {
+        // Read-modify-write: incorpora chaves gravadas por outro engine sobre
+        // o mesmo arquivo antes de persistir, para o flush do cache local não
+        // apagá-las.
+        self.cache = Self::load_snapshot(&self.path, &self.journal_path)?;
         self.cache.insert(key.to_string(), value.to_vec());
         self.dirty = true;
         self.flush()?;
@@ -203,6 +214,9 @@ impl StorageBackend for FileStorageBackend {
     }
 
     fn delete(&mut self, key: &str) -> Result<(), StorageError> {
+        // Recarrega antes de remover pelo mesmo motivo do `write`: sem isso,
+        // o flush apagaria do arquivo chaves de outro engine.
+        self.cache = Self::load_snapshot(&self.path, &self.journal_path)?;
         self.cache.remove(key);
         self.dirty = true;
         self.flush()?;
@@ -210,7 +224,10 @@ impl StorageBackend for FileStorageBackend {
     }
 
     fn list_keys(&self) -> Result<Vec<String>, StorageError> {
-        Ok(self.cache.keys().cloned().collect())
+        // Só o disco: como no `read`, o cache local pode conter chaves já
+        // apagadas por outro engine sobre o mesmo arquivo.
+        let snapshot = Self::load_snapshot(&self.path, &self.journal_path)?;
+        Ok(snapshot.keys().cloned().collect())
     }
 }
 
@@ -1198,6 +1215,33 @@ mod tests {
 
         let recovered = FileStorageBackend::new(path.clone()).unwrap();
         assert_eq!(recovered.read("pin").unwrap(), Some(b"recovered".to_vec()));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_file_backend_shared_between_two_engines() {
+        // Dois engines sobre o mesmo arquivo (CTAP2 + applets no simulador
+        // com `--storage-path`): escritas intercaladas não podem apagar as
+        // chaves do outro, e deletes refletem no par.
+        let root =
+            std::env::temp_dir().join(format!("openkey-storage-shared-{}", std::process::id()));
+        let path = root.join("store.json");
+        let _ = fs::remove_dir_all(&root);
+
+        let mut ctap = FileStorageBackend::new(path.clone()).unwrap();
+        let mut applets = FileStorageBackend::new(path.clone()).unwrap();
+        ctap.write("cred:01", b"ctap").unwrap();
+        applets.write("sys:piv", b"piv-state").unwrap();
+        // Escrita do CTAP2 após a dos applets precisa preservar `sys:piv`.
+        ctap.write("cred:02", b"ctap2").unwrap();
+
+        assert_eq!(ctap.read("sys:piv").unwrap(), Some(b"piv-state".to_vec()));
+        assert_eq!(applets.read("cred:02").unwrap(), Some(b"ctap2".to_vec()));
+        assert_eq!(ctap.list_keys().unwrap().len(), 3);
+
+        ctap.delete("sys:piv").unwrap();
+        assert_eq!(applets.read("sys:piv").unwrap(), None);
 
         let _ = fs::remove_dir_all(&root);
     }

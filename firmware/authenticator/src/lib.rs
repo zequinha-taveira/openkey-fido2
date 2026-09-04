@@ -35,5 +35,5 @@ pub use multiprotocol::{
 };
 pub use yubico_management::{register_yubico_applets, ManagementApplet, AID_YUBICO_MANAGEMENT};
 pub use yubico_oath::{OathAlgorithm, OathApplet, OathType, AID_YUBICO_OATH, MAX_CREDENTIALS};
-pub use yubico_openpgp::{OpenPgpApplet, AID_OPENPGP};
+pub use yubico_openpgp::{OpenPgpApplet, AID_OPENPGP, AID_OPENPGP_FULL};
 pub use yubico_piv::{PivApplet, AID_PIV};

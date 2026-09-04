@@ -11,8 +11,8 @@ use ctap2::{
     CredentialDescriptor, Ctap2Authenticator, Ctap2Error, GetAssertionOptions, GetAssertionRequest,
     MakeCredentialOptions, MakeCredentialRequest, PublicKeyCredParams, RelyingParty, User,
 };
-use storage::StorageEngine;
 use rand::RngCore;
+use storage::StorageEngine;
 
 fn make_request(user_id: &[u8]) -> MakeCredentialRequest {
     MakeCredentialRequest {
@@ -283,8 +283,8 @@ fn test_ctap2_get_info() {
     let authenticator = Ctap2Authenticator::new(ctap2::AAGUID, crypto, storage).unwrap();
 
     let info = authenticator.get_info().unwrap();
-    assert!(info.versions.contains(&"2.0".to_string()));
-    assert!(info.versions.contains(&"2.1".to_string()));
+    assert!(info.versions.contains(&"FIDO_2_0".to_string()));
+    assert!(info.versions.contains(&"FIDO_2_1".to_string()));
     assert_eq!(info.aaguid, vec![0u8; 16]);
     assert!(info.options.contains(&"rk".to_string()));
     assert!(info.options.contains(&"up".to_string()));
@@ -390,7 +390,7 @@ fn test_ctap2_process_command_get_info() {
         Some(ciborium::Value::Integer(1_000.into()))
     );
     let response: ctap2::GetInfoResponse = ctap2::decode_cbor(&response_data).unwrap();
-    assert!(response.versions.contains(&"2.0".to_string()));
+    assert!(response.versions.contains(&"FIDO_2_0".to_string()));
 }
 
 #[test]
@@ -695,7 +695,11 @@ fn test_embedded_authenticator_capabilities_drive_get_info() {
     let info = authenticator.get_info().unwrap();
     assert_eq!(info.firmware_version, 3_001_000);
     assert!(info.options.contains(&"rk".to_string()));
-    assert!(info.options.contains(&"clientPin".to_string()));
+    // CTAP 2.0/2.1 §6.4: sem PIN configurado, `clientPin` não é anunciado
+    // como presente na struct (no fio CBOR é emitido como false);
+    // `pinUvAuthToken` indica a capacidade de definir PIN.
+    assert!(!info.options.contains(&"clientPin".to_string()));
+    assert!(info.options.contains(&"pinUvAuthToken".to_string()));
     assert_eq!(info.max_credential_id_length, 128);
 }
 
@@ -1737,4 +1741,103 @@ fn test_nrf52840_and_stm32l4_hardware_transports() {
     let mut stm_usb = Stm32l4UsbHid::new(TestPin);
     assert!(stm_usb.init().is_ok());
     assert!(stm_usb.send_packet(b"world").is_ok());
+}
+
+/// Monta o roteador multi-protocolo (Management + OATH + PIV + OpenPGP)
+/// sobre storage em memória, como o simulador host faz.
+fn multiprotocol_router() -> transport::iso7816::CardRouter<'static> {
+    use authenticator::{
+        register_multiprotocol_applets, ManagementApplet, OathApplet, OpenPgpApplet, PivApplet,
+    };
+    use std::cell::RefCell;
+
+    const MASTER_KEY: [u8; 32] = [77u8; 32];
+    let storage: &'static RefCell<StorageEngine> =
+        Box::leak(Box::new(RefCell::new(StorageEngine::new().unwrap())));
+    let engine = || CryptoEngine::from_key(MASTER_KEY);
+    let mgmt = Box::leak(Box::new(ManagementApplet::new(storage, engine()).unwrap()));
+    let oath = Box::leak(Box::new(OathApplet::new(storage, engine()).unwrap()));
+    let piv = Box::leak(Box::new(PivApplet::new(storage, engine()).unwrap()));
+    let openpgp = Box::leak(Box::new(OpenPgpApplet::new(storage, engine()).unwrap()));
+    let mut router = transport::iso7816::CardRouter::new();
+    register_multiprotocol_applets(&mut router, mgmt, oath, piv, openpgp);
+    router
+}
+
+fn select_frame(aid: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x00, 0xA4, 0x04, 0x00, aid.len() as u8];
+    v.extend_from_slice(aid);
+    v
+}
+
+#[test]
+fn test_multiprotocol_router_piv_verify_generate_auth() {
+    use authenticator::AID_PIV;
+
+    let mut router = multiprotocol_router();
+    assert_eq!(
+        router.process(&select_frame(AID_PIV)).sw,
+        Some(transport::iso7816::SW_NO_ERROR)
+    );
+
+    // Slot 9A sem VERIFY: AUTH nega com 6982.
+    let auth = vec![0x00, 0x87, 0x00, 0x9A, 0x01, 0xAA];
+    assert_eq!(
+        router.process(&auth).sw,
+        Some(transport::iso7816::SW_SECURITY_STATUS)
+    );
+
+    // VERIFY com o PIN padrão, GENERATE Ed25519 e AUTH assinam.
+    let mut verify = vec![0x00, 0x20, 0x00, 0x80, 0x08];
+    verify.extend_from_slice(b"123456\xFF\xFF");
+    assert_eq!(
+        router.process(&verify).sw,
+        Some(transport::iso7816::SW_NO_ERROR)
+    );
+    let generate = vec![
+        0x00, 0x47, 0x00, 0x9A, 0x05, 0xAC, 0x03, 0x80, 0x01, 0xE0, 0x00,
+    ];
+    let resp = router.process(&generate);
+    assert_eq!(resp.sw, Some(transport::iso7816::SW_NO_ERROR));
+    assert_eq!(&resp.data[..2], &[0x7F, 0x49]);
+    let mut auth = vec![0x00, 0x87, 0x00, 0x9A, 0x20];
+    auth.extend_from_slice(&[0x11u8; 32]);
+    auth.push(0x00);
+    let resp = router.process(&auth);
+    assert_eq!(resp.sw, Some(transport::iso7816::SW_NO_ERROR));
+    assert_eq!(resp.data.len(), 64);
+}
+
+#[test]
+fn test_multiprotocol_router_openpgp_verify_generate_sign() {
+    use authenticator::AID_OPENPGP;
+
+    let mut router = multiprotocol_router();
+    let resp = router.process(&select_frame(AID_OPENPGP));
+    assert_eq!(resp.sw, Some(transport::iso7816::SW_NO_ERROR));
+    assert_eq!(resp.data.first(), Some(&0x6F));
+
+    // PSO SIGN sem VERIFY: 6982.
+    let sign = vec![0x00, 0x2A, 0x9E, 0x9A, 0x01, 0xAA];
+    assert_eq!(
+        router.process(&sign).sw,
+        Some(transport::iso7816::SW_SECURITY_STATUS)
+    );
+
+    // VERIFY PW1, GENERATE SIG e PSO SIGN assinam.
+    let mut verify = vec![0x00, 0x20, 0x00, 0x81, 0x06];
+    verify.extend_from_slice(b"123456");
+    assert_eq!(
+        router.process(&verify).sw,
+        Some(transport::iso7816::SW_NO_ERROR)
+    );
+    let resp = router.process(&[0x00, 0x47, 0x00, 0x00, 0x01, 0xE0, 0x00]);
+    assert_eq!(resp.sw, Some(transport::iso7816::SW_NO_ERROR));
+    assert_eq!(&resp.data[..2], &[0x7F, 0x49]);
+    let mut sign = vec![0x00, 0x2A, 0x9E, 0x9A, 0x05];
+    sign.extend_from_slice(b"hello");
+    sign.push(0x00);
+    let resp = router.process(&sign);
+    assert_eq!(resp.sw, Some(transport::iso7816::SW_NO_ERROR));
+    assert_eq!(resp.data.len(), 64);
 }
