@@ -687,7 +687,7 @@ impl<'a> OpenPgpApplet<'a> {
         }
         if apdu.data.is_empty() {
             // Consulta de status: tentativas restantes, sem consumir.
-            debug!("OpenPGP VERIFY status query (slot={:#04X})", slot);
+            debug!("OpenPGP VERIFY status query");
             return Ok(ResponseData::with_sw(Vec::new(), sw_retries(left)));
         }
         if constant_time_eq(apdu.data, &expected) {
@@ -703,7 +703,7 @@ impl<'a> OpenPgpApplet<'a> {
             if !is_admin {
                 self.pw1_verified = true;
             }
-            debug!("OpenPGP VERIFY succeeded (slot={:#04X})", slot);
+            debug!("OpenPGP VERIFY succeeded");
             Ok(ResponseData::ok(Vec::new()))
         } else {
             let sw = {
@@ -724,7 +724,7 @@ impl<'a> OpenPgpApplet<'a> {
                 self.pw1_verified = false;
             }
             self.persist_state()?;
-            debug!("OpenPGP VERIFY failed (slot={:#04X})", slot);
+            debug!("OpenPGP VERIFY failed");
             Err(sw)
         }
     }
