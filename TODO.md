@@ -8,7 +8,7 @@ completos; itens com 🚧 estão em progresso; itens com ❌ são incrementos fu
 ### Core CTAP2
 - ✅ MakeCredential com attestation `none`, `self`, `packed`
 - ✅ GetAssertion com sign counter incremental e multi-assertion (`GetNextAssertion`)
-- ✅ GetInfo com capabilities dinâmicas e `maxLargeBlobDataSize`
+- ✅ GetInfo com capabilities dinâmicas, `maxLargeBlobDataSize` e `clientPin: true/false` conforme CTAP 2.1 §6.4
 - ✅ GetVersion
 - ✅ ProcessCommand (dispatch CBOR)
 - ✅ Suporte a allow_list e exclude_list
@@ -17,7 +17,7 @@ completos; itens com 🚧 estão em progresso; itens com ❌ são incrementos fu
 - ✅ Rejeição de payload CBOR com bytes residuais após o item completo
 - ✅ **Extensão LargeBlobs (CTAP 2.1 §6.10, Opcode 0x0C)**: leitura e escrita fragmentada com storage seguro de 4096B
 - ✅ **Extensão `largeBlobKey`**: geração de chave simétrica de 32B por credencial e retorno no MakeCredential/GetAssertion
-- ✅ **Credential Management (CTAP 2.1 §6.8, Opcode 0x0A)**: `getCredsMetadata`, `enumerateRPs`, `enumerateCredentials`, `updateUserInformation`, `deleteCredential`
+- ✅ **Credential Management (CTAP 2.1 §6.8, Opcode 0x0A)**: `getCredsMetadata`, `enumerateRPs`, `enumerateCredentials`, `updateUserInformation`, `deleteCredential` — chaves inteiras de resposta conformes à spec (`0x03..0x0B`), `subCommandParams` aceita chaves inteiras de clientes reais, `publicKey` como `COSE_Key` (mapa), `PIN_NOT_SET` (0x35) quando sem PIN, `RelyingParty.name` com fallback
 - ✅ **Enterprise Attestation**: validação contra RP list corporativa e bypass de anonymization
 
 ### Criptografia
@@ -114,7 +114,7 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Implementar PIN retry counter decrement/increment** — Decrementar em tentativa falha, reset em sucesso, bloquear após 3 falhas consecutivas (powerCycleState=true, `PIN_AUTH_BLOCKED`). Crate: `ctap2`, `storage`. Critério: testes unitários de retry passando.
 - ✅ **Adicionar handler `ClientPIN` no `process_command`** — Codec próprio de array/mapa CBOR (chaves inteiras 0x01..0x0A) e response em mapa canônico 0x01..0x05. Critério: `cargo test -p ctap2 -- client_pin` passando.
 - ✅ **Erros CTAP2 de PIN no `Ctap2Error`** — `PinInvalid` 0x31, `PinBlocked` 0x32, `PinAuthInvalid` 0x33, `PinAuthBlocked` 0x34, `PinNotSet` 0x35, `PinRequired` 0x36, `PinPolicyViolation` 0x37, `PinTokenExpired` 0x38, `UvBlocked` 0x3C, `UnauthorizedPermission` 0x40, `MissingParameter` 0x14.
-- ✅ **GetInfo com `pinUvAuthProtocols` [1, 2] e options `clientPin`/`pinUvAuthToken`** — `uv` permanece ausente; `clientPin` anunciado como suporte da feature (exigido pelo python-fido2 para enviar setPIN).
+- ✅ **GetInfo com `pinUvAuthProtocols` [1, 2] e options `clientPin`/`pinUvAuthToken`** — `uv` permanece ausente; `clientPin` emitido como `false` (sem PIN) ou `true` (com PIN) conforme CTAP 2.1 §6.4, exigido pelo python-fido2 e Yubico Authenticator para fluxo de setPIN/gerenciamento. Correção 2026-09-04: conversor CBOR de `options` atualizado de `Vec<String>` para `Vec<(String, bool)>`.
 - ✅ **Testes E2E Python: `tests/python/conformance/test_client_pin.py`** — Fluxo completo com `fido2.ctap2.pin.ClientPin` (python-fido2 2.2.1) nos protocolos 1 e 2: setPIN → getPINRetries → getPINToken → changePIN → getPINToken+permissions, com códigos de erro da spec. Critério: `pytest tests/python/conformance/test_client_pin.py -v` passando (15 testes).
 - ✅ **Wiring do `pinUvAuthParam` em MakeCredential/GetAssertion/CredentialManagement** — Requests carregam o campo CTAP2.1; MakeCredential/GetAssertion validam MAC sobre `clientDataHash`, permissões e binding de RP; Credential Management valida MAC sobre `subCommand || subCommandParams`. Cobertura Rust e E2E Python adicionada.
 - ✅ **`firmwareVersion` do GetInfo como inteiro (CTAP 2.1 §6.4)** — Mapeamento determinístico do semver do perfil documentado no ADR-0020; wire e consumidores Python validam tipo e valor.
@@ -255,7 +255,7 @@ Itens que podem ser implementados imediatamente com baixo esforço:
 - ✅ **Criar ADR-0012: Suporte a Conformance Testing FIDO2 e Interface Raw CBOR** — Documentar modo `--raw-cbor` no simulador e suíte de testes de conformidade. Crate: N/A. Critério: `docs/adr/ADR-0012-fido-conformance-e-raw-cbor-interface.md` criado.
 - ✅ **Implementar modo `--raw-cbor` no `fido2-simulator`** — Suporte a framing binário length-prefixed no stdin/stdout para despacho direto de comandos CTAP2 sem parsing JSON. Crate: `simulator`. Critério: `cargo build -p fido2-simulator` compila e executa.
 - ✅ **Criar transporte `SimulatorClient` em Python (`tests/python/conformance/ctap2_transport.py`)** — Ponte binária Python para comunicação bidirecional com o simulador em modo `--raw-cbor`. Crate: `tests`. Critério: módulo funcional.
-- ✅ **Implementar suíte de testes de conformidade CTAP 2.1 (`tests/python/conformance/`)** — 12 testes automatizados cobrindo GetInfo, MakeCredential, GetAssertion, ClientPIN, CredentialManagement, LargeBlobs e Reset. Crate: `tests`. Critério: `pytest tests/python/conformance/ -v` passando com 100% de sucesso.
+- ✅ **Implementar suíte de testes de conformidade CTAP 2.1 (`tests/python/conformance/`)** — 53 testes automatizados cobrindo GetInfo, MakeCredential, GetAssertion, ClientPIN, CredentialManagement, LargeBlobs, HmacSecret, Persistence e Reset. Crate: `tests`. Critério: `pytest tests/python/conformance/ -v` passando com 100% de sucesso (53 passed em 2026-09-04).
 - ✅ **Implementar Virtual CTAPHID Bridge (`tools/ctaphid_bridge.py`)** — Ponte USB-HID virtual (UHID no Linux) conectando o simulador `--raw-cbor` ao OS para uso direto com ferramentas oficiais da FIDO Alliance. Framing CTAPHID + wrapping CBOR testados em host (`tests/python/test_ctaphid_bridge.py`, 14 testes). Crate: `tools`. ⬅️ depende de `fido2-simulator --raw-cbor`. Critério: detecção do dispositivo virtual pelo browser e pelo FIDO Conformance Tool (requer Linux/UHID).
 
 ---
@@ -297,6 +297,7 @@ Estado em 2026-09-03 (toolchain `1.98.0-x86_64-pc-windows-gnu`): 502 testes Rust
 - ✅ **hmac-secret reescrito conforme CTAP 2.1 §12.5** — novo módulo `protocol/ctap2/src/hmac_secret.rs`: keyAgreement inline (protocolos 1 e 2 via `pin_protocol`), `saltAuth` verificado, `CredRandomWithUV/WithoutUV` de 32B por credencial persistidos, IV fresco via `SystemRandom`; removidos os caminhos inseguros de nonce zero + chave mestra. E2E: `tests/python/conformance/test_hmac_secret.py` (12 testes).
 - ✅ **Extensões decodificáveis do wire** — `credProtect` (inteiro CBOR) e `credBlob` (byte string via `serde_bytes_opt`) falhavam `decode_cbor` com InvalidCbor; corrigidos com testes de round-trip wire.
 - ✅ **GetAssertionRequest com defaults serde** — `allowList`, `options.up` (default true) e `options.uv` omitíveis conforme spec; request mínima não é mais InvalidCbor.
+- ✅ **Interoperabilidade GetInfo/CredentialManagement com Yubico Authenticator (2026-09-04)** — 6 correções de conformidade CTAP 2.1 que impediam o funcionamento com Yubico Authenticator e python-fido2: (1) `GetInfo.options.clientPin` emite `false`/`true` em vez de presença/ausência; (2) chaves inteiras de resposta de CredentialManagement corrigidas (`rp`→`0x03`, `rpIDHash`→`0x04`, `totalRPs`→`0x05`, `user`→`0x06`, `credentialId`→`0x07`, `publicKey`→`0x08`, `totalCredentials`→`0x09`, `credProtect`→`0x0A`, `largeBlobKey`→`0x0B`); (3) `subCommandParams` normaliza chaves inteiras (`0x01`→`rpIDHash`, `0x02`→`credentialId`, `0x03`→`user`) para deserialização; (4) `publicKey` serializado como mapa `COSE_Key` (major type 5) em vez de byte string; (5) `CTAP2_ERR_PIN_NOT_SET` (0x35) retornado quando sem PIN (antes: 0x36); (6) `RelyingParty.name` com fallback para `id`. Critério: `pytest tests/python/conformance/ -v` — 53 passed; `cargo test -p ctap2` passando.
 
 ### Correções de segurança
 - ✅ **Bloqueio de PIN volátil** — 3 falhas bloqueiam na sessão (`PinAuthBlocked`) mas power cycle recupera; contador persistente de retries mantido. Critério: `test_pin_auth_blocked_clears_on_power_cycle`.

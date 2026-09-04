@@ -69,3 +69,27 @@ def test_get_info_algorithms_negotiation():
                     if alg_id is not None:
                         supported_algs.append(alg_id)
             assert -7 in supported_algs or -8 in supported_algs or len(supported_algs) > 0
+
+
+def test_get_info_client_pin_option():
+    """CTAP 2.0 / 2.1 §6.4: clientPin é False quando suportado e sem PIN, e True com PIN."""
+    from fido2.ctap2.pin import ClientPin, PinProtocolV2
+    from .test_client_pin import SimCtap2
+
+    with SimulatorClient() as client:
+        client.send_cbor(CtapCmd.RESET)
+        status, info = client.send_cbor(CtapCmd.GET_INFO)
+        assert status == CtapError.SUCCESS
+        options = info.get(0x04, {})
+        assert options.get("clientPin") is False
+
+        # Configura um PIN
+        pin = ClientPin(SimCtap2(client), protocol=PinProtocolV2())
+        pin.set_pin("1234")
+
+        # Verifica GetInfo novamente
+        status, info = client.send_cbor(CtapCmd.GET_INFO)
+        assert status == CtapError.SUCCESS
+        options = info.get(0x04, {})
+        assert options.get("clientPin") is True
+

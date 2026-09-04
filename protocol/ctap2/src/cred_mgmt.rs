@@ -102,8 +102,8 @@ pub struct EnumerateCredentialsEntryResponse {
     #[serde(rename = "credentialId")]
     pub credential_id: crate::ctap2::CredentialDescriptor,
     /// Chave pública no formato COSE.
-    #[serde(with = "serde_bytes", rename = "publicKey")]
-    pub public_key: Vec<u8>,
+    #[serde(rename = "publicKey")]
+    pub public_key: ciborium::Value,
     /// Total de credenciais para este Relying Party.
     #[serde(rename = "totalCredentials")]
     pub total_credentials: u32,
