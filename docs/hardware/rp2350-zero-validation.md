@@ -372,12 +372,29 @@ Procedimento de validação:
 > premissas proprietárias de fabricante, fornecendo o diagnóstico técnico
 > autoritativo e independente.
 
+### O que falta no firmware
+
+O leitor CCID aparece (`Yubico YubiKey OTP+FIDO+CCID 0`), mas a interface CCID precisa:
+
+1. **Responder ao ICC Power On com um ATR válido (ex.: `3B 8D 80 01...`)**:
+   - O comando CCID `PC_to_RDR_IccPowerOn` (`0x62`) recebido pelo endpoint Bulk OUT precisa responder com `RDR_to_PC_DataBlock` (`0x80`) contendo um Answer To Reset (ATR) válido e bem formatado segundo ISO 7816-3.
+   - Sem essa resposta de ativação, o subsistema PC/SC do Windows considera o cartão ausente ou inativo, retornando o código de erro `0x80100066` (`SCARD_W_REMOVED_CARD`) em chamadas de `SCardConnect` ou mantendo o leitor em estado MUTE.
+
+2. **Processar APDU SELECT dos applets (OATH, Management, etc.)**:
+   - O comando CCID `PC_to_RDR_XfrBlock` (`0x6F`) precisa receber as APDUs ISO 7816-4 enviadas pelo host e despachar o comando `SELECT AID` para os applets correspondentes:
+     - **Management Applet**: AID `A0 00 00 05 27 47 11 17`
+     - **OATH Applet**: AID `A0 00 00 05 27 21 01`
+     - **PIV Applet**: AID `A0 00 00 03 08`
+     - **OpenPGP Applet**: AID `D2 76 00 01 24 01`
+   - O firmware deve responder com o status word `90 00` e o payload TLV esperado pelos clientes (ex.: YubiKey Manager, Yubico Authenticator, OpenSC).
+
 ---
 
 ## 8. Ainda não verificado (honesto)
 
 Itens que este runbook **não cobre** e continuam em aberto:
 
+- [ ] Interface CCID em hardware físico: responder ao ICC Power On com ATR válido e processar APDU SELECT dos applets (OATH, Management, etc.)
 - [ ] WS2812B (GPIO16) como `StatusLed`: a trait existe em
       `transport::embedded`, mas falta o driver PIO; hoje o LED não reflete
       estados do autenticador

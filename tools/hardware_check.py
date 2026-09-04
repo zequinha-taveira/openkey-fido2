@@ -30,6 +30,12 @@ IDENTITY_NOTE = (
     "is the opt-in VID:PID=Yubikey5 (0x1050:0x0407) build, not for distribution."
 )
 
+FIRMWARE_REQUIREMENTS_NOTE = (
+    "O leitor CCID aparece, mas a interface CCID precisa:\n"
+    "  1. Responder ao ICC Power On com um ATR válido (ex.: 3B 8D 80 01...)\n"
+    "  2. Processar APDU SELECT dos applets (OATH, Management, etc.)"
+)
+
 OATH_AID = bytes.fromhex("A0000005272101")
 MGMT_AID = bytes.fromhex("A000000527471117")
 PIV_AID = bytes.fromhex("A000000308000010000100")
@@ -461,6 +467,7 @@ def main():
 
     result = {
         "identity_note": IDENTITY_NOTE,
+        "firmware_requirements": FIRMWARE_REQUIREMENTS_NOTE,
         "fido2": fido2_lib,
         "opensc": opensc,
         "ykman": ykman,
@@ -517,6 +524,10 @@ def main():
                 print(f"    erro de conexão PC/SC: {e['connect_error']} ({desc})")
             if e.get("atr"):
                 print(f"    ATR: {e.get('atr')}")
+            if e.get("connect_error") or not e.get("atr"):
+                print("    [O que falta no firmware]:")
+                print("      - Responder ao ICC Power On com um ATR válido (ex.: 3B 8D 80 01...)")
+                print("      - Processar APDU SELECT dos applets (OATH, Management, etc.)")
             for k in ("select_oath", "select_management", "select_piv", "select_openpgp"):
                 v = e.get(k)
                 if v is not None:

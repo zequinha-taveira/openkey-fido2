@@ -152,6 +152,15 @@ def test_identity_note_constant():
     assert "not for distribution" in hc.IDENTITY_NOTE
 
 
+def test_firmware_requirements_note_constant():
+    assert "ICC Power On" in hc.FIRMWARE_REQUIREMENTS_NOTE
+    assert "ATR" in hc.FIRMWARE_REQUIREMENTS_NOTE
+    assert "APDU SELECT" in hc.FIRMWARE_REQUIREMENTS_NOTE
+    assert "3B 8D 80 01" in hc.FIRMWARE_REQUIREMENTS_NOTE
+    assert "OATH" in hc.FIRMWARE_REQUIREMENTS_NOTE
+    assert "Management" in hc.FIRMWARE_REQUIREMENTS_NOTE
+
+
 def test_fido2_lib_present():
     out = hc.check_fido2_lib()
     assert isinstance(out, dict)
@@ -217,6 +226,9 @@ def test_cli_json_includes_neutral_tools_and_identity_note():
     assert proc.returncode == 0, proc.stderr
     data = json.loads(proc.stdout)
     assert "identity_note" in data
+    assert "firmware_requirements" in data
+    assert "ICC Power On" in data["firmware_requirements"]
+    assert "APDU SELECT" in data["firmware_requirements"]
     assert "0x1209:0x0001" in data["identity_note"]
     assert "0x1050:0x0407" in data["identity_note"]
     assert "fido2" in data
